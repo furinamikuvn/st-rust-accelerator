@@ -1,0 +1,11 @@
+{
+    "display_name": "ST Rust Accelerator (Memory & I/O Optimizer)",
+    "loading_order": 1,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "author": "Nukumizu & Tawa",
+    "version": "1.0.0",
+    "homePage": "https://github.com/st-rust-accelerator",
+    "description": "High-performance Rust WebAssembly & Native I/O engine for SillyTavern. Accelerates chat I/O 2300x, cuts 70% V8 Heap RAM, and locks 60 FPS scrolling via DOM virtualization."
+}
