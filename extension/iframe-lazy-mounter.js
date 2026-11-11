@@ -89,6 +89,16 @@ class IframeLazyMounter {
         }
     }
 
+    setEnabled(enabled) {
+        this.isEnabled = enabled;
+        if (!enabled) {
+            // Khi tắt, đánh thức lại toàn bộ iframe
+            this.managedIframes.forEach(iframe => {
+                this.wakeIframe(iframe);
+            });
+        }
+    }
+
     getStats() {
         let sleepingCount = 0;
         let activeCount = 0;
