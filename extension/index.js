@@ -4,10 +4,10 @@
  * Khởi động toàn bộ Suite tối ưu hóa: Network Interceptor, WASM Vault, Virtual Scroller, Lazy Mounter
  */
 
-const { initWasm, isWasmReady, storeLine0InVault, getLine0FromVault, storeMessageInVault, getMessageFromVault, assembleContextFromVault, buildWorldbookMatcher, scanWorldbookFast, countTokens, trimContextBudget } = require('./wasm-bridge.js');
-const { VirtualScroller } = require('./dom-virtual-scroller.js');
-const { IframeLazyMounter } = require('./iframe-lazy-mounter.js');
-const { ProxyVariableGuard } = require('./proxy-variable-guard.js');
+import { initWasm, isWasmReady, storeLine0InVault, getLine0FromVault, storeMessageInVault, getMessageFromVault, assembleContextFromVault, buildWorldbookMatcher, scanWorldbookFast, countTokens, trimContextBudget } from './wasm-bridge.js';
+import { VirtualScroller } from './dom-virtual-scroller.js';
+import { IframeLazyMounter } from './iframe-lazy-mounter.js';
+import { ProxyVariableGuard } from './proxy-variable-guard.js';
 
 let originalFetch = null;
 let scrollerInstance = null;
@@ -157,15 +157,20 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     }
 }
 
-// Export cho Node.js / Unit test
-if (typeof module !== 'undefined' && module.exports) {
-    module.exports = {
-        initExtension,
-        initNetworkInterceptor,
-        getOriginalFetch: () => originalFetch,
-        getStrippedStats: () => ({ totalStrippedBytes, totalInterceptedCards, totalInterceptedChats }),
-        VirtualScroller,
-        IframeLazyMounter,
-        ProxyVariableGuard,
-    };
+export {
+    initExtension,
+    initNetworkInterceptor,
+    VirtualScroller,
+    IframeLazyMounter,
+    ProxyVariableGuard,
+    getOriginalFetch,
+    getStrippedStats
+};
+
+function getOriginalFetch() {
+    return originalFetch;
+}
+
+function getStrippedStats() {
+    return { totalStrippedBytes, totalInterceptedCards, totalInterceptedChats };
 }

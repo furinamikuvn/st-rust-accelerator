@@ -236,7 +236,9 @@ class VirtualScroller {
     }
 }
 
-// Export module
+// Export cho cả ESM và CJS
+export { VirtualScroller };
+
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = { VirtualScroller };
 }

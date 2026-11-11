@@ -1,0 +1,7 @@
+{
+  "name": "st-rust-accelerator",
+  "version": "1.0.0",
+  "description": "High-performance Rust WebAssembly & Native I/O engine for SillyTavern",
+  "main": "index.js",
+  "type": "module"
+}

@@ -230,7 +230,24 @@ function clearVault() {
     } catch (_) {}
 }
 
-// Export module
+// Export cho cả ESM (Browser & Node.js 24+) và CJS
+export {
+    initWasm,
+    isWasmReady,
+    setWasmEnabled,
+    storeLine0InVault,
+    getLine0FromVault,
+    storeMessageInVault,
+    getMessageFromVault,
+    assembleContextFromVault,
+    buildWorldbookMatcher,
+    scanWorldbookFast,
+    countTokens,
+    trimContextBudget,
+    getVaultStats,
+    clearVault,
+};
+
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
         initWasm,

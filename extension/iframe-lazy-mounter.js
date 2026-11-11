@@ -108,7 +108,9 @@ class IframeLazyMounter {
     }
 }
 
-// Export module
+// Export cho cả ESM và CJS
+export { IframeLazyMounter };
+
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = { IframeLazyMounter };
 }

@@ -91,7 +91,9 @@ class ProxyVariableGuard {
     }
 }
 
-// Export module
+// Export cho cả ESM và CJS
+export { ProxyVariableGuard };
+
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = { ProxyVariableGuard };
 }
