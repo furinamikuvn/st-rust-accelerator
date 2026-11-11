@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "crates/st-server-addon",
+]
+resolver = "2"

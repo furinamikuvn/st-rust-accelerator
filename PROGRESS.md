@@ -1,11 +1,11 @@
 # PROGRESS — ST-RUST-ACCELERATOR
 
-## Phase Hiện Tại: **P0 — Recon & Architectural Freeze (HOÀN THÀNH BẰNG CHỨNG THỰC NGHIỆM)**
+## Phase Hiện Tại: **P1 — Rust Server I/O & PNG Fast Stripper (HOÀN THÀNH 100% KIỂM CHỨNG THỰC NGHIỆM)**
 
 | Phase | Trạng Thái | Commit Hash | Bằng Chứng Nghiệm Thu |
 | :--- | :--- | :--- | :--- |
-| **P0: Recon & Ground Truth Freeze** | 🟢 ĐÃ XONG | (init) | 8 card đo đạc thật, 33.85MB chat bóc tách Line 0, benchmark I/O 755x, nén LZ4 25.9%. |
-| **P1: Rust Server I/O & PNG Stripper** | ⚪ Chờ duyệt | - | Crate `wal_chat_io` & `png_fast_extractor` (NAPI-RS), test I/O delta < 0.2ms. |
+| **P0: Recon & Ground Truth Freeze** | 🟢 ĐÃ XONG | `8c1a...` | 8 card đo đạc thật, 33.85MB chat bóc tách Line 0, benchmark I/O 755x, nén LZ4 25.9%. |
+| **P1: Rust Server I/O & PNG Stripper** | 🟢 ĐÃ XONG | `a8b7c63` | Crate `wal_chat_io` & `png_fast_extractor` (NAPI-RS), 11/11 test pass, Append delta 0.0505ms (nhanh hơn 2.320x), bóc tách PNG 46ms, quét header 0.095ms, cắt tỉa 46.8MB json_data. |
 | **P2: Rust Client WASM Core** | ⚪ Chờ duyệt | - | Crate `lz4_chat_vault`, `aho_worldbook_scanner`, `simd_tokenizer` biên dịch `.wasm`. |
 | **P3: Client JS Virtualization Suite**| ⚪ Chờ duyệt | - | Virtual Scroller (15 tin, 60 FPS), Iframe Lazy Mount, Network Fetch Interceptor. |
 | **P4: End-to-End System Integration**| ⚪ Chờ duyệt | - | Cắm vào ST v1.18.0 thật, nạp card Genshin 47.8MB, đo RAM Task Manager tụt từ 850MB $\rightarrow$ ~230MB. |
@@ -13,28 +13,36 @@
 
 ---
 
-## Việc Của Phase Hiện Tại (P0) — ĐÃ HOÀN TẤT 100%
-- [x] Khảo sát nhị phân 8 thẻ nhân vật khổng lồ trên máy Sensei (tỷ lệ metadata 90% - 98.8%).
-- [x] Bóc tách cấu trúc file chat thật 33.85MB (Line 0 dài 34.8 triệu ký tự).
-- [x] Đo đạc V8 Heap khi parse và clone Line 0 (tăng từ 3.8MB $\rightarrow$ 56.3MB $\rightarrow$ 164.9MB).
-- [x] Benchmark tốc độ ghi đĩa thực tế: ST ghi đè 117.15 ms vs Append Delta 0.155 ms (nhanh hơn 755 lần).
-- [x] Benchmark thuật toán quét Worldbook RegExp của ST (2.33ms tin ngắn, 18.1ms tin dài, vạch trần rác GC).
-- [x] Đo tỷ lệ nén nhị phân LZ4 trên file chat thật (nén còn 8.76 MB = 25.9%).
-- [x] Thiết lập Project Harness đầy đủ (`AGENTS.md`, `PROGRESS.md`, `DECISIONS.md`, `RECON_FINDINGS.md`, `COMPAT_MATRIX.md`).
+## Việc Của Phase P1 — ĐÃ HOÀN TẤT 100%
+- [x] Thiết lập Cargo Workspace Node-API (`crates/st-server-addon`) sử dụng `napi`, `napi-derive`, `simd-json`, `memmap2`, `base64`, `flate2`.
+- [x] Tạo cầu nối import library MSYS2 UCRT64 `libnode.a` và cấu hình build hoàn chỉnh.
+- [x] Xây dựng module `wal_chat_io.rs`:
+  - `append_message_delta`: Ghi delta tin nhắn mới đạt trung bình **0.0505 ms** (nhanh hơn ST gốc **2.320 lần**).
+  - `update_last_message_delta`: Cập nhật swipe tin cuối đạt **0.92 ms**.
+  - `extract_line0_snapshot`: Tách snapshot Line 0 (26.57 MB / 33.23 MB disk) sang `.meta.json`.
+  - `read_chat_lines`: Tái dựng mảng RFC JSONL tương thích ngược 100%.
+  - `save_full_chat_atomic`: Ghi atomic qua file tạm an toàn tuyệt đối.
+- [x] Xây dựng module `png_fast_extractor.rs`:
+  - `summarize_png_chunks`: Nhảy cóc qua IDAT chunks, quét metadata chỉ mất **0.095 ms** (95 microseconds).
+  - `extract_character_card`: Zero-copy byte scanning bóc tách card Genshin 47.86MB trong **46.29 ms**.
+  - Cắt tỉa triệt để trường `json_data` khổng lồ (23.4MB Base64 / 46.8MB raw), loại bỏ gánh nặng ngốn 46.8MB–140MB V8 Heap.
+  - Bảo toàn 100% ký tự UTF-8 đa ngôn ngữ (tiếng Việt, CJK tiếng Trung, emoji).
+- [x] Viết test suite tự động `test_p1.js`: Toàn bộ 11/11 bài test PASS 100% trên dữ liệu thật.
 
 ---
 
-## Kế Hoạch Phase Tiếp Theo (P1: Rust Server I/O & PNG Stripper)
-- [ ] Thiết lập Cargo Workspace cho `st-server-addon` bằng `napi-rs`.
-- [ ] Xây dựng module `wal_chat_io.rs`: Đọc/ghi chat theo cơ chế Append-Only WAL và tách riêng metadata.
-- [ ] Xây dựng module `png_fast_extractor.rs`: Zero-copy byte scanning chunk `tEXt` của PNG.
-- [ ] Viết test suite so sánh tốc độ và độ toàn vẹn dữ liệu với hàm gốc của Node.js Express.
+## Kế Hoạch Phase Tiếp Theo (P2: Rust Client WASM Core)
+- [ ] Khởi tạo crate `crates/st-wasm-core` với `wasm-bindgen`.
+- [ ] Xây dựng module `lz4_chat_vault.rs`: Két sắt nén lịch sử chat ngoài V8 Heap bằng `lz4_flex`.
+- [ ] Xây dựng module `aho_worldbook_scanner.rs`: Bộ quét từ khóa đa mẫu Aho-Corasick O(N) Zero-GC.
+- [ ] Xây dựng module `simd_tokenizer.rs`: Bộ đếm token và cắt tỉa ngân sách ngữ cảnh tốc độ cao.
+- [ ] Viết kịch bản kiểm thử Node/WASM đo đạc tỷ lệ nén và tốc độ quét từ khóa trên file Worldbook thật máy Sensei.
 
 ---
 
 ## Nhật Ký Handoff Giữa Các Phiên (5 Dòng Tiêu Chuẩn)
-- **Phiên gần nhất hoàn tất**: P0 — Recon & Project Scaffold.
-- **Đã làm xong**: Thu thập toàn bộ bằng chứng số liệu thực nghiệm, thiết lập repo độc lập `D:\st-rust-accelerator`, khởi tạo bộ ba tài liệu quản trị Trinity.
-- **File bị biến đổi**: `AGENTS.md`, `PROGRESS.md`, `DECISIONS.md`, `docs/SPEC.md`, `docs/RECON_FINDINGS.md`, `docs/COMPAT_MATRIX.md`.
-- **Việc phiên tới cần làm ngay**: Sensei mở phiên làm việc mới tại thư mục `D:\st-rust-accelerator` và bắt đầu Phase P1 (Rust Server NAPI Addon).
-- **Cảnh báo rủi ro**: Đảm bảo môi trường máy đã cài đặt Rust (`rustc`, `cargo`) và Node.js (`node`, `npm`) trước khi build `napi-rs`.
+- **Phiên gần nhất hoàn tất**: P1 — Rust Server I/O & PNG Fast Stripper (NAPI-RS).
+- **Đã làm xong**: Hoàn thành Cargo workspace, native addon `st_server_addon.node`, lõi Append-Only WAL I/O (0.05ms write, 2320x speedup), bộ bóc tách PNG zero-copy (46ms) cắt tỉa 46.8MB json_data, đạt 11/11 test PASS 100%.
+- **File bị biến đổi**: `.gitignore`, `Cargo.toml`, `crates/st-server-addon/Cargo.toml`, `crates/st-server-addon/build.rs`, `crates/st-server-addon/src/*`, `test_p1.js`, `PROGRESS.md`.
+- **Việc phiên tới cần làm ngay**: Sensei nghiệm thu Phase P1 và chỉ đạo khởi động Phase P2 (Rust Client WASM Core: LZ4 Chat Vault, Aho-Corasick Scanner, Tokenizer).
+- **Cảnh báo rủi ro**: Nhị phân `st_server_addon.node` đã được build tối ưu hóa (release profile) sẵn sàng trong thư mục gốc; giữ nguyên cấu hình `libnode` khi rebuild.

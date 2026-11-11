@@ -1,0 +1,16 @@
+# Rust target
+/target/
+Cargo.lock
+
+# Node-API built binaries
+*.node
+*.dll
+*.so
+*.dylib
+
+# MSYS2 generated import lib
+/libnode/
+
+# Test sandboxes
+/test_sandbox_*/
+*.tmp.*
