@@ -148,12 +148,12 @@ async function main() {
         console.log(`       - Version: ${manifest.version} | Author: ${manifest.author}`);
     });
 
-    await runTest('Kiểm tra sự hiện diện của Wasm binary 316KB trong pkg', () => {
+    await runTest('Kiểm tra sự hiện diện của Wasm binary v3 (<= 600KB) trong pkg', () => {
         const wasmPath = path.resolve(__dirname, 'pkg', 'st_wasm_core_bg.wasm');
         assert(fs.existsSync(wasmPath), 'File st_wasm_core_bg.wasm phải có trong pkg');
         const stat = fs.statSync(wasmPath);
         console.log(`\n       - WASM Binary Size: ${(stat.size / 1024).toFixed(1)} KB`);
-        assert(stat.size > 250 * 1024 && stat.size < 400 * 1024, 'Kích thước WASM phải ~316KB');
+        assert(stat.size > 250 * 1024 && stat.size < 600 * 1024, 'Kích thước WASM v3 (Zstd+BLAKE3+Streaming+V2) phải trong dải 250KB..600KB');
     });
 
     // =========================================================================

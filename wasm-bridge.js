@@ -328,6 +328,283 @@ function clearVault() {
     } catch (_) {}
 }
 
+function assertP10Ready() {
+    if (!isWasmReady()) {
+        throw new Error('WASM Streaming Engine v3 is not initialized; await initWasm() first');
+    }
+}
+
+function getWasmCoreVersion() {
+    assertP10Ready();
+    return wasmInstance.get_wasm_core_version();
+}
+
+function getG0Constants() {
+    assertP10Ready();
+    return wasmInstance.get_g0_constants();
+}
+
+function getWasmMemory() {
+    assertP10Ready();
+    return wasmInstance.get_wasm_memory();
+}
+
+function getLinearMemoryBytes() {
+    assertP10Ready();
+    return wasmInstance.get_linear_memory_bytes();
+}
+
+function getArenaInfo() {
+    assertP10Ready();
+    return {
+        memory: wasmInstance.get_wasm_memory(),
+        inPtr: wasmInstance.wasm_in_ptr(),
+        inCap: wasmInstance.wasm_in_cap(),
+        outPtr: wasmInstance.wasm_out_ptr(),
+        outCap: wasmInstance.wasm_out_cap(),
+        blobPtr: wasmInstance.wasm_blob_ptr(),
+        blobCap: wasmInstance.wasm_blob_cap(),
+        maxLinearBytes: wasmInstance.wasm_max_linear_bytes(),
+        linearBytes: wasmInstance.get_linear_memory_bytes(),
+    };
+}
+
+/**
+ * Creates a push-based zero-copy WASM Streaming Scrubber controller using fixed 1+1 MiB arena.
+ */
+function createStreamingScrubber(options = {}) {
+    assertP10Ready();
+    const {
+        mode = 1,
+        scrubFlags = 1 | 2,
+        coldThresholdBytes = 65536,
+        keepLastMessages = 15,
+        expectedTotalMessages = 0,
+        onOutChunk = null,
+        onBlobChunk = null,
+        onBlobComplete = null,
+        collectOutput = !onOutChunk,
+        collectBlobs = false,
+    } = options;
+
+    wasmInstance.stream_begin(mode, scrubFlags, coldThresholdBytes, keepLastMessages, expectedTotalMessages);
+
+    const inPtr = wasmInstance.wasm_in_ptr();
+    const inCap = wasmInstance.wasm_in_cap();
+    const outPtr = wasmInstance.wasm_out_ptr();
+    const blobPtr = wasmInstance.wasm_blob_ptr();
+    const mem = wasmInstance.get_wasm_memory();
+
+    const outParts = collectOutput ? [] : null;
+    const completedBlobs = collectBlobs ? [] : null;
+    const activeBlobParts = new Map();
+
+    function drainStepOutputs(status) {
+        const outLen = wasmInstance.stream_out_len();
+        if (outLen > 0) {
+            const outSlice = new Uint8Array(mem.buffer, outPtr, outLen).slice();
+            if (onOutChunk) onOutChunk(outSlice);
+            if (outParts) outParts.push(outSlice);
+        }
+
+        const blobLen = wasmInstance.stream_blob_len();
+        if (status === 3 || blobLen > 0) {
+            const meta = wasmInstance.stream_get_blob_meta();
+            const blobSlice = blobLen > 0 ? new Uint8Array(mem.buffer, blobPtr, blobLen).slice() : new Uint8Array(0);
+            if (onBlobChunk) onBlobChunk(blobSlice, meta);
+            if (onBlobComplete || completedBlobs) {
+                let list = activeBlobParts.get(meta.blobId);
+                if (!list) {
+                    list = [];
+                    activeBlobParts.set(meta.blobId, list);
+                }
+                if (blobSlice.byteLength > 0) list.push(blobSlice);
+                if (meta.isComplete) {
+                    activeBlobParts.delete(meta.blobId);
+                    const total = list.reduce((acc, c) => acc + c.byteLength, 0);
+                    const full = new Uint8Array(total);
+                    let pos = 0;
+                    for (const part of list) {
+                        full.set(part, pos);
+                        pos += part.byteLength;
+                    }
+                    if (onBlobComplete) onBlobComplete(meta, full);
+                    if (completedBlobs) completedBlobs.push({ meta, data: full });
+                }
+            }
+        }
+    }
+
+    function feed(chunk) {
+        const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+        for (let off = 0; off < u8.byteLength; off += inCap) {
+            const slice = u8.subarray(off, Math.min(off + inCap, u8.byteLength));
+            new Uint8Array(mem.buffer, inPtr, slice.byteLength).set(slice);
+            wasmInstance.stream_feed_begin(slice.byteLength);
+            while (true) {
+                const st = wasmInstance.stream_step();
+                if (st === 255) {
+                    throw new Error(wasmInstance.stream_last_error() || 'WASM stream_step failed');
+                }
+                drainStepOutputs(st);
+                if (st === 0 || st === 2) break;
+            }
+        }
+    }
+
+    function finish() {
+        while (true) {
+            const st = wasmInstance.stream_finish();
+            if (st === 255) {
+                throw new Error(wasmInstance.stream_last_error() || 'WASM stream_finish failed');
+            }
+            drainStepOutputs(st);
+            if (st === 2) break;
+        }
+        let outBytes = null;
+        if (outParts) {
+            const total = outParts.reduce((acc, c) => acc + c.byteLength, 0);
+            outBytes = new Uint8Array(total);
+            let pos = 0;
+            for (const p of outParts) {
+                outBytes.set(p, pos);
+                pos += p.byteLength;
+            }
+        }
+        return {
+            outBytes,
+            stats: wasmInstance.stream_get_stats(),
+            blobs: completedBlobs,
+            linearMemoryBytes: wasmInstance.get_linear_memory_bytes(),
+        };
+    }
+
+    return { feed, finish };
+}
+
+function scrubJsonBytes(inputBytes, options = {}) {
+    const scrubber = createStreamingScrubber(options);
+    const u8 = inputBytes instanceof Uint8Array ? inputBytes : new Uint8Array(inputBytes);
+    const stepSize = Math.max(1, Math.min(options.chunkSize || wasmInstance.wasm_in_cap(), wasmInstance.wasm_in_cap()));
+    for (let off = 0; off < u8.byteLength; off += stepSize) {
+        scrubber.feed(u8.subarray(off, Math.min(off + stepSize, u8.byteLength)));
+    }
+    return scrubber.finish();
+}
+
+function zstdCompress(data, level = 3) {
+    assertP10Ready();
+    const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+    const inCap = wasmInstance.wasm_in_cap();
+    if (u8.byteLength > inCap) {
+        throw new RangeError(`zstdCompress slice (${u8.byteLength}) exceeds IN_BUF (${inCap})`);
+    }
+    const mem = wasmInstance.get_wasm_memory();
+    const inPtr = wasmInstance.wasm_in_ptr();
+    const outPtr = wasmInstance.wasm_out_ptr();
+    new Uint8Array(mem.buffer, inPtr, u8.byteLength).set(u8);
+    const outLen = wasmInstance.wasm_zstd_compress_in_buf(u8.byteLength, level);
+    return new Uint8Array(mem.buffer, outPtr, outLen).slice();
+}
+
+function zstdDecompress(compressed) {
+    assertP10Ready();
+    const u8 = compressed instanceof Uint8Array ? compressed : new Uint8Array(compressed);
+    const inCap = wasmInstance.wasm_in_cap();
+    if (u8.byteLength > inCap) {
+        throw new RangeError(`zstdDecompress slice (${u8.byteLength}) exceeds IN_BUF (${inCap})`);
+    }
+    const mem = wasmInstance.get_wasm_memory();
+    const inPtr = wasmInstance.wasm_in_ptr();
+    const outPtr = wasmInstance.wasm_out_ptr();
+    new Uint8Array(mem.buffer, inPtr, u8.byteLength).set(u8);
+    const outLen = wasmInstance.wasm_zstd_decompress_in_buf(u8.byteLength);
+    return new Uint8Array(mem.buffer, outPtr, outLen).slice();
+}
+
+function stv3EncodeChunk(chunk, flags = 0, codecPref = 1, timestampMs = Date.now()) {
+    assertP10Ready();
+    const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+    const inCap = wasmInstance.wasm_in_cap();
+    if (u8.byteLength > inCap) {
+        throw new RangeError(`stv3EncodeChunk input (${u8.byteLength}) exceeds IN_BUF (${inCap})`);
+    }
+    const mem = wasmInstance.get_wasm_memory();
+    const inPtr = wasmInstance.wasm_in_ptr();
+    const outPtr = wasmInstance.wasm_out_ptr();
+    new Uint8Array(mem.buffer, inPtr, u8.byteLength).set(u8);
+    const outLen = wasmInstance.stv3_encode_in_buf(u8.byteLength, flags, codecPref, timestampMs);
+    return new Uint8Array(mem.buffer, outPtr, outLen).slice();
+}
+
+function stv3DecodeChunk(blob) {
+    assertP10Ready();
+    const u8 = blob instanceof Uint8Array ? blob : new Uint8Array(blob);
+    const inCap = wasmInstance.wasm_in_cap();
+    if (u8.byteLength > inCap) {
+        throw new RangeError(`stv3DecodeChunk blob (${u8.byteLength}) exceeds IN_BUF (${inCap})`);
+    }
+    const mem = wasmInstance.get_wasm_memory();
+    const inPtr = wasmInstance.wasm_in_ptr();
+    const outPtr = wasmInstance.wasm_out_ptr();
+    new Uint8Array(mem.buffer, inPtr, u8.byteLength).set(u8);
+    const outLen = wasmInstance.stv3_decode_in_buf(u8.byteLength);
+    return new Uint8Array(mem.buffer, outPtr, outLen).slice();
+}
+
+function stv3InspectHeader(blob) {
+    assertP10Ready();
+    const u8 = blob instanceof Uint8Array ? blob : new Uint8Array(blob);
+    const headerSlice = u8.byteLength > 32 ? u8.subarray(0, 32) : u8;
+    return wasmInstance.stv3_inspect_header(headerSlice);
+}
+
+function hashXxh64Hex(data) {
+    assertP10Ready();
+    const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (u8.byteLength <= 16384) {
+        return wasmInstance.hash_xxh64_hex(u8);
+    }
+    const hasher = createStreamingHasher();
+    hasher.update(u8);
+    return hasher.digestXxh64Hex();
+}
+
+function hashBlake3Hex(data) {
+    assertP10Ready();
+    const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+    if (u8.byteLength <= 16384) {
+        return wasmInstance.hash_blake3_hex(u8);
+    }
+    const hasher = createStreamingHasher();
+    hasher.update(u8);
+    return hasher.digestBlake3Hex();
+}
+
+function createStreamingHasher() {
+    assertP10Ready();
+    wasmInstance.hash_stream_begin();
+    const mem = wasmInstance.get_wasm_memory();
+    const inPtr = wasmInstance.wasm_in_ptr();
+    const inCap = wasmInstance.wasm_in_cap();
+    return {
+        update(chunk) {
+            const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+            for (let off = 0; off < u8.byteLength; off += inCap) {
+                const slice = u8.subarray(off, Math.min(off + inCap, u8.byteLength));
+                new Uint8Array(mem.buffer, inPtr, slice.byteLength).set(slice);
+                wasmInstance.hash_stream_update_in_buf(slice.byteLength);
+            }
+        },
+        digestXxh64Hex() {
+            return wasmInstance.hash_stream_end_xxh64_hex();
+        },
+        digestBlake3Hex() {
+            return wasmInstance.hash_stream_end_blake3_hex();
+        },
+    };
+}
+
 export {
     initWasm,
     isWasmReady,
@@ -343,4 +620,19 @@ export {
     trimContextBudget,
     getVaultStats,
     clearVault,
+    getWasmCoreVersion,
+    getG0Constants,
+    getWasmMemory,
+    getLinearMemoryBytes,
+    getArenaInfo,
+    createStreamingScrubber,
+    scrubJsonBytes,
+    zstdCompress,
+    zstdDecompress,
+    stv3EncodeChunk,
+    stv3DecodeChunk,
+    stv3InspectHeader,
+    hashXxh64Hex,
+    hashBlake3Hex,
+    createStreamingHasher,
 };

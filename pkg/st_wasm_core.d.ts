@@ -12,17 +12,69 @@ export function build_worldbook_matcher(worldbook_json: string): number;
  */
 export function count_tokens(text: string): number;
 
+export function get_g0_constants(): any;
+
+/**
+ * Returns current linear WASM memory size in bytes (`pages * 65536`). Must remain `<= 8 MiB` at Gate G1.
+ */
+export function get_linear_memory_bytes(): number;
+
 export function get_wasm_core_version(): string;
+
+/**
+ * Exposes the WASM module's linear `WebAssembly.Memory` for zero-copy `Uint8Array` views in JS/Workers.
+ */
+export function get_wasm_memory(): any;
 
 /**
  * Lấy thông tin thống kê của bộ quét Worldbook.
  */
 export function get_worldbook_matcher_stats(): any;
 
+export function hash_blake3_64(data: Uint8Array): bigint;
+
+export function hash_blake3_hex(data: Uint8Array): string;
+
+export function hash_stream_begin(): void;
+
+export function hash_stream_end_blake3_hex(): string;
+
+export function hash_stream_end_xxh64_hex(): string;
+
+export function hash_stream_update_in_buf(in_len: number): void;
+
+export function hash_xxh64(data: Uint8Array): bigint;
+
+export function hash_xxh64_hex(data: Uint8Array): string;
+
 /**
  * Quét một lượt duy nhất toàn bộ văn bản chat (O(N + M)).
  */
 export function scan_worldbook_text(haystack: string): Uint32Array;
+
+export function stream_begin(mode: number, scrub_flags: number, cold_threshold_bytes: number, keep_last_messages: number, expected_total_messages: number): void;
+
+export function stream_blob_len(): number;
+
+export function stream_feed_begin(in_len: number): void;
+
+export function stream_finish(): number;
+
+export function stream_get_blob_meta(): any;
+
+export function stream_get_stats(): any;
+
+export function stream_last_error(): string;
+
+export function stream_out_len(): number;
+
+export function stream_step(): number;
+
+export function stv3_decode_in_buf(in_len: number): number;
+
+export function stv3_encode_in_buf(in_len: number, flags: number, codec_pref: number, timestamp_ms: number): number;
+
+export function stv3_inspect_header(blob: Uint8Array): any;
 
 /**
  * Tính toán ngân sách token và cắt tỉa tin nhắn vượt quá max_context.
@@ -75,30 +127,90 @@ export function vault_store_line0(line0_bytes: Uint8Array): number;
  */
 export function vault_store_message(index: number, message_bytes: Uint8Array): number;
 
+export function wasm_blob_cap(): number;
+
+export function wasm_blob_ptr(): number;
+
+export function wasm_hash_blake3_hex_in_buf(in_len: number): string;
+
+export function wasm_hash_xxh64_in_buf(in_len: number): bigint;
+
+export function wasm_in_cap(): number;
+
+export function wasm_in_ptr(): number;
+
+export function wasm_max_linear_bytes(): number;
+
+export function wasm_out_cap(): number;
+
+export function wasm_out_ptr(): number;
+
+export function wasm_zstd_compress_in_buf(in_len: number, level: number): number;
+
+export function wasm_zstd_decompress_in_buf(in_len: number): number;
+
+export function zstd_compress(data: Uint8Array, level: number): Uint8Array;
+
+export function zstd_decompress(compressed: Uint8Array, max_output: number): Uint8Array;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
-    readonly build_worldbook_matcher: (a: number, b: number) => [number, number, number];
+    readonly build_worldbook_matcher: (a: number, b: number, c: number) => void;
     readonly count_tokens: (a: number, b: number) => number;
-    readonly get_wasm_core_version: () => [number, number];
-    readonly get_worldbook_matcher_stats: () => [number, number, number];
-    readonly scan_worldbook_text: (a: number, b: number) => [number, number];
-    readonly trim_context_budget: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
-    readonly vault_assemble_context: (a: number, b: number) => [number, number, number, number];
+    readonly get_g0_constants: (a: number) => void;
+    readonly get_linear_memory_bytes: () => number;
+    readonly get_wasm_core_version: (a: number) => void;
+    readonly get_worldbook_matcher_stats: (a: number) => void;
+    readonly hash_blake3_64: (a: number, b: number) => bigint;
+    readonly hash_blake3_hex: (a: number, b: number, c: number) => void;
+    readonly hash_stream_begin: () => void;
+    readonly hash_stream_end_blake3_hex: (a: number) => void;
+    readonly hash_stream_end_xxh64_hex: (a: number) => void;
+    readonly hash_stream_update_in_buf: (a: number, b: number) => void;
+    readonly hash_xxh64: (a: number, b: number) => bigint;
+    readonly hash_xxh64_hex: (a: number, b: number, c: number) => void;
+    readonly scan_worldbook_text: (a: number, b: number, c: number) => void;
+    readonly stream_begin: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly stream_feed_begin: (a: number, b: number) => void;
+    readonly stream_finish: () => number;
+    readonly stream_get_blob_meta: (a: number) => void;
+    readonly stream_get_stats: (a: number) => void;
+    readonly stream_last_error: (a: number) => void;
+    readonly stream_step: () => number;
+    readonly stv3_decode_in_buf: (a: number, b: number) => void;
+    readonly stv3_encode_in_buf: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly stv3_inspect_header: (a: number, b: number, c: number) => void;
+    readonly trim_context_budget: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly vault_assemble_context: (a: number, b: number, c: number) => void;
     readonly vault_clear: () => void;
-    readonly vault_get_line0: () => [number, number, number, number];
-    readonly vault_get_message: (a: number) => [number, number, number, number];
-    readonly vault_get_stats: () => [number, number, number];
+    readonly vault_get_line0: (a: number) => void;
+    readonly vault_get_message: (a: number, b: number) => void;
+    readonly vault_get_stats: (a: number) => void;
     readonly vault_has_message: (a: number) => number;
     readonly vault_store_line0: (a: number, b: number) => number;
     readonly vault_store_message: (a: number, b: number, c: number) => number;
-    readonly __wbindgen_malloc: (a: number, b: number) => number;
-    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
-    readonly __wbindgen_externrefs: WebAssembly.Table;
-    readonly __externref_table_dealloc: (a: number) => void;
-    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_start: () => void;
+    readonly wasm_blob_cap: () => number;
+    readonly wasm_hash_blake3_hex_in_buf: (a: number, b: number) => void;
+    readonly wasm_hash_xxh64_in_buf: (a: number, b: number) => void;
+    readonly wasm_in_cap: () => number;
+    readonly wasm_max_linear_bytes: () => number;
+    readonly wasm_zstd_compress_in_buf: (a: number, b: number, c: number) => void;
+    readonly wasm_zstd_decompress_in_buf: (a: number, b: number) => void;
+    readonly zstd_compress: (a: number, b: number, c: number, d: number) => void;
+    readonly zstd_decompress: (a: number, b: number, c: number, d: number) => void;
+    readonly wasm_blob_ptr: () => number;
+    readonly wasm_in_ptr: () => number;
+    readonly wasm_out_ptr: () => number;
+    readonly wasm_out_cap: () => number;
+    readonly stream_blob_len: () => number;
+    readonly stream_out_len: () => number;
+    readonly get_wasm_memory: () => number;
+    readonly __wbindgen_export: (a: number, b: number) => number;
+    readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
+    readonly __wbindgen_export3: (a: number, b: number, c: number) => void;
 }
 
 export type SyncInitInput = BufferSource | WebAssembly.Module;

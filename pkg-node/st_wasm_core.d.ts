@@ -12,17 +12,69 @@ export function build_worldbook_matcher(worldbook_json: string): number;
  */
 export function count_tokens(text: string): number;
 
+export function get_g0_constants(): any;
+
+/**
+ * Returns current linear WASM memory size in bytes (`pages * 65536`). Must remain `<= 8 MiB` at Gate G1.
+ */
+export function get_linear_memory_bytes(): number;
+
 export function get_wasm_core_version(): string;
+
+/**
+ * Exposes the WASM module's linear `WebAssembly.Memory` for zero-copy `Uint8Array` views in JS/Workers.
+ */
+export function get_wasm_memory(): any;
 
 /**
  * Lấy thông tin thống kê của bộ quét Worldbook.
  */
 export function get_worldbook_matcher_stats(): any;
 
+export function hash_blake3_64(data: Uint8Array): bigint;
+
+export function hash_blake3_hex(data: Uint8Array): string;
+
+export function hash_stream_begin(): void;
+
+export function hash_stream_end_blake3_hex(): string;
+
+export function hash_stream_end_xxh64_hex(): string;
+
+export function hash_stream_update_in_buf(in_len: number): void;
+
+export function hash_xxh64(data: Uint8Array): bigint;
+
+export function hash_xxh64_hex(data: Uint8Array): string;
+
 /**
  * Quét một lượt duy nhất toàn bộ văn bản chat (O(N + M)).
  */
 export function scan_worldbook_text(haystack: string): Uint32Array;
+
+export function stream_begin(mode: number, scrub_flags: number, cold_threshold_bytes: number, keep_last_messages: number, expected_total_messages: number): void;
+
+export function stream_blob_len(): number;
+
+export function stream_feed_begin(in_len: number): void;
+
+export function stream_finish(): number;
+
+export function stream_get_blob_meta(): any;
+
+export function stream_get_stats(): any;
+
+export function stream_last_error(): string;
+
+export function stream_out_len(): number;
+
+export function stream_step(): number;
+
+export function stv3_decode_in_buf(in_len: number): number;
+
+export function stv3_encode_in_buf(in_len: number, flags: number, codec_pref: number, timestamp_ms: number): number;
+
+export function stv3_inspect_header(blob: Uint8Array): any;
 
 /**
  * Tính toán ngân sách token và cắt tỉa tin nhắn vượt quá max_context.
@@ -74,3 +126,29 @@ export function vault_store_line0(line0_bytes: Uint8Array): number;
  * Trả về kích thước khối nén (bytes).
  */
 export function vault_store_message(index: number, message_bytes: Uint8Array): number;
+
+export function wasm_blob_cap(): number;
+
+export function wasm_blob_ptr(): number;
+
+export function wasm_hash_blake3_hex_in_buf(in_len: number): string;
+
+export function wasm_hash_xxh64_in_buf(in_len: number): bigint;
+
+export function wasm_in_cap(): number;
+
+export function wasm_in_ptr(): number;
+
+export function wasm_max_linear_bytes(): number;
+
+export function wasm_out_cap(): number;
+
+export function wasm_out_ptr(): number;
+
+export function wasm_zstd_compress_in_buf(in_len: number, level: number): number;
+
+export function wasm_zstd_decompress_in_buf(in_len: number): number;
+
+export function zstd_compress(data: Uint8Array, level: number): Uint8Array;
+
+export function zstd_decompress(compressed: Uint8Array, max_output: number): Uint8Array;
