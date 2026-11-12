@@ -54,13 +54,11 @@ async function runAllTests() {
         
         const requiredFiles = [
             'manifest.json',
-            'package.json',
             'index.js',
             'dom-virtual-scroller.js',
             'iframe-lazy-mounter.js',
             'proxy-variable-guard.js',
             'wasm-bridge.js',
-            'st_server_addon.node',
             path.join('pkg', 'st_wasm_core_bg.wasm'),
             path.join('pkg', 'st_wasm_core.js')
         ];
@@ -139,7 +137,7 @@ async function runAllTests() {
     // =========================================================================
     console.log(`\n=== PHẦN 3: KIỂM CHỨNG END-TO-END TRÊN DỮ LIỆU THẬT SENSEI ===`);
 
-    const extAddon = require(path.join(EXTENSION_DEST, 'st_server_addon.node'));
+    const extAddon = require(path.join(PLUGIN_DEST, 'st_server_addon.node'));
 
     runTest('Bóc tách thẻ thật 47.86MB & Cắt tỉa 46.8MB json_data qua Server Addon', () => {
         assert(fs.existsSync(REAL_CARD_PATH), `Card không tồn tại: ${REAL_CARD_PATH}`);
@@ -163,7 +161,7 @@ async function runAllTests() {
 
     runTest('Nén và truy xuất file chat thật 33.85MB qua WASM Vault', () => {
         assert(fs.existsSync(REAL_CHAT_PATH), `Chat không tồn tại: ${REAL_CHAT_PATH}`);
-        const extWasm = require(path.join(EXTENSION_DEST, 'pkg', 'st_wasm_core.js'));
+        const extWasm = require(path.join(EXTENSION_DEST, 'pkg-node', 'st_wasm_core.js'));
 
         const rawChat = fs.readFileSync(REAL_CHAT_PATH, 'utf8');
         const lines = rawChat.split(/\r?\n/).filter(l => l.trim().length > 0);

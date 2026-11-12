@@ -26,7 +26,7 @@ const PLUGIN_DEST = path.join(ST_ROOT, 'plugins', 'st-rust-accelerator');
 
 // Nạp Addon và Wasm từ Extension đã tích hợp trong SillyTavern
 const serverAddon = require(path.join(PLUGIN_DEST, 'st_server_addon.node'));
-const wasmCore = require(path.join(EXTENSION_DEST, 'pkg', 'st_wasm_core.js'));
+const wasmCore = require(path.join(EXTENSION_DEST, 'pkg-node', 'st_wasm_core.js'));
 
 let testsPassed = 0;
 let testsFailed = 0;
