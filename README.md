@@ -136,5 +136,5 @@ st-rust-accelerator/
 
 ## 6. Giấy Phép & Bản Quyền
 
-Dự án được phát triển bởi **Nukumizu (Sensei) & Tawa** dành riêng cho cộng đồng SillyTavern.  
+Dự án được phát triển bởi **Nukumizu**
 Giấy phép: **MIT License**.
