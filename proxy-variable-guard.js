@@ -73,6 +73,17 @@ class ProxyVariableGuard {
     }
 
     /**
+     * Bọc bảo vệ toàn bộ object message (tự động gắn CoW Proxy cho trường variables).
+     */
+    static protectMessage(msg) {
+        if (!msg || typeof msg !== 'object') return msg;
+        if (msg.variables && typeof msg.variables === 'object') {
+            msg.variables = ProxyVariableGuard.createCoWProxy(msg.variables);
+        }
+        return msg;
+    }
+
+    /**
      * Chặn đứng việc gọi klona() hoặc structuredClone() trên object 34MB:
      * Trả về snapshot phẳng chỉ chứa các trường cần thiết.
      */

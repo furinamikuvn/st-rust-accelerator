@@ -221,14 +221,19 @@ function installSettingsDrawer() {
     const icon = drawer.querySelector('.inline-drawer-icon');
 
     toggleHeader.addEventListener('click', () => {
-        const isHidden = content.style.display === 'none';
-        content.style.display = isHidden ? 'block' : 'none';
-        if (icon) {
-            icon.classList.toggle('down', !isHidden);
-            icon.classList.toggle('up', isHidden);
+        // Nếu không có jQuery/ST Core slideToggle xử lý (như trong Unit Test), tự fallback toggle
+        if (typeof window.$ === 'undefined' || !window.$.fn || !window.$.fn.slideToggle) {
+            const isHidden = content.style.display === 'none';
+            content.style.display = isHidden ? 'block' : 'none';
+            if (icon) {
+                icon.classList.toggle('down', !isHidden);
+                icon.classList.toggle('up', isHidden);
+            }
         }
-        updateTelemetryUI();
-        checkServerStatus();
+        setTimeout(() => {
+            updateTelemetryUI();
+            checkServerStatus();
+        }, 60);
     });
 
     // Lắng nghe sự kiện Bật/Tắt Checkbox:
@@ -335,8 +340,12 @@ async function checkServerStatus() {
         badge.style.background = '#eab308';
         badge.textContent = 'Đang dò...';
 
-        const res = await originalFetch('/api/plugins/st-rust-accelerator/status');
-        if (res.ok) {
+        let res = await originalFetch('/api/plugins/st-rust-accelerator/status').catch(() => null);
+        if (!res || !res.ok) {
+            // Auto-Healing: Thử route lặp nếu SillyTavern plugin loader phiên bản cũ mount kép router
+            res = await originalFetch('/api/plugins/st-rust-accelerator/api/plugins/st-rust-accelerator/status').catch(() => null);
+        }
+        if (res && res.ok) {
             const data = await res.json();
             if (data.rust_ready) {
                 badge.style.background = '#16a34a';
