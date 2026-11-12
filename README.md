@@ -75,23 +75,41 @@ st-rust-accelerator/
 
 ## 4. Hướng Dẫn Cài Đặt & Sử Dụng
 
-### 4.1. Cài đặt Tiện ích Client (Frontend)
-Sao chép thư mục `extension/` vào thư mục extension của SillyTavern:
-```bash
-cp -r extension/ /path/to/SillyTavern/public/scripts/extensions/third-party/st-rust-accelerator
-```
-Tiện ích sẽ tự động nạp và kích hoạt khi mở SillyTavern trên trình duyệt.
+### 4.1. Cài Đặt 1-Click Qua Giao Diện SillyTavern (Khuyên Dùng)
 
-### 4.2. Cài đặt Plugin Server Native (Backend)
-Sao chép thư mục `server-plugin/` và file nhị phân `st_server_addon.node`:
+Bạn có thể cài đặt trực tiếp tiện ích mở rộng này bằng cách dán URL GitHub vào giao diện SillyTavern:
+
+1. Mở giao diện SillyTavern trên trình duyệt.
+2. Bấm vào biểu tượng **Extensions (Tiện ích mở rộng)** ở thanh công cụ góc trên bên phải.
+3. Chọn mục **Install Extension (Cài đặt tiện ích mở rộng)**.
+4. Dán trực tiếp đường link GitHub này vào ô nhập URL:
+   ```text
+   https://github.com/furinamikuvn/st-rust-accelerator
+   ```
+5. Nhấn nút **Save / Install** $\rightarrow$ SillyTavern sẽ tự động tải về, nhận diện `manifest.json` và kích hoạt ngay lập tức!
+6. Khi có bản cập nhật mới, bạn chỉ cần bấm nút **Check for Updates** ngay trên giao diện để cập nhật bằng 1 click.
+
+---
+
+### 4.2. Cài Đặt Thủ Công Bằng Git Clone (Dành Cho Developer)
+Nếu muốn cài đặt thủ công qua dòng lệnh Terminal:
 ```bash
-cp -r server-plugin/ /path/to/SillyTavern/plugins/st-rust-accelerator
+git clone --depth 1 https://github.com/furinamikuvn/st-rust-accelerator.git /path/to/SillyTavern/public/scripts/extensions/third-party/st-rust-accelerator
 ```
-Trong file `config.yaml` của SillyTavern, bật:
-```yaml
-enableServerPlugins: true
-```
-Khởi động lại SillyTavern để kích hoạt 5 endpoint Native I/O siêu tốc.
+
+---
+
+### 4.3. Kích Hoạt Plugin Server Native (Tùy Chọn Nâng Cao — Tăng Tốc Ghi Đĩa 2.300x)
+Để kích hoạt thêm lõi Rust Native Addon ở tầng Server Express (giúp lưu chat trong 0.05ms):
+1. Sao chép thư mục `server-plugin/` và file nhị phân `st_server_addon.node` vào thư mục plugins của SillyTavern:
+   ```bash
+   cp -r server-plugin/ /path/to/SillyTavern/plugins/st-rust-accelerator
+   ```
+2. Mở file `config.yaml` của SillyTavern, tìm và bật:
+   ```yaml
+   enableServerPlugins: true
+   ```
+3. Khởi động lại SillyTavern để kích hoạt 5 endpoint Native I/O siêu tốc.
 
 ---
 
