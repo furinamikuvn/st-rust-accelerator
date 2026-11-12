@@ -1,4 +1,4 @@
 {
-  "name": "st-wasm-core-pkg",
-  "type": "commonjs"
+  "name": "st-wasm-core-web",
+  "type": "module"
 }

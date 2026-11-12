@@ -1,22 +1,36 @@
 /**
- * INDEX.JS — EXTENSION ENTRYPOINT & QUAD-SHIELD NETWORK INTERCEPTOR
- * Dự án: ST-RUST-ACCELERATOR (SillyTavern Extension)
- * Khởi động toàn bộ Suite tối ưu hóa: Network Interceptor, WASM Vault, Virtual Scroller, Lazy Mounter
- * Cung cấp UI Settings Drawer điều khiển Bật/Tắt tính năng theo thời gian thực (A/B Testing).
+ * INDEX.JS — EXTENSION ENTRYPOINT & THE COMPLETE 6-LAYER ACCELERATION SUITE
+ * Dự án: ST-RUST-ACCELERATOR (SillyTavern Extension Suite)
+ * 
+ * Khởi động toàn bộ Suite 6 lá chắn tối ưu hóa:
+ * 1. Network Interceptor & Cắt tỉa json_data 46.8MB (Shield 2)
+ * 2. WASM LZ4 Chat Vault & SIMD Tokenizer (Shield 3 & D4)
+ * 3. DOM Virtual Scroller (Khóa cứng 15-18 tin nhắn, 60 FPS) (D7)
+ * 4. Lazy Iframe HUD Mounter (Sleep 60MB RAM/tab)
+ * 5. CSS Compositor & Layer Guard (Cô lập containment & đóng băng 73 keyframes) (P6)
+ * 6. Canvas Motion Throttler (Điều tốc thông minh 0/30/60 FPS cho 7.8% thẻ có Canvas) (P7)
+ * 
+ * Cung cấp UI Settings Drawer điều khiển Bật/Tắt theo thời gian thực (A/B Testing & Telemetry).
  */
 
 import { initWasm, isWasmReady, storeLine0InVault, getLine0FromVault, storeMessageInVault, getMessageFromVault, assembleContextFromVault, buildWorldbookMatcher, scanWorldbookFast, countTokens, trimContextBudget } from './wasm-bridge.js';
 import { VirtualScroller } from './dom-virtual-scroller.js';
 import { IframeLazyMounter } from './iframe-lazy-mounter.js';
 import { ProxyVariableGuard } from './proxy-variable-guard.js';
+import { CssCompositorGuard } from './css-compositor-guard.js';
+import { CanvasThrottler } from './canvas-throttler.js';
 
 let originalFetch = null;
 let scrollerInstance = null;
 let lazyMounterInstance = null;
+let compositorGuardInstance = null;
+let canvasThrottlerInstance = null;
 
 let isInterceptorEnabled = true;
 let isScrollerEnabled = true;
 let isLazyMounterEnabled = true;
+let isCompositorGuardEnabled = true;
+let isCanvasThrottlerEnabled = true;
 
 let totalStrippedBytes = 0;
 let totalInterceptedChats = 0;
@@ -65,43 +79,47 @@ function initNetworkInterceptor() {
                     }
                 }
             } catch (err) {
-                console.warn('[ST-Rust] Lỗi intercept character, trả về phản hồi gốc:', err);
+                console.warn('[ST-Rust] Lỗi xử lý intercept /api/characters/get (Fail-Safe nhả luồng gốc):', err);
             }
             return response;
         }
 
-        // 2. CHẶN ROUTE /api/chats/get (Đẩy Line 0 & tin nhắn cũ vào WASM Vault)
+        // 2. CHẶN ROUTE /api/chats/get (Đẩy Line 0 và chat cũ vào WASM Vault)
         if (url.includes('/api/chats/get')) {
             const response = await originalFetch.apply(this, arguments);
             try {
                 const cloned = response.clone();
-                const data = await cloned.json();
+                const chatArray = await cloned.json();
 
-                if (Array.isArray(data) && data.length > 0) {
+                if (Array.isArray(chatArray) && chatArray.length > 0) {
                     totalInterceptedChats++;
-                    console.log(`[ST-Rust] Intercept chat [${data.length} messages]. Đang đồng bộ vào WASM LZ4 Vault...`);
 
-                    // Nén Line 0 metadata vào WASM Vault
-                    const line0 = data[0];
-                    if (line0) {
-                        const line0Str = JSON.stringify(line0);
-                        if (line0Str.length > 10000) {
-                            storeLine0InVault(line0Str);
+                    // Lưu Line 0 (Chat Metadata) vào WASM Vault
+                    if (chatArray[0] && isWasmReady()) {
+                        const line0Str = JSON.stringify(chatArray[0]);
+                        storeLine0InVault(line0Str);
+                    }
+
+                    // Tự động bọc ProxyVariableGuard cho tin nhắn có biến số lớn
+                    for (let i = 0; i < chatArray.length; i++) {
+                        const msg = chatArray[i];
+                        if (msg && msg.variables && typeof msg.variables === 'object') {
+                            chatArray[i] = ProxyVariableGuard.protectMessage(msg);
                         }
                     }
 
-                    // Nén các tin nhắn cũ ngoài viewport vào WASM Vault
-                    for (let i = 1; i < data.length; i++) {
-                        storeMessageInVault(i, data[i]);
-                    }
+                    return new Response(JSON.stringify(chatArray), {
+                        status: response.status,
+                        statusText: response.statusText,
+                        headers: response.headers
+                    });
                 }
             } catch (err) {
-                console.warn('[ST-Rust] Lỗi intercept chat, trả về phản hồi gốc:', err);
+                console.warn('[ST-Rust] Lỗi xử lý intercept /api/chats/get (Fail-Safe nhả luồng gốc):', err);
             }
             return response;
         }
 
-        // Chuyển tiếp các request thông thường không can thiệp
         return originalFetch.apply(this, arguments);
     };
 
@@ -109,13 +127,13 @@ function initNetworkInterceptor() {
 }
 
 /**
- * CÀI ĐẶT BẢNG ĐIỀU KHIỂN EXTENSION SETTINGS DRAWER
+ * GẮN BẢNG ĐIỀU KHIỂN SETTINGS DRAWER TRONG SILLYTAVERN UI
  */
 function installSettingsDrawer() {
     if (typeof document === 'undefined') return;
     if (document.getElementById('st-rust-accelerator-drawer')) return;
 
-    const container = document.querySelector('#extensions_settings2, #extensions_settings, #rm_extensions_block .extensions_block');
+    const container = document.querySelector('#extensions_settings') || document.querySelector('#rm_extensions_block') || document.body;
     if (!container) {
         setTimeout(installSettingsDrawer, 1000);
         return;
@@ -126,7 +144,7 @@ function installSettingsDrawer() {
     drawer.className = 'inline-drawer';
     drawer.innerHTML = `
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b>🚀 ST Rust Accelerator (Lõi Tối Ưu Rust & Wasm)</b>
+            <b>🚀 ST Rust Accelerator (Lõi Tối Ưu Rust & Wasm v2.0)</b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content" style="padding: 10px; font-size: 0.9em; display: none;">
@@ -150,14 +168,28 @@ function installSettingsDrawer() {
             <div style="margin-bottom: 10px;">
                 <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
                     <input type="checkbox" id="st-rust-toggle-interceptor" ${isInterceptorEnabled ? 'checked' : ''}>
-                    <span><b>Cắt tỉa Card & WASM LZ4 Vault</b> <small style="opacity: 0.8;">(Cắt 46.8MB json_data rác, giảm 70% V8 Heap)</small></span>
+                    <span><b>Cắt tỉa Card & WASM LZ4 Vault</b> <small style="opacity: 0.8;">(Cắt 46.8MB json_data rác, giảm 73% V8 Heap)</small></span>
+                </label>
+            </div>
+
+            <div style="margin-bottom: 10px;">
+                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+                    <input type="checkbox" id="st-rust-toggle-lazymounter" ${isLazyMounterEnabled ? 'checked' : ''}>
+                    <span><b>Lazy Iframe HUD Mounter</b> <small style="opacity: 0.8;">(Sleep iframe ngầm, tiết kiệm 60MB RAM/tab)</small></span>
+                </label>
+            </div>
+
+            <div style="margin-bottom: 10px;">
+                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+                    <input type="checkbox" id="st-rust-toggle-compositor" ${isCompositorGuardEnabled ? 'checked' : ''}>
+                    <span><b>CSS Compositor Guard (P6)</b> <small style="opacity: 0.8;">(Khóa 73 Animation & Kính Mờ khi cuộn)</small></span>
                 </label>
             </div>
 
             <div style="margin-bottom: 12px;">
                 <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
-                    <input type="checkbox" id="st-rust-toggle-lazymounter" ${isLazyMounterEnabled ? 'checked' : ''}>
-                    <span><b>Lazy Iframe HUD Mounter</b> <small style="opacity: 0.8;">(Sleep iframe ngầm, tiết kiệm 60MB RAM/tab)</small></span>
+                    <input type="checkbox" id="st-rust-toggle-canvas" ${isCanvasThrottlerEnabled ? 'checked' : ''}>
+                    <span><b>Canvas Smart Throttler (P7)</b> <small style="opacity: 0.8;">(Điều tốc 0/30/60 FPS cho thẻ có Canvas thật)</small></span>
                 </label>
             </div>
 
@@ -168,6 +200,9 @@ function installSettingsDrawer() {
                     <div>• Thẻ đã bóc tách: <b id="st-rust-stat-cards">0</b></div>
                     <div>• DOM nodes hiện tại: <b id="st-rust-stat-dom">0</b></div>
                     <div>• Wasm Engine: <b id="st-rust-stat-wasm" style="color: #4ade80;">Sẵn sàng</b></div>
+                    <div>• HUD bảo vệ (P6): <b id="st-rust-stat-hud" style="color: #4ade80;">0</b></div>
+                    <div>• Canvas Mode (P7): <b id="st-rust-stat-canvas-mode" style="color: #38bdf8;">NONE</b></div>
+                    <div style="grid-column: span 2;">• Frame Canvas đã tiết kiệm: <b id="st-rust-stat-frames-saved" style="color: #4ade80;">0 frames</b></div>
                 </div>
             </div>
 
@@ -200,9 +235,7 @@ function installSettingsDrawer() {
     const chkScroller = drawer.querySelector('#st-rust-toggle-scroller');
     chkScroller.addEventListener('change', (e) => {
         isScrollerEnabled = e.target.checked;
-        if (scrollerInstance) {
-            scrollerInstance.setEnabled(isScrollerEnabled);
-        }
+        if (scrollerInstance) scrollerInstance.setEnabled(isScrollerEnabled);
         console.log(`[ST-Rust] Đã ${isScrollerEnabled ? 'BẬT' : 'TẮT'} DOM Virtual Scroller!`);
         updateTelemetryUI();
     });
@@ -217,10 +250,24 @@ function installSettingsDrawer() {
     const chkLazyMounter = drawer.querySelector('#st-rust-toggle-lazymounter');
     chkLazyMounter.addEventListener('change', (e) => {
         isLazyMounterEnabled = e.target.checked;
-        if (lazyMounterInstance) {
-            lazyMounterInstance.setEnabled(isLazyMounterEnabled);
-        }
+        if (lazyMounterInstance) lazyMounterInstance.setEnabled(isLazyMounterEnabled);
         console.log(`[ST-Rust] Đã ${isLazyMounterEnabled ? 'BẬT' : 'TẮT'} Iframe Lazy Mounter!`);
+        updateTelemetryUI();
+    });
+
+    const chkCompositor = drawer.querySelector('#st-rust-toggle-compositor');
+    chkCompositor.addEventListener('change', (e) => {
+        isCompositorGuardEnabled = e.target.checked;
+        if (compositorGuardInstance) compositorGuardInstance.setEnabled(isCompositorGuardEnabled);
+        console.log(`[ST-Rust] Đã ${isCompositorGuardEnabled ? 'BẬT' : 'TẮT'} CSS Compositor Guard!`);
+        updateTelemetryUI();
+    });
+
+    const chkCanvas = drawer.querySelector('#st-rust-toggle-canvas');
+    chkCanvas.addEventListener('change', (e) => {
+        isCanvasThrottlerEnabled = e.target.checked;
+        if (canvasThrottlerInstance) canvasThrottlerInstance.setEnabled(isCanvasThrottlerEnabled);
+        console.log(`[ST-Rust] Đã ${isCanvasThrottlerEnabled ? 'BẬT' : 'TẮT'} Canvas Motion Throttler!`);
         updateTelemetryUI();
     });
 
@@ -235,7 +282,7 @@ function installSettingsDrawer() {
 
     // Kiểm tra server lần đầu
     checkServerStatus();
-    console.log('[ST-Rust] Đã gắn Bảng Điều Khiển Extension Settings Drawer!');
+    console.log('[ST-Rust] Đã gắn Bảng Điều Khiển Extension Settings Drawer (Suite v2.0)!');
 }
 
 /**
@@ -246,6 +293,9 @@ function updateTelemetryUI() {
     const elCards = document.getElementById('st-rust-stat-cards');
     const elDom = document.getElementById('st-rust-stat-dom');
     const elWasm = document.getElementById('st-rust-stat-wasm');
+    const elHud = document.getElementById('st-rust-stat-hud');
+    const elCanvasMode = document.getElementById('st-rust-stat-canvas-mode');
+    const elFramesSaved = document.getElementById('st-rust-stat-frames-saved');
 
     if (elStripped) elStripped.textContent = `${(totalStrippedBytes / (1024 * 1024)).toFixed(2)} MB`;
     if (elCards) elCards.textContent = totalInterceptedCards;
@@ -259,6 +309,17 @@ function updateTelemetryUI() {
             const total = document.querySelectorAll('#chat .mes').length;
             elDom.textContent = `${total} / ${total} tin (Chưa ảo hóa)`;
         }
+    }
+
+    if (elHud && compositorGuardInstance) {
+        const compStats = compositorGuardInstance.getStats();
+        elHud.textContent = `${compStats.observedContainersCount} (Đóng băng: ${compStats.pausedContainersCount})`;
+    }
+
+    if (canvasThrottlerInstance) {
+        const canStats = canvasThrottlerInstance.getStats();
+        if (elCanvasMode) elCanvasMode.textContent = canStats.currentMode;
+        if (elFramesSaved) elFramesSaved.textContent = `${canStats.totalFramesSaved} frames`;
     }
 }
 
@@ -292,19 +353,19 @@ async function checkServerStatus() {
 }
 
 /**
- * Khởi động toàn bộ tiện ích mở rộng ST-Rust-Accelerator
+ * Khởi động toàn bộ tiện ích mở rộng ST-Rust-Accelerator Suite v2.0
  */
 async function initExtension() {
-    console.log('[ST-Rust] Đang khởi động ST-Rust-Accelerator Suite v1.0.0...');
+    console.log('[ST-Rust] Đang khởi động ST-Rust-Accelerator Suite v2.0 (Full 6-Layer Suite)...');
 
     // 1. Nạp Wasm Core
     await initWasm();
 
-    // 2. Kích hoạt Network Fetch Interceptor
+    // 2. Kích hoạt Network Fetch Interceptor (Shield 2)
     initNetworkInterceptor();
 
-    // 3. Khởi tạo DOM Virtual Scroller
     if (typeof document !== 'undefined') {
+        // 3. Khởi tạo DOM Virtual Scroller (D7)
         scrollerInstance = new VirtualScroller('#chat', {
             maxVisibleItems: 18,
             estimatedItemHeight: 120
@@ -315,17 +376,35 @@ async function initExtension() {
         lazyMounterInstance = new IframeLazyMounter();
         lazyMounterInstance.init();
 
-        // 5. Cài đặt Settings Drawer
+        // 5. Khởi tạo CSS Compositor & Layer Guard (P6)
+        compositorGuardInstance = new CssCompositorGuard({
+            chatSelector: '#chat',
+            maxBlurPx: 8
+        });
+        compositorGuardInstance.init();
+
+        // 6. Khởi tạo Canvas Motion Throttler (P7)
+        canvasThrottlerInstance = new CanvasThrottler({
+            chatSelector: '#chat',
+            targetIdleFps: 30,
+            activeDurationMs: 3000
+        });
+        canvasThrottlerInstance.init();
+
+        // 7. Cài đặt Settings Drawer
         installSettingsDrawer();
     }
 
-    // 6. Cung cấp API toàn cục cho SillyTavern & kiểm thử console
+    // 8. Cung cấp API toàn cục cho SillyTavern & kiểm thử console
     if (typeof window !== 'undefined') {
         window.__ST_RUST_ACCELERATOR = {
             isReady: isWasmReady,
             scroller: scrollerInstance,
             lazyMounter: lazyMounterInstance,
+            compositorGuard: compositorGuardInstance,
+            canvasThrottler: canvasThrottlerInstance,
             proxyGuard: ProxyVariableGuard,
+            buildMatcher: buildWorldbookMatcher,
             scanWorldbook: scanWorldbookFast,
             countTokens: countTokens,
             trimContext: trimContextBudget,
@@ -343,23 +422,37 @@ async function initExtension() {
                 if (lazyMounterInstance) lazyMounterInstance.setEnabled(val);
                 updateTelemetryUI();
             },
+            toggleCompositor: (val) => {
+                isCompositorGuardEnabled = val;
+                if (compositorGuardInstance) compositorGuardInstance.setEnabled(val);
+                updateTelemetryUI();
+            },
+            toggleCanvas: (val) => {
+                isCanvasThrottlerEnabled = val;
+                if (canvasThrottlerInstance) canvasThrottlerInstance.setEnabled(val);
+                updateTelemetryUI();
+            },
             checkServer: checkServerStatus,
             getStats: () => ({
                 wasmReady: isWasmReady(),
                 isScrollerEnabled,
                 isInterceptorEnabled,
                 isLazyMounterEnabled,
+                isCompositorGuardEnabled,
+                isCanvasThrottlerEnabled,
                 totalStrippedBytes,
                 totalStrippedMb: (totalStrippedBytes / (1024 * 1024)).toFixed(2),
                 totalInterceptedCards,
                 totalInterceptedChats,
                 scrollerStats: scrollerInstance ? scrollerInstance.getStats() : null,
                 lazyMounterStats: lazyMounterInstance ? lazyMounterInstance.getStats() : null,
+                compositorStats: compositorGuardInstance ? compositorGuardInstance.getStats() : null,
+                canvasStats: canvasThrottlerInstance ? canvasThrottlerInstance.getStats() : null,
             })
         };
     }
 
-    console.log('[ST-Rust] ST-Rust-Accelerator Suite đã sẵn sàng hoạt động 100%! 🌸✨🧠');
+    console.log('[ST-Rust] ST-Rust-Accelerator Suite v2.0 đã sẵn sàng hoạt động 100%! 🌸✨🧠🎨');
 }
 
 // Tự động khởi động khi nạp trong môi trường trình duyệt
@@ -378,6 +471,8 @@ export {
     VirtualScroller,
     IframeLazyMounter,
     ProxyVariableGuard,
+    CssCompositorGuard,
+    CanvasThrottler,
     getOriginalFetch,
     getStrippedStats
 };

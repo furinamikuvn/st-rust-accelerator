@@ -5,7 +5,7 @@
  * @param {string} worldbook_json
  * @returns {number}
  */
-function build_worldbook_matcher(worldbook_json) {
+export function build_worldbook_matcher(worldbook_json) {
     const ptr0 = passStringToWasm0(worldbook_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.build_worldbook_matcher(ptr0, len0);
@@ -14,7 +14,6 @@ function build_worldbook_matcher(worldbook_json) {
     }
     return ret[0] >>> 0;
 }
-exports.build_worldbook_matcher = build_worldbook_matcher;
 
 /**
  * Đếm số token ước lượng của văn bản bằng bộ phân tích byte UTF-8 siêu tốc.
@@ -22,18 +21,17 @@ exports.build_worldbook_matcher = build_worldbook_matcher;
  * @param {string} text
  * @returns {number}
  */
-function count_tokens(text) {
+export function count_tokens(text) {
     const ptr0 = passStringToWasm0(text, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.count_tokens(ptr0, len0);
     return ret >>> 0;
 }
-exports.count_tokens = count_tokens;
 
 /**
  * @returns {string}
  */
-function get_wasm_core_version() {
+export function get_wasm_core_version() {
     let deferred1_0;
     let deferred1_1;
     try {
@@ -45,27 +43,25 @@ function get_wasm_core_version() {
         wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
     }
 }
-exports.get_wasm_core_version = get_wasm_core_version;
 
 /**
  * Lấy thông tin thống kê của bộ quét Worldbook.
  * @returns {any}
  */
-function get_worldbook_matcher_stats() {
+export function get_worldbook_matcher_stats() {
     const ret = wasm.get_worldbook_matcher_stats();
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
     return takeFromExternrefTable0(ret[0]);
 }
-exports.get_worldbook_matcher_stats = get_worldbook_matcher_stats;
 
 /**
  * Quét một lượt duy nhất toàn bộ văn bản chat (O(N + M)).
  * @param {string} haystack
  * @returns {Uint32Array}
  */
-function scan_worldbook_text(haystack) {
+export function scan_worldbook_text(haystack) {
     const ptr0 = passStringToWasm0(haystack, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.scan_worldbook_text(ptr0, len0);
@@ -73,7 +69,6 @@ function scan_worldbook_text(haystack) {
     wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
     return v2;
 }
-exports.scan_worldbook_text = scan_worldbook_text;
 
 /**
  * Tính toán ngân sách token và cắt tỉa tin nhắn vượt quá max_context.
@@ -85,7 +80,7 @@ exports.scan_worldbook_text = scan_worldbook_text;
  * @param {boolean} always_keep_first
  * @returns {any}
  */
-function trim_context_budget(messages_json, max_tokens, reserve_tokens, always_keep_first) {
+export function trim_context_budget(messages_json, max_tokens, reserve_tokens, always_keep_first) {
     const ptr0 = passStringToWasm0(messages_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.trim_context_budget(ptr0, len0, max_tokens, reserve_tokens, always_keep_first);
@@ -94,7 +89,6 @@ function trim_context_budget(messages_json, max_tokens, reserve_tokens, always_k
     }
     return takeFromExternrefTable0(ret[0]);
 }
-exports.trim_context_budget = trim_context_budget;
 
 /**
  * Giải nén và nối chuỗi trực tiếp các tin nhắn trong bộ nhớ WASM thành mảng JSON UTF-8.
@@ -103,7 +97,7 @@ exports.trim_context_budget = trim_context_budget;
  * @param {Uint32Array} indices
  * @returns {Uint8Array}
  */
-function vault_assemble_context(indices) {
+export function vault_assemble_context(indices) {
     const ptr0 = passArray32ToWasm0(indices, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.vault_assemble_context(ptr0, len0);
@@ -114,21 +108,19 @@ function vault_assemble_context(indices) {
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v2;
 }
-exports.vault_assemble_context = vault_assemble_context;
 
 /**
  * Xóa sạch két sắt khi chuyển phiên chat mới.
  */
-function vault_clear() {
+export function vault_clear() {
     wasm.vault_clear();
 }
-exports.vault_clear = vault_clear;
 
 /**
  * Giải nén và lấy lại Line 0 metadata khi SillyTavern cần nạp hoặc lưu.
  * @returns {Uint8Array}
  */
-function vault_get_line0() {
+export function vault_get_line0() {
     const ret = wasm.vault_get_line0();
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
@@ -137,14 +129,13 @@ function vault_get_line0() {
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v1;
 }
-exports.vault_get_line0 = vault_get_line0;
 
 /**
  * Giải nén và lấy về một tin nhắn cụ thể theo index.
  * @param {number} index
  * @returns {Uint8Array}
  */
-function vault_get_message(index) {
+export function vault_get_message(index) {
     const ret = wasm.vault_get_message(index);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
@@ -153,31 +144,28 @@ function vault_get_message(index) {
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v1;
 }
-exports.vault_get_message = vault_get_message;
 
 /**
  * Lấy thống kê nén của két sắt WASM.
  * @returns {any}
  */
-function vault_get_stats() {
+export function vault_get_stats() {
     const ret = wasm.vault_get_stats();
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
     return takeFromExternrefTable0(ret[0]);
 }
-exports.vault_get_stats = vault_get_stats;
 
 /**
  * Kiểm tra tin nhắn có tồn tại trong vault không.
  * @param {number} index
  * @returns {boolean}
  */
-function vault_has_message(index) {
+export function vault_has_message(index) {
     const ret = wasm.vault_has_message(index);
     return ret !== 0;
 }
-exports.vault_has_message = vault_has_message;
 
 /**
  * Nén và lưu Line 0 (chat_metadata khổng lồ ~34.8MB) vào két sắt WASM.
@@ -185,13 +173,12 @@ exports.vault_has_message = vault_has_message;
  * @param {Uint8Array} line0_bytes
  * @returns {number}
  */
-function vault_store_line0(line0_bytes) {
+export function vault_store_line0(line0_bytes) {
     const ptr0 = passArray8ToWasm0(line0_bytes, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.vault_store_line0(ptr0, len0);
     return ret >>> 0;
 }
-exports.vault_store_line0 = vault_store_line0;
 
 /**
  * Nén và lưu trữ một tin nhắn chat vào két sắt WASM.
@@ -200,13 +187,12 @@ exports.vault_store_line0 = vault_store_line0;
  * @param {Uint8Array} message_bytes
  * @returns {number}
  */
-function vault_store_message(index, message_bytes) {
+export function vault_store_message(index, message_bytes) {
     const ptr0 = passArray8ToWasm0(message_bytes, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.vault_store_message(index, ptr0, len0);
     return ret >>> 0;
 }
-exports.vault_store_message = vault_store_message;
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
@@ -366,7 +352,15 @@ function takeFromExternrefTable0(idx) {
 
 let cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
 cachedTextDecoder.decode();
+const MAX_SAFARI_DECODE_BYTES = 2146435072;
+let numBytesDecoded = 0;
 function decodeText(ptr, len) {
+    numBytesDecoded += len;
+    if (numBytesDecoded >= MAX_SAFARI_DECODE_BYTES) {
+        cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
+        cachedTextDecoder.decode();
+        numBytesDecoded = len;
+    }
     return cachedTextDecoder.decode(getUint8ArrayMemory0().subarray(ptr, ptr + len));
 }
 
@@ -385,9 +379,97 @@ if (!('encodeInto' in cachedTextEncoder)) {
 
 let WASM_VECTOR_LEN = 0;
 
-const wasmPath = `${__dirname}/st_wasm_core_bg.wasm`;
-const wasmBytes = require('fs').readFileSync(wasmPath);
-const wasmModule = new WebAssembly.Module(wasmBytes);
-let wasmInstance = new WebAssembly.Instance(wasmModule, __wbg_get_imports());
-let wasm = wasmInstance.exports;
-wasm.__wbindgen_start();
+let wasmModule, wasmInstance, wasm;
+function __wbg_finalize_init(instance, module) {
+    wasmInstance = instance;
+    wasm = instance.exports;
+    wasmModule = module;
+    cachedDataViewMemory0 = null;
+    cachedUint32ArrayMemory0 = null;
+    cachedUint8ArrayMemory0 = null;
+    wasm.__wbindgen_start();
+    return wasm;
+}
+
+async function __wbg_load(module, imports) {
+    if (typeof Response === 'function' && module instanceof Response) {
+        if (typeof WebAssembly.instantiateStreaming === 'function') {
+            try {
+                return await WebAssembly.instantiateStreaming(module, imports);
+            } catch (e) {
+                const validResponse = module.ok && expectedResponseType(module.type);
+
+                if (validResponse && module.headers.get('Content-Type') !== 'application/wasm') {
+                    console.warn("`WebAssembly.instantiateStreaming` failed because your server does not serve Wasm with `application/wasm` MIME type. Falling back to `WebAssembly.instantiate` which is slower. Original error:\n", e);
+
+                } else { throw e; }
+            }
+        }
+
+        const bytes = await module.arrayBuffer();
+        return await WebAssembly.instantiate(bytes, imports);
+    } else {
+        const instance = await WebAssembly.instantiate(module, imports);
+
+        if (instance instanceof WebAssembly.Instance) {
+            return { instance, module };
+        } else {
+            return instance;
+        }
+    }
+
+    function expectedResponseType(type) {
+        switch (type) {
+            case 'basic': case 'cors': case 'default': return true;
+        }
+        return false;
+    }
+}
+
+function initSync(module) {
+    if (wasm !== undefined) return wasm;
+
+
+    if (module !== undefined) {
+        if (Object.getPrototypeOf(module) === Object.prototype) {
+            ({module} = module)
+        } else {
+            console.warn('using deprecated parameters for `initSync()`; pass a single object instead')
+        }
+    }
+
+    const imports = __wbg_get_imports();
+    if (!(module instanceof WebAssembly.Module)) {
+        module = new WebAssembly.Module(module);
+    }
+    const instance = new WebAssembly.Instance(module, imports);
+    return __wbg_finalize_init(instance, module);
+}
+
+async function __wbg_init(module_or_path) {
+    if (wasm !== undefined) return wasm;
+
+
+    if (module_or_path !== undefined) {
+        if (Object.getPrototypeOf(module_or_path) === Object.prototype) {
+            ({module_or_path} = module_or_path)
+        } else {
+            console.warn('using deprecated parameters for the initialization function; pass a single object instead')
+        }
+    }
+
+    if (module_or_path === undefined) {
+        module_or_path = new URL('st_wasm_core_bg.wasm', import.meta.url);
+    }
+    const imports = __wbg_get_imports();
+
+    if (typeof module_or_path === 'string' || (typeof Request === 'function' && module_or_path instanceof Request) || (typeof URL === 'function' && module_or_path instanceof URL)) {
+        module_or_path = fetch(module_or_path);
+    }
+
+    const { instance, module } = await __wbg_load(await module_or_path, imports);
+
+    return __wbg_finalize_init(instance, module);
+}
+
+export { initSync, __wbg_init as default };
