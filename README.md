@@ -134,7 +134,4 @@ st-rust-accelerator/
 
 ---
 
-## 6. Giấy Phép & Bản Quyền
-
 Dự án được phát triển bởi **Nukumizu**
-Giấy phép: **MIT License**.
