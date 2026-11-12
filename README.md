@@ -8,7 +8,7 @@
 
 ## 1. Giới thiệu Dự án
 
-**ST-Rust-Accelerator** là giải pháp kỹ nghệ lai kết hợp giữa **Lõi Hệ Thống Rust Native (Node-API)**, **Lõi Điện Toán Nhị Phân Rust WebAssembly (`.wasm`)**, và **Kỹ thuật Ảo Hóa DOM / Compositor Guard JavaScript** nhằm giải quyết triệt để 6 nút thắt cổ chai lớn nhất của SillyTavern:
+**ST-Rust-Accelerator** là giải pháp kỹ nghệ lai kết hợp giữa **Lõi Hệ Thống Rust Native (Node-API)**, **Lõi Điện Toán Nhị Phân Rust WebAssembly (`.wasm`)**, và **Kỹ thuật Ảo Hóa DOM / Compositor Guard JavaScript** nhằm giải quyết 6 nút thắt của SillyTavern:
 
 1. ⚡ **Tốc độ ghi chat I/O**: Tăng tốc từ 117 ms xuống **0.05 ms** (Nhanh hơn **2.320 LẦN** qua Append-Only WAL).
 2. 🎴 **Bóc tách thẻ PNG khổng lồ**: Tăng tốc từ 1.240 ms xuống **46 ms** (Nhanh hơn **27 LẦN**) và tự động cắt tỉa 46.8MB `json_data` thừa thãi.
