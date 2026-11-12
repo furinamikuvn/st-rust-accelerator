@@ -8,6 +8,8 @@
 import { ProxyVariableGuard } from './proxy-variable-guard.js';
 
 const STRIPPED_SENTINEL = '__ST_RUST_STRIPPED__';
+const UNSET_SENTINEL = '__@@UNSET@@__';
+const MERGE_CONTROL_KEYS = new Set(['avatar', 'avatars', 'filter', 'json_data']);
 const DEFAULT_MAX_CACHE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_CHATS = 5;
 
@@ -18,8 +20,8 @@ function debugLog(message, ...args) {
 }
 
 /**
- * Recursively applies partial attribute updates into a target object (in-place).
- * Used to keep cached `json_data` synchronized when `/api/characters/merge-attributes` runs.
+ * Recursively applies partial attribute updates into a target object (in-place),
+ * respecting SillyTavern's `__@@UNSET@@__` sentinel deletion convention.
  *
  * @param {Object} target
  * @param {Object} source
@@ -32,6 +34,10 @@ function deepMergeInPlace(target, source) {
     for (const key of Object.keys(source)) {
         const srcVal = source[key];
         if (srcVal === undefined) continue;
+        if (srcVal === UNSET_SENTINEL) {
+            delete target[key];
+            continue;
+        }
         if (
             srcVal !== null &&
             typeof srcVal === 'object' &&
@@ -46,6 +52,24 @@ function deepMergeInPlace(target, source) {
         }
     }
     return target;
+}
+
+/**
+ * Removes `/api/characters/merge-attributes` control keys (`avatar`, `avatars`, `filter`, `json_data`)
+ * so they are never merged into root card JSON data.
+ *
+ * @param {Object} mergePayload
+ * @returns {Object}
+ */
+function sanitizeMergePayload(mergePayload) {
+    if (!mergePayload || typeof mergePayload !== 'object') return {};
+    const clean = {};
+    for (const key of Object.keys(mergePayload)) {
+        if (!MERGE_CONTROL_KEYS.has(key)) {
+            clean[key] = mergePayload[key];
+        }
+    }
+    return clean;
 }
 
 /**
@@ -103,6 +127,7 @@ class RehydrationGuard {
         this.maxCacheBytes = options.maxCacheBytes ?? DEFAULT_MAX_CACHE_BYTES;
         this.maxChatSnapshots = options.maxChatSnapshots ?? DEFAULT_MAX_CHATS;
         this.getOriginalFetch = options.getOriginalFetch || (() => (typeof window !== 'undefined' ? window.fetch : null));
+        this.getRequestHeaders = options.getRequestHeaders || null;
         this.getLine0FromVault = options.getLine0FromVault || (() => null);
         this.getMessageFromVault = options.getMessageFromVault || (() => null);
 
@@ -119,6 +144,7 @@ class RehydrationGuard {
             charactersRehydrated: 0,
             characterFormSyncs: 0,
             cacheMissRecoveries: 0,
+            failClosedEditBlocks: 0,
             mergeAttributePatches: 0,
             invalidations: 0,
             chatsCaptured: 0,
@@ -237,6 +263,22 @@ class RehydrationGuard {
     }
 
     /**
+     * Clears the entire warm character LRU cache (used for bulk `avatars: []` merge-attributes).
+     * Preserves `knownStrippedAvatars` by default so Fail-Closed protection stays armed.
+     *
+     * @param {Object} [options={}]
+     */
+    clearCharacterCache(options = { keepKnownFlag: true }) {
+        const clearedCount = this.characterCache.size;
+        this.characterCache.clear();
+        this.currentCacheBytes = 0;
+        if (options.keepKnownFlag === false) {
+            this.knownStrippedAvatars.clear();
+        }
+        this.stats.invalidations += clearedCount || 1;
+    }
+
+    /**
      * Keeps cached `json_data` and active `#character_json_data` form field aligned
      * when extensions write attributes via `/api/characters/merge-attributes`.
      *
@@ -248,6 +290,9 @@ class RehydrationGuard {
         const key = String(avatar || '').trim();
         if (!key || !mergePayload || typeof mergePayload !== 'object') return false;
 
+        const cleanUpdate = sanitizeMergePayload(mergePayload);
+        if (Object.keys(cleanUpdate).length === 0) return false;
+
         const cached = this.getCachedCharacterJson(key);
         if (!cached) {
             this.invalidateCharacter(key, { keepKnownFlag: true });
@@ -256,7 +301,7 @@ class RehydrationGuard {
 
         try {
             const parsed = JSON.parse(cached);
-            deepMergeInPlace(parsed, mergePayload);
+            deepMergeInPlace(parsed, cleanUpdate);
             const updatedStr = JSON.stringify(parsed);
 
             const prev = this.characterCache.get(key);
@@ -291,13 +336,85 @@ class RehydrationGuard {
     }
 
     /**
-     * Resolves full `json_data` from warm cache, falling back cleanly to server `/api/characters/get`.
+     * Collects SillyTavern request headers (`X-CSRF-Token`, etc.) for authenticated fallback fetches.
+     *
+     * @param {HeadersInit|null} [extraHeaders=null]
+     * @returns {Object}
+     */
+    _buildJsonHeaders(extraHeaders = null) {
+        const headers = {};
+        const headerSources = [];
+
+        if (typeof this.getRequestHeaders === 'function') {
+            try { headerSources.push(this.getRequestHeaders()); } catch (_) {}
+        }
+        if (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) {
+            try {
+                const ctx = SillyTavern.getContext();
+                if (ctx && typeof ctx.getRequestHeaders === 'function') {
+                    headerSources.push(ctx.getRequestHeaders());
+                }
+            } catch (_) {}
+        }
+        if (typeof window !== 'undefined' && typeof window.getRequestHeaders === 'function') {
+            try { headerSources.push(window.getRequestHeaders()); } catch (_) {}
+        }
+
+        for (const src of headerSources) {
+            if (!src || typeof src !== 'object') continue;
+            for (const k of Object.keys(src)) {
+                if (typeof src[k] === 'string' && src[k].length > 0) {
+                    headers[k] = src[k];
+                }
+            }
+        }
+
+        if (extraHeaders) {
+            const csrfFromExtra = this._readHeader(extraHeaders, 'x-csrf-token');
+            if (csrfFromExtra) {
+                headers['X-CSRF-Token'] = csrfFromExtra;
+            }
+        }
+
+        headers['Content-Type'] = 'application/json';
+        return headers;
+    }
+
+    /**
+     * Checks whether this card's `json_data` was previously stripped by ST-Rust.
      *
      * @param {string} avatar
-     * @param {Function} [fetchFn]
+     * @returns {boolean}
+     */
+    _isAvatarKnownStripped(avatar) {
+        const key = String(avatar || '').trim();
+        if (!key) return false;
+        if (this.knownStrippedAvatars.has(key)) return true;
+
+        try {
+            let chars = null;
+            if (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) {
+                chars = SillyTavern.getContext()?.characters;
+            }
+            if (!Array.isArray(chars) && typeof window !== 'undefined') {
+                chars = window.characters;
+            }
+            if (Array.isArray(chars)) {
+                return chars.some(c => c && this.getCharacterKey(c) === key && Boolean(c.__st_rust_stripped));
+            }
+        } catch (_) {}
+        return false;
+    }
+
+    /**
+     * Resolves full `json_data` from warm cache, falling back to authenticated `/api/characters/get`.
+     *
+     * @param {string} avatar
+     * @param {Function|null} [fetchFn=null]
+     * @param {HeadersInit|null} [extraHeaders=null]
      * @returns {Promise<string|null>}
      */
-    async resolveCharacterJsonData(avatar, fetchFn = null) {
+    async resolveCharacterJsonData(avatar, fetchFn = null, extraHeaders = null) {
         const key = String(avatar || '').trim();
         if (!key) return null;
 
@@ -310,7 +427,7 @@ class RehydrationGuard {
         try {
             const res = await upstreamFetch('/api/characters/get', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: this._buildJsonHeaders(extraHeaders),
                 body: JSON.stringify({ avatar_url: key }),
             });
             if (!res || !res.ok) return null;
@@ -328,6 +445,23 @@ class RehydrationGuard {
             }
         } catch (err) {
             debugLog(`Cache-miss server recovery failed for "${key}":`, err);
+        }
+        return null;
+    }
+
+    /**
+     * Resolves stripped `json_data` for `/api/characters/edit` or fails closed to prevent PNG data loss.
+     */
+    async _resolveStrippedJsonOrThrow(avatar, fetchFn, extraHeaders) {
+        const restored = await this.resolveCharacterJsonData(avatar, fetchFn, extraHeaders);
+        if (restored) {
+            return restored;
+        }
+        if (this._isAvatarKnownStripped(avatar)) {
+            this.stats.failClosedEditBlocks++;
+            throw new Error(
+                `[ST-Rust] Fail-closed data-loss protection: aborted POST /api/characters/edit for stripped card "${avatar}" because json_data re-hydration failed.`
+            );
         }
         return null;
     }
@@ -386,8 +520,8 @@ class RehydrationGuard {
 
     /**
      * Guards `POST /api/characters/edit` payloads (FormData, URLSearchParams, or JSON string).
-     * Only rehydrates when incoming `json_data` is empty or holds a stripped sentinel,
-     * preserving intentional edits such as World Info `character_book` removal.
+     * Rehydrates empty/sentinel `json_data` and enforces fail-closed blocking if a stripped card
+     * cannot be recovered (e.g. missing CSRF token / 403 / offline).
      *
      * @param {RequestInit} init
      * @param {Function} [fetchFn]
@@ -406,7 +540,7 @@ class RehydrationGuard {
             }
             if (!avatar) return { modified: false, avatar: '', byteLength: 0 };
 
-            const restored = await this.resolveCharacterJsonData(avatar, fetchFn);
+            const restored = await this._resolveStrippedJsonOrThrow(avatar, fetchFn, init.headers);
             if (!restored) return { modified: false, avatar, byteLength: 0 };
 
             init.body.set('json_data', restored);
@@ -419,7 +553,7 @@ class RehydrationGuard {
             const avatar = String(init.body.get('avatar_url') || '').trim();
             const rawJson = String(init.body.get('json_data') || '').trim();
             if ((rawJson === '' || rawJson === STRIPPED_SENTINEL) && avatar) {
-                const restored = await this.resolveCharacterJsonData(avatar, fetchFn);
+                const restored = await this._resolveStrippedJsonOrThrow(avatar, fetchFn, init.headers);
                 if (restored) {
                     init.body.set('json_data', restored);
                     this.stats.charactersRehydrated++;
@@ -430,23 +564,24 @@ class RehydrationGuard {
         }
 
         if (typeof init.body === 'string' && init.body.trim().startsWith('{')) {
+            let bodyObj;
             try {
-                const bodyObj = JSON.parse(init.body);
-                const avatar = String(bodyObj.avatar_url || bodyObj.avatar || '').trim();
-                const rawJson = typeof bodyObj.json_data === 'string' ? bodyObj.json_data.trim() : '';
-                if ((rawJson === '' || rawJson === STRIPPED_SENTINEL) && avatar) {
-                    const restored = await this.resolveCharacterJsonData(avatar, fetchFn);
-                    if (restored) {
-                        bodyObj.json_data = restored;
-                        init.body = JSON.stringify(bodyObj);
-                        this.stats.charactersRehydrated++;
-                        return { modified: true, avatar, byteLength: restored.length };
-                    }
-                }
-                return { modified: false, avatar, byteLength: rawJson.length };
+                bodyObj = JSON.parse(init.body);
             } catch (_) {
                 return { modified: false, avatar: '', byteLength: 0 };
             }
+            const avatar = String(bodyObj.avatar_url || bodyObj.avatar || '').trim();
+            const rawJson = typeof bodyObj.json_data === 'string' ? bodyObj.json_data.trim() : '';
+            if ((rawJson === '' || rawJson === STRIPPED_SENTINEL) && avatar) {
+                const restored = await this._resolveStrippedJsonOrThrow(avatar, fetchFn, init.headers);
+                if (restored) {
+                    bodyObj.json_data = restored;
+                    init.body = JSON.stringify(bodyObj);
+                    this.stats.charactersRehydrated++;
+                    return { modified: true, avatar, byteLength: restored.length };
+                }
+            }
+            return { modified: false, avatar, byteLength: rawJson.length };
         }
 
         return { modified: false, avatar: '', byteLength: 0 };

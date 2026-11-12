@@ -165,6 +165,30 @@ function tryParseJsonBody(body) {
     }
 }
 
+function createJsonResponse(payloadObj, originalResponse) {
+    let headers;
+    if (typeof Headers !== 'undefined') {
+        headers = new Headers(originalResponse.headers || {});
+        headers.delete('content-length');
+        headers.delete('content-encoding');
+        headers.set('content-type', 'application/json; charset=utf-8');
+    } else {
+        headers = { ...(originalResponse.headers || {}) };
+        for (const key of Object.keys(headers)) {
+            const lower = key.toLowerCase();
+            if (lower === 'content-length' || lower === 'content-encoding') {
+                delete headers[key];
+            }
+        }
+        headers['Content-Type'] = 'application/json; charset=utf-8';
+    }
+    return new Response(JSON.stringify(payloadObj), {
+        status: originalResponse.status,
+        statusText: originalResponse.statusText,
+        headers,
+    });
+}
+
 async function handleCharacterReadResponse(fetchCtx, args) {
     const response = await originalFetch.apply(fetchCtx, args);
     try {
@@ -197,11 +221,7 @@ async function handleCharacterReadResponse(fetchCtx, args) {
             saveTelemetryStorage();
             updateTelemetryUI();
 
-            return new Response(JSON.stringify(data), {
-                status: response.status,
-                statusText: response.statusText,
-                headers: response.headers
-            });
+            return createJsonResponse(data, response);
         }
     } catch (err) {
         console.warn('[ST-Rust] Error intercepting character payload (pass-through active):', err);
@@ -249,11 +269,7 @@ async function handleChatGetResponse(fetchCtx, args, init) {
                 hasProxiedVariables: hasProxied,
             });
 
-            return new Response(JSON.stringify(ProxyVariableGuard.unwrap(chatArray)), {
-                status: response.status,
-                statusText: response.statusText,
-                headers: response.headers
-            });
+            return createJsonResponse(ProxyVariableGuard.unwrap(chatArray), response);
         }
     } catch (err) {
         console.warn('[ST-Rust] Error intercepting chat payload (pass-through active):', err);
@@ -273,8 +289,18 @@ async function handleCharacterEditRequest(fetchCtx, resource, init) {
 async function handleCharacterMergeAttributes(fetchCtx, resource, init) {
     const reqObj = tryParseJsonBody(init && init.body);
     const response = await originalFetch.call(fetchCtx, resource, init);
-    if (response && response.ok && reqObj && reqObj.avatar) {
-        rehydrationGuard.applyMergeAttributes(reqObj.avatar, reqObj);
+    if (response && response.ok && reqObj) {
+        if (Array.isArray(reqObj.avatars)) {
+            if (reqObj.avatars.length === 0) {
+                rehydrationGuard.clearCharacterCache({ keepKnownFlag: true });
+            } else {
+                for (const av of reqObj.avatars) {
+                    rehydrationGuard.invalidateCharacter(av, { keepKnownFlag: true });
+                }
+            }
+        } else if (reqObj.avatar) {
+            rehydrationGuard.applyMergeAttributes(reqObj.avatar, reqObj);
+        }
     }
     return response;
 }
@@ -604,9 +630,12 @@ function installEventSourceHooks() {
         ev.on('character_editor_opened', (chid) => {
             rehydrationGuard.syncCharacterFormDom(chid, getActiveCharactersArray());
         });
-        ev.on('character_edited', (chid) => {
+        ev.on('character_edited', (payload) => {
             const chars = getActiveCharactersArray();
-            const charObj = chars && chars[Number(chid)];
+            const detailObj = payload && payload.detail ? payload.detail : payload;
+            const charObj =
+                (detailObj && detailObj.character) ||
+                (chars && chars[Number(detailObj && detailObj.id !== undefined ? detailObj.id : payload)]);
             if (charObj) {
                 rehydrationGuard.invalidateCharacter(rehydrationGuard.getCharacterKey(charObj), { keepKnownFlag: true });
             }

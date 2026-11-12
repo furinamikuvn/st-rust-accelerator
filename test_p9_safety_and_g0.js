@@ -229,6 +229,42 @@ async function main() {
     let lastSavedEditForm = null;
     let lastSavedChatPayload = null;
     let serverGetCalls = 0;
+    let serverEditCalls = 0;
+    let serverCsrfRejects = 0;
+    const EXPECTED_CSRF = 'st-csrf-test-token-v3';
+
+    function extractCsrfToken(headers) {
+        if (!headers) return '';
+        if (typeof headers.get === 'function') {
+            return headers.get('x-csrf-token') || headers.get('X-CSRF-Token') || '';
+        }
+        if (typeof headers === 'object') {
+            for (const [k, v] of Object.entries(headers)) {
+                if (String(k).toLowerCase() === 'x-csrf-token') return String(v ?? '');
+            }
+        }
+        return '';
+    }
+
+    function applyServerMerge(rec, data) {
+        if (!rec || !data || typeof data !== 'object') return;
+        const parsed = JSON.parse(rec.json_data);
+        const mergeInto = (target, src) => {
+            for (const [k, v] of Object.entries(src)) {
+                if (v === '__@@UNSET@@__') {
+                    delete target[k];
+                } else if (v && typeof v === 'object' && !Array.isArray(v)) {
+                    if (!target[k] || typeof target[k] !== 'object' || Array.isArray(target[k])) target[k] = {};
+                    mergeInto(target[k], v);
+                } else {
+                    target[k] = v;
+                }
+            }
+        };
+        mergeInto(parsed.data, data);
+        rec.json_data = JSON.stringify(parsed);
+        rec.data = parsed.data;
+    }
 
     global.FormData = class MockFormData {
         constructor() { this._map = new Map(); }
@@ -244,10 +280,10 @@ async function main() {
             this.status = init.status || 200;
             this.ok = this.status >= 200 && this.status < 300;
             this.statusText = init.statusText || 'OK';
-            this.headers = init.headers || {};
+            this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers || undefined);
         }
         clone() {
-            return new MockResponse(this.bodyText, { status: this.status, statusText: this.statusText, headers: this.headers });
+            return new MockResponse(this.bodyText, { status: this.status, statusText: this.statusText, headers: new Headers(this.headers) });
         }
         async json() { return JSON.parse(this.bodyText); }
         async text() { return this.bodyText; }
@@ -255,32 +291,57 @@ async function main() {
 
     const rawUpstreamFetch = async function (url, opts = {}) {
         if (url === '/api/characters/all') {
-            return new Response(JSON.stringify(Array.from(serverCardDb.values()).map(c => ({ ...c }))));
+            return new Response(
+                JSON.stringify(Array.from(serverCardDb.values()).map(c => ({ ...c }))),
+                {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Content-Length': '999999',
+                        'Content-Encoding': 'gzip',
+                        'X-ST-Upstream': '1',
+                    },
+                },
+            );
         }
         if (url === '/api/characters/get') {
+            if (extractCsrfToken(opts.headers) !== EXPECTED_CSRF) {
+                serverCsrfRejects++;
+                return new Response(
+                    JSON.stringify({ error: 'Forbidden: invalid or missing X-CSRF-Token' }),
+                    { status: 403, statusText: 'Forbidden', headers: { 'Content-Type': 'application/json' } },
+                );
+            }
             serverGetCalls++;
             const body = JSON.parse(opts.body);
             const record = serverCardDb.get(body.avatar_url);
-            return new Response(JSON.stringify({ ...record }), { status: record ? 200 : 404 });
+            return new Response(JSON.stringify(record ? { ...record } : {}), {
+                status: record ? 200 : 404,
+                headers: { 'Content-Type': 'application/json' },
+            });
         }
         if (url === '/api/characters/edit') {
+            serverEditCalls++;
             lastSavedEditForm = opts.body;
             const avatar = opts.body.get('avatar_url');
             const editedJson = opts.body.get('json_data');
             const rec = serverCardDb.get(avatar);
-            if (rec && editedJson) {
+            if (rec && editedJson !== null && editedJson !== undefined) {
                 rec.json_data = editedJson;
-                rec.data = JSON.parse(editedJson).data;
+                if (editedJson) {
+                    rec.data = JSON.parse(editedJson).data;
+                }
             }
             return new Response(JSON.stringify({ ok: true }));
         }
         if (url === '/api/characters/merge-attributes') {
             const req = JSON.parse(opts.body);
-            const rec = serverCardDb.get(req.avatar);
-            if (rec) {
-                const parsed = JSON.parse(rec.json_data);
-                parsed.data.extensions = { ...parsed.data.extensions, ...(req.data && req.data.extensions ? req.data.extensions : {}) };
-                rec.json_data = JSON.stringify(parsed);
+            if (Array.isArray(req.avatars)) {
+                const targets = req.avatars.length === 0 ? Array.from(serverCardDb.keys()) : req.avatars;
+                for (const av of targets) {
+                    applyServerMerge(serverCardDb.get(av), req.data);
+                }
+            } else if (req.avatar) {
+                applyServerMerge(serverCardDb.get(req.avatar), req.data);
             }
             return new Response(JSON.stringify({ ok: true }));
         }
@@ -307,7 +368,14 @@ async function main() {
                     variables: { hp: 100, mood: 'bright' },
                 },
             ];
-            return new Response(JSON.stringify(chat));
+            return new Response(JSON.stringify(chat), {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': '888888',
+                    'Content-Encoding': 'br',
+                    'X-ST-Chat': '1',
+                },
+            });
         }
         if (url === '/api/chats/save') {
             if (opts.body instanceof Uint8Array && opts.headers && opts.headers['Content-Encoding'] === 'gzip' && typeof DecompressionStream !== 'undefined') {
@@ -355,6 +423,7 @@ async function main() {
         fetch: rawUpstreamFetch,
         eventSource,
         characters: mockCharacters,
+        getRequestHeaders: () => ({ 'Content-Type': 'application/json', 'X-CSRF-Token': EXPECTED_CSRF }),
         requestAnimationFrame: (fn) => fn(),
         cancelAnimationFrame: () => {},
     };
@@ -377,6 +446,9 @@ async function main() {
         assert.strictEqual(global.window.fetch.__stRustWrapped, true, 'Cờ __stRustWrapped phải active tức thời');
 
         const res = await global.window.fetch('/api/characters/all', { method: 'POST' });
+        assert.strictEqual(res.headers.get('content-length'), null, 'Rewritten /api/characters/all phải xóa stale content-length');
+        assert.strictEqual(res.headers.get('content-encoding'), null, 'Rewritten /api/characters/all phải xóa stale content-encoding');
+        assert.strictEqual(res.headers.get('x-st-upstream'), '1', 'Header upstream gốc vẫn phải được bảo toàn');
         const list = await res.json();
         mockCharacters.push(...list);
 
@@ -416,10 +488,15 @@ async function main() {
         assert(savedObj.data.extensions.regex_scripts.length === 1, 'Phải bảo toàn regex_scripts sau unlink world');
     });
 
-    await runTest('Write-Back Guard: bảo vệ POST /api/characters/edit khi FormData rỗng, cache-miss fallback & merge-attributes', async () => {
+    await runTest('Write-Back Guard: bảo vệ POST /api/characters/edit khi FormData rỗng, CSRF cache-miss fallback, bulk merge-attributes & fail-closed lock', async () => {
         // 1. Nạp lại bản gốc của Teyvat_A vào DB + cache rồi giả lập FormData gửi json_data rỗng
         serverCardDb.get('Teyvat_A.png').json_data = cardAJson;
-        await window.fetch('/api/characters/get', { method: 'POST', body: JSON.stringify({ avatar_url: 'Teyvat_A.png' }) });
+        const getA = await window.fetch('/api/characters/get', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': EXPECTED_CSRF },
+            body: JSON.stringify({ avatar_url: 'Teyvat_A.png' }),
+        });
+        assert.strictEqual(getA.status, 200, 'GET Teyvat_A có CSRF phải trả 200');
 
         const emptyEditForm = new FormData();
         emptyEditForm.set('avatar_url', 'Teyvat_A.png');
@@ -428,10 +505,15 @@ async function main() {
         await window.fetch('/api/characters/edit', { method: 'POST', body: emptyEditForm });
         assert.strictEqual(sha256(lastSavedEditForm.get('json_data')), sha256(cardAJson), 'FormData rỗng phải được Re-hydrate SHA-256 100%');
 
-        // 2. Test merge-attributes đồng bộ vào cache thay vì ghi đè stale
-        await window.fetch('/api/characters/get', { method: 'POST', body: JSON.stringify({ avatar_url: 'Mushoku_B.png' }) });
+        // 2. Test single merge-attributes đồng bộ vào cache sạch (không nhét key avatar thừa)
+        await window.fetch('/api/characters/get', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': EXPECTED_CSRF },
+            body: JSON.stringify({ avatar_url: 'Mushoku_B.png' }),
+        });
         await window.fetch('/api/characters/merge-attributes', {
             method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': EXPECTED_CSRF },
             body: JSON.stringify({ avatar: 'Mushoku_B.png', data: { extensions: { custom_plugin_v3: { active: true } } } }),
         });
         const postMergeForm = new FormData();
@@ -441,11 +523,56 @@ async function main() {
         const postMergeSaved = JSON.parse(lastSavedEditForm.get('json_data'));
         assert.strictEqual(postMergeSaved.data.extensions.custom_plugin_v3.active, true, 'Merge attributes phải được giữ qua lần edit kế tiếp');
         assert.strictEqual(postMergeSaved.data.extensions.tavern_helper.scripts.length, 1, 'TavernHelper gốc không được mất sau merge');
+        assert.strictEqual(postMergeSaved.avatar, undefined, 'Single merge-attributes không được nhét key avatar thừa vào root JSON');
 
-        // 3. Test LRU Eviction + Cache-Miss recovery qua /api/characters/get
+        // 3. Test bulk merge-attributes ({ avatars: [...] } và { avatars: [] })
+        await window.fetch('/api/characters/get', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': EXPECTED_CSRF },
+            body: JSON.stringify({ avatar_url: 'Teyvat_A.png' }),
+        });
+        await window.fetch('/api/characters/get', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': EXPECTED_CSRF },
+            body: JSON.stringify({ avatar_url: 'Mushoku_B.png' }),
+        });
+        assert(indexMod.rehydrationGuard.getCachedCharacterJson('Teyvat_A.png') !== null, 'Teyvat_A phải nằm trong cache trước bulk merge');
+        assert(indexMod.rehydrationGuard.getCachedCharacterJson('Mushoku_B.png') !== null, 'Mushoku_B phải nằm trong cache trước bulk merge');
+
+        await window.fetch('/api/characters/merge-attributes', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': EXPECTED_CSRF },
+            body: JSON.stringify({ avatars: ['Teyvat_A.png'], data: { extensions: { bulk_tag_v3: 'hit' } } }),
+        });
+        assert.strictEqual(indexMod.rehydrationGuard.getCachedCharacterJson('Teyvat_A.png'), null, 'Bulk merge { avatars: [Teyvat_A] } phải invalidate cache Teyvat_A');
+        assert(indexMod.rehydrationGuard.getCachedCharacterJson('Mushoku_B.png') !== null, 'Bulk merge nhắm riêng Teyvat_A không được xóa cache Mushoku_B');
+
+        await window.fetch('/api/characters/merge-attributes', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': EXPECTED_CSRF },
+            body: JSON.stringify({ avatars: [], data: { extensions: { global_tag_v3: 'all' } } }),
+        });
+        assert.strictEqual(indexMod.rehydrationGuard.getCachedCharacterJson('Mushoku_B.png'), null, 'Bulk merge { avatars: [] } phải clear toàn bộ hot LRU cache');
+        assert.strictEqual(indexMod.rehydrationGuard.knownStrippedAvatars.has('Teyvat_A.png'), true, 'clear cache vẫn phải giữ cờ knownStrippedAvatars');
+
+        // 4. Test event character_edited signature thật của ST v1.18.0: { detail: { id, character } }
+        await window.fetch('/api/characters/get', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': EXPECTED_CSRF },
+            body: JSON.stringify({ avatar_url: 'Teyvat_A.png' }),
+        });
+        assert(indexMod.rehydrationGuard.getCachedCharacterJson('Teyvat_A.png') !== null, 'Teyvat_A phải được cache trước event character_edited');
+        await eventSource.emit('character_edited', { detail: { id: 0, character: mockCharacters[0] } });
+        assert.strictEqual(indexMod.rehydrationGuard.getCachedCharacterJson('Teyvat_A.png'), null, 'Event character_edited { detail: { id, character } } phải invalidate cache');
+
+        // 5. Test LRU Eviction + Cache-Miss recovery qua /api/characters/get CÓ KIỂM TRA CSRF TOKEN
+        serverCardDb.get('Teyvat_A.png').json_data = cardAJson;
         const { RehydrationGuard } = await import(toUrl(path.join(__dirname, 'rehydration-guard.js')));
         const beforeCalls = serverGetCalls;
-        const boundedGuard = new RehydrationGuard({ maxCacheBytes: cardAJson.length + 100 });
+        const boundedGuard = new RehydrationGuard({
+            maxCacheBytes: cardAJson.length + 100,
+            getRequestHeaders: () => ({ 'X-CSRF-Token': EXPECTED_CSRF }),
+        });
         boundedGuard.captureCharacter({ avatar: 'Teyvat_A.png', name: 'Teyvat_A', json_data: cardAJson });
         boundedGuard.captureCharacter({ avatar: 'Mushoku_B.png', name: 'Mushoku_B', json_data: cardBJson }); // Ép evict Teyvat_A
         assert.strictEqual(boundedGuard.getCachedCharacterJson('Teyvat_A.png'), null, 'Card cũ hơn phải bị evict khỏi hot LRU');
@@ -455,8 +582,48 @@ async function main() {
         evictForm.set('json_data', '');
         const guardRes = await boundedGuard.guardCharacterEditInit({ body: evictForm }, rawUpstreamFetch);
         assert.strictEqual(guardRes.modified, true);
-        assert(serverGetCalls > beforeCalls, 'Cache-miss phải tự động cứu qua /api/characters/get');
+        assert(serverGetCalls > beforeCalls, 'Cache-miss phải tự động cứu qua /api/characters/get với X-CSRF-Token');
         assert.strictEqual(sha256(evictForm.get('json_data')), sha256(cardAJson), 'Dữ liệu cứu từ cache-miss phải khớp SHA-256 100%');
+
+        // 6. Test lấy X-CSRF-Token từ init.headers ngay cả khi window.getRequestHeaders không tồn tại
+        const savedGetReqHeaders = global.window.getRequestHeaders;
+        global.window.getRequestHeaders = undefined;
+        try {
+            const headerOnlyGuard = new RehydrationGuard({ maxCacheBytes: cardAJson.length + 100 });
+            headerOnlyGuard.captureCharacter({ avatar: 'Teyvat_A.png', name: 'Teyvat_A', json_data: cardAJson });
+            headerOnlyGuard.captureCharacter({ avatar: 'Mushoku_B.png', name: 'Mushoku_B', json_data: cardBJson });
+
+            const headerForm = new FormData();
+            headerForm.set('avatar_url', 'Teyvat_A.png');
+            headerForm.set('json_data', '');
+            const headerRes = await headerOnlyGuard.guardCharacterEditInit(
+                { headers: { 'x-csrf-token': EXPECTED_CSRF }, body: headerForm },
+                rawUpstreamFetch,
+            );
+            assert.strictEqual(headerRes.modified, true, 'Phải trích xuất được x-csrf-token từ init.headers khi cứu cache-miss');
+            assert.strictEqual(sha256(headerForm.get('json_data')), sha256(cardAJson), 'Cứu hộ bằng init.headers phải khớp SHA-256 100%');
+
+            // 7. Fail-Closed Data-Loss Lock: nếu /api/characters/get trả 403 (thiếu CSRF) thì TUYỆT ĐỐI CHẶN ghi đè json_data: ""
+            indexMod.rehydrationGuard.invalidateCharacter('Teyvat_A.png', { keepKnownFlag: true });
+            const beforeRejects = serverCsrfRejects;
+            const beforeEdits = serverEditCalls;
+            const beforeBlocks = indexMod.rehydrationGuard.stats.failClosedEditBlocks;
+
+            const failEditForm = new FormData();
+            failEditForm.set('avatar_url', 'Teyvat_A.png');
+            failEditForm.set('json_data', '');
+            await assert.rejects(
+                () => window.fetch('/api/characters/edit', { method: 'POST', body: failEditForm }),
+                /Fail-closed|Chặn ghi đè/i,
+                'Khi card đã bị strip mà cache-miss fallback bị 403, bắt buộc ném lỗi Fail-Closed chặn POST /api/characters/edit',
+            );
+            assert(serverCsrfRejects > beforeRejects, 'Mock server phải thực sự trả 403 cho /api/characters/get thiếu CSRF');
+            assert.strictEqual(serverEditCalls, beforeEdits, 'Fail-Closed tuyệt đối không được cho phép request ghi đè chạm tới /api/characters/edit');
+            assert.strictEqual(indexMod.rehydrationGuard.stats.failClosedEditBlocks, beforeBlocks + 1, 'Phải tăng counter failClosedEditBlocks');
+            assert.strictEqual(sha256(serverCardDb.get('Teyvat_A.png').json_data), sha256(cardAJson), 'Dữ liệu thẻ PNG gốc trên đĩa server phải được bảo toàn 100%');
+        } finally {
+            global.window.getRequestHeaders = savedGetReqHeaders;
+        }
     });
 
     await runTest('Write-Back Guard: khôi phục lossless Line 0 + giải bọc CoW Proxy trước POST /api/chats/save (SHA-256)', async () => {
@@ -465,6 +632,9 @@ async function main() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ ch_name: 'Teyvat_A', file_name: 'chat_1.jsonl', avatar_url: 'Teyvat_A.png' }),
         });
+        assert.strictEqual(chatRes.headers.get('content-length'), null, 'Rewritten /api/chats/get phải xóa stale content-length');
+        assert.strictEqual(chatRes.headers.get('content-encoding'), null, 'Rewritten /api/chats/get phải xóa stale content-encoding');
+        assert.strictEqual(chatRes.headers.get('x-st-chat'), '1', 'Header upstream /api/chats/get phải giữ nguyên');
         const loadedChat = await chatRes.json();
         const originalLine0Meta = JSON.parse(JSON.stringify(loadedChat[0].chat_metadata));
 
