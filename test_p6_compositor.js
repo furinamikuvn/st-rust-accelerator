@@ -243,11 +243,11 @@ runTest('Khởi tạo CssCompositorGuard & Tiêm Global Style Sheet', () => {
     assert(styleEl, 'Thẻ <style> quản lý animation phải được tiêm vào document.head');
     assert(styleEl.textContent.includes('.st-hud-paused'), 'Style sheet phải chứa class .st-hud-paused');
     assert(styleEl.textContent.includes('animation-play-state: paused !important'), 'Phải có quy tắc paused !important');
-    assert(styleEl.textContent.includes('contain: layout style paint'), 'Phải có CSS Containment');
+    assert(styleEl.textContent.includes('contain: layout style'), 'Phải có CSS Containment layout style');
 });
 
-runTest('Nhận diện Container Game HUD & Tiêm CSS Containment', () => {
-    // Tạo 1 container HUD giả lập thẻ Thiên Chương Định Mệnh (class .dream-radar-panel)
+runTest('Nhận diện Container Game HUD & Tiêm CSS Containment (Bỏ qua position: fixed/sticky)', () => {
+    // 1. Container HUD thông thường trong luồng tài liệu
     const hudContainer = new MockElement('div', 'dream-container', 'dream-radar-panel');
     hudContainer.setAttribute('style', 'animation: dreamRotate 4s infinite linear');
 
@@ -255,18 +255,26 @@ runTest('Nhận diện Container Game HUD & Tiêm CSS Containment', () => {
     radarChild.setAttribute('style', 'transform: rotate(45deg); animation: pulse 1s infinite');
     hudContainer.appendChild(radarChild);
 
+    // 2. Container HUD nổi có position: fixed (TavernHelper / MVUZOD HUD)
+    const fixedHud = new MockElement('div', 'mvu-hud-overlay', 'game-hud');
+    fixedHud.setAttribute('style', 'position: fixed; top: 10px; right: 10px; animation: mvuFade 2s');
+
     // Thêm vào #chat
     activeMutationCallback([{
         type: 'childList',
-        addedNodes: [hudContainer]
+        addedNodes: [hudContainer, fixedHud]
     }]);
 
     console.log(`\n       - Containment style: "${hudContainer.style.contain}"`);
     console.log(`       - Guarded attribute: "${hudContainer.getAttribute('data-st-compositor-guarded')}"`);
+    console.log(`       - Fixed HUD containment: "${fixedHud.style.contain || 'none'}"`);
 
-    assert.strictEqual(hudContainer.style.contain, 'layout style paint', 'Container HUD phải được tiêm containment layout style paint');
+    assert(hudContainer.style.contain.includes('layout style'), 'Container HUD phải được tiêm containment layout style');
     assert.strictEqual(hudContainer.getAttribute('data-st-compositor-guarded'), 'true');
     assert(guardInstance.observedContainers.has(hudContainer), 'Container phải nằm trong danh sách theo dõi của IntersectionObserver');
+
+    // Fixed HUD không được gán containment để tránh clipping tàng hình
+    assert(!fixedHud.style.contain, 'Fixed/Sticky HUD tuyệt đối không được gán containment!');
 });
 
 runTest('Đóng băng 73 animation khi HUD trượt khỏi Viewport (isIntersecting = false)', () => {

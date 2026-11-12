@@ -289,25 +289,34 @@ console.log(`\n=== PHẦN 4: BỘ QUẢN LÝ SLEEP IFRAME & PROXY VARIABLE GUARD
 const { IframeLazyMounter } = require('./extension/iframe-lazy-mounter.js');
 const { ProxyVariableGuard } = require('./extension/proxy-variable-guard.js');
 
-runTest('Chuyển Iframe ẩn sang chế độ Sleep (about:blank) để giải phóng 60MB RAM', () => {
+runTest('Chuyển Iframe ẩn sang chế độ Sleep (about:blank) và Whitelist bảo vệ TavernHelper/MVU', () => {
     const mounter = new IframeLazyMounter();
 
-    // Giả lập 1 iframe đang ẩn
-    const mockIframe = new MockElement('iframe');
-    mockIframe.setAttribute('src', 'http://localhost:8000/tavern_helper_hud.html');
-    mockIframe.style.display = 'none';
+    // 1. Giả lập 1 iframe thông thường đang ẩn (cần tiết kiệm RAM)
+    const genericIframe = new MockElement('iframe');
+    genericIframe.setAttribute('src', 'http://localhost:8000/generic_doc_preview.html');
+    genericIframe.style.display = 'none';
 
-    mounter.sleepIframe(mockIframe);
+    mounter.sleepIframe(genericIframe);
 
-    console.log(`\n       - Iframe src sau khi sleep: "${mockIframe.getAttribute('src')}"`);
-    console.log(`       - Backup link gốc trong data-lazy-src: "${mockIframe.getAttribute('data-lazy-src')}"`);
+    console.log(`\n       - Generic Iframe src sau khi sleep: "${genericIframe.getAttribute('src')}"`);
+    console.log(`       - Backup link gốc trong data-lazy-src: "${genericIframe.getAttribute('data-lazy-src')}"`);
 
-    assert.strictEqual(mockIframe.getAttribute('src'), 'about:blank', 'src phải chuyển về about:blank');
-    assert(mockIframe.getAttribute('data-lazy-src').includes('tavern_helper_hud'), 'Phải lưu lại link gốc');
+    assert.strictEqual(genericIframe.getAttribute('src'), 'about:blank', 'src phải chuyển về about:blank');
+    assert(genericIframe.getAttribute('data-lazy-src').includes('generic_doc_preview'), 'Phải lưu lại link gốc');
 
     // Thử wake lại
-    mounter.wakeIframe(mockIframe);
-    assert.strictEqual(mockIframe.getAttribute('src'), 'http://localhost:8000/tavern_helper_hud.html', 'Phải khôi phục link gốc');
+    mounter.wakeIframe(genericIframe);
+    assert.strictEqual(genericIframe.getAttribute('src'), 'http://localhost:8000/generic_doc_preview.html', 'Phải khôi phục link gốc');
+
+    // 2. Giả lập iframe của TavernHelper / MVUZOD Game HUD (bắt buộc KHÔNG được sleep)
+    const tavernIframe = new MockElement('iframe');
+    tavernIframe.setAttribute('src', 'http://localhost:8000/tavern_helper_mvu_hud.html');
+    tavernIframe.style.display = 'none';
+
+    mounter.sleepIframe(tavernIframe);
+    console.log(`       - TavernHelper/MVU HUD src sau sleep attempt: "${tavernIframe.getAttribute('src')}"`);
+    assert.strictEqual(tavernIframe.getAttribute('src'), 'http://localhost:8000/tavern_helper_mvu_hud.html', 'Protected HUD iframe tuyệt đối KHÔNG được chuyển sang about:blank!');
 });
 
 runTest('Chống nhân bản mù quáng 34MB bằng Copy-on-Write Proxy (ProxyVariableGuard)', () => {

@@ -2,12 +2,37 @@
  * Iframe Lazy Mounter and Sleep State Manager for HUD Iframes.
  * Suspends hidden HUD iframe render contexts by switching src to about:blank,
  * saving approximately 50MB-80MB of Blink renderer heap per dormant iframe.
+ * Automatically whitelists and protects essential TavernHelper / MVUZOD game HUD runtimes.
  */
 
 function debugLog(message, ...args) {
     if (typeof window !== 'undefined' && window.__ST_RUST_DEBUG) {
         console.debug(`[ST-Rust] ${message}`, ...args);
     }
+}
+
+/**
+ * Determines whether an iframe belongs to an active game HUD or essential extension.
+ * Protected iframes must never be put to sleep to prevent runtime disconnection.
+ *
+ * @param {HTMLIFrameElement} iframe - The target iframe element
+ * @returns {boolean} True if the iframe is protected
+ */
+function isProtectedIframe(iframe) {
+    if (!iframe) return false;
+    const id = (iframe.id || '').toLowerCase();
+    const cls = (iframe.className || '').toLowerCase();
+    const src = (iframe.getAttribute('src') || iframe.getAttribute('data-lazy-src') || '').toLowerCase();
+    const title = (iframe.title || '').toLowerCase();
+
+    const protectedKeywords = [
+        'tavern', 'helper', 'slash', 'mvu', 'hud', 
+        'game', 'status', 'dashboard', 'card', 'stage'
+    ];
+
+    return protectedKeywords.some(kw => 
+        id.includes(kw) || cls.includes(kw) || src.includes(kw) || title.includes(kw)
+    );
 }
 
 /**
@@ -52,12 +77,15 @@ class IframeLazyMounter {
 
     /**
      * Scans document for unmanaged iframes and registers them for intersection monitoring.
+     * Skips protected Game HUD and TavernHelper runtimes.
      */
     scanAndRegister() {
         if (!this.isEnabled || typeof document === 'undefined') return;
 
         const iframes = document.querySelectorAll('iframe:not([data-st-managed="true"])');
         iframes.forEach(iframe => {
+            if (isProtectedIframe(iframe)) return;
+
             iframe.setAttribute('data-st-managed', 'true');
             this.managedIframes.add(iframe);
 
@@ -87,11 +115,12 @@ class IframeLazyMounter {
 
     /**
      * Places target iframe into sleep mode to conserve memory.
+     * Never suspends protected HUD iframes.
      *
      * @param {HTMLIFrameElement} iframe - Target iframe element
      */
     sleepIframe(iframe) {
-        if (!this.isEnabled || !iframe) return;
+        if (!this.isEnabled || !iframe || isProtectedIframe(iframe)) return;
         const currentSrc = iframe.getAttribute('src');
         if (currentSrc && currentSrc !== 'about:blank') {
             iframe.setAttribute('data-lazy-src', currentSrc);
@@ -152,8 +181,8 @@ class IframeLazyMounter {
     }
 }
 
-export { IframeLazyMounter };
+export { IframeLazyMounter, isProtectedIframe };
 
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { IframeLazyMounter };
+    module.exports = { IframeLazyMounter, isProtectedIframe };
 }

@@ -85,7 +85,7 @@ class CssCompositorGuard {
             }
 
             .st-hud-isolated {
-                contain: layout style paint !important;
+                contain: layout style !important;
             }
         `;
 
@@ -304,6 +304,11 @@ class CssCompositorGuard {
     protectContainer(container) {
         if (!container || !container.setAttribute) return;
 
+        const style = (typeof window !== 'undefined' && window.getComputedStyle) ? window.getComputedStyle(container) : container.style;
+        if (style && (style.position === 'fixed' || style.position === 'sticky')) {
+            return;
+        }
+
         if (container.getAttribute('data-st-compositor-guarded') === 'true') {
             return;
         }
@@ -312,7 +317,7 @@ class CssCompositorGuard {
         if (this.options.enableContainment) {
             container.classList.add('st-hud-isolated');
             if (container.style) {
-                container.style.contain = 'layout style paint';
+                container.style.contain = 'layout style';
             }
         }
 
@@ -394,7 +399,7 @@ class CssCompositorGuard {
             for (const container of this.observedContainers) {
                 if (this.options.enableContainment) {
                     container.classList.add('st-hud-isolated');
-                    if (container.style) container.style.contain = 'layout style paint';
+                    if (container.style) container.style.contain = 'layout style';
                 }
             }
             this.scanAllExistingHuds();

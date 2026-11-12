@@ -1,6 +1,6 @@
 {
   "name": "st-rust-accelerator",
-  "version": "1.0.0",
+  "version": "2.0.2",
   "description": "High-performance Rust Native Addon (WAL Chat I/O 2300x & Zero-Copy PNG Stripper)",
   "main": "index.js",
   "type": "module"

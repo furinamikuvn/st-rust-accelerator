@@ -433,7 +433,7 @@ async function executeP8Suite() {
         // Kích hoạt bảo vệ container
         guard.protectContainer(hudContainer);
         assert(hudContainer.classList.contains('st-hud-isolated'), 'HUD phải được áp dụng CSS Containment');
-        assert.strictEqual(hudContainer.style.contain, 'layout style paint');
+        assert.strictEqual(hudContainer.style.contain, 'layout style');
 
         // Mô phỏng trượt khỏi viewport (isIntersecting = false)
         guard.intersectionObserver.triggerChange(hudContainer, false, 0.0);
