@@ -7,6 +7,8 @@ Cargo.lock
 *.dll
 *.so
 *.dylib
+!server-plugin/st_server_addon.node
+!st_server_addon.node
 
 # MSYS2 generated import lib
 /libnode/

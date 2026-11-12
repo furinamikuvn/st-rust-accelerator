@@ -66,11 +66,14 @@ git clone --depth 1 https://github.com/furinamikuvn/st-rust-accelerator.git /pat
 
 ### ⚙️ Kích Hoạt Plugin Server Native (Tùy Chọn Nâng Cao — Tăng Tốc Ghi Đĩa 2.300x)
 
-Để kích hoạt thêm lõi Rust Native Addon ở tầng Server Express (giúp lưu chat trong 0.05ms):
-1. Sao chép thư mục `server-plugin/` và file nhị phân `st_server_addon.node` vào thư mục plugins của SillyTavern:
+> [!NOTE]
+> Đây là tính năng **TÙY CHỌN NÂNG CAO** chạy phía backend Node.js. Nếu bạn chỉ cài đặt Client Extension qua 1-Click Install ở mục 3 thì SillyTavern đã được kích hoạt đủ 6 lá chắn (60 FPS, nén 73% RAM, ảo hóa 18 DOM nodes, chặn lag thẻ) mà không cần cài thêm plugin server này!
+> File nhị phân `st_server_addon.node` đã được đính kèm sẵn trong thư mục `server-plugin/` (biên dịch sẵn cho hệ điều hành **Windows x64**). Các nền tảng khác (Linux/Termux Android/macOS) nếu không có binary `.node` tương thích sẽ tự động kích hoạt cơ chế JS Fallback, đảm bảo hệ thống luôn hoạt động bình thường 100%.
+
+Để kích hoạt lõi Rust Native Addon ở tầng Server Express (giúp lưu chat trong 0.05ms):
+1. Sao chép thư mục `server-plugin/` (đã có sẵn file `st_server_addon.node`) vào thư mục `plugins/` của SillyTavern:
    ```bash
    cp -r server-plugin/ /path/to/SillyTavern/plugins/st-rust-accelerator
-   cp st_server_addon.node /path/to/SillyTavern/plugins/st-rust-accelerator/
    ```
 2. Mở file `config.yaml` của SillyTavern, tìm và bật:
    ```yaml
