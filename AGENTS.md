@@ -3,7 +3,8 @@
 ## 0. Tài Liệu Bắt Buộc Đọc Khi Mở Phiên Mới
 1. `PROGRESS.md` (xác định phase hiện tại, việc đã xong, đọc 5 dòng handoff của phiên trước).
 2. `DECISIONS.md` (nắm các quyết định kiến trúc đã đóng băng, tuyệt đối không lật lại).
-3. `docs/SPEC.md` và `docs/RECON_FINDINGS.md` (nắm rõ số liệu đo đạc thực tế và ranh giới hệ thống).
+3. `docs/SPEC.md` và `docs/RECON_FINDINGS.md` (nắm rõ số liệu đo đạc thực tế P1-P5).
+4. `docs/GROUND_TRUTH_76_CARDS_CENSUS.md` và `docs/HUD_COMPOSITOR_BREAKTHROUGH_SPEC.md` (nắm số liệu thực tế 76 thẻ và đặc tả P6-P8).
 
 ## 1. Thứ Tự Nguồn Sự Thật (Hierarchy of Truth)
 1. Mã nguồn thực tế của SillyTavern Core v1.18.0 (`D:\ST\SillyTavern`) và kết quả benchmark trực tiếp trên đĩa/RAM máy tính.
