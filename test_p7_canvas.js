@@ -196,8 +196,8 @@ global.MutationObserver = MockMutationObserver;
 
 global.mockChat = new MockElement('div', 'chat');
 
-// Nạp module
-const { CanvasThrottler } = require('./extension/canvas-throttler.js');
+// Nạp module từ root (Unified ESM Root)
+const { CanvasThrottler } = require('./canvas-throttler.js');
 
 let throttler = null;
 

@@ -224,8 +224,8 @@ global.document = {
 global.IntersectionObserver = MockIntersectionObserver;
 global.MutationObserver = MockMutationObserver;
 
-// Nạp module CssCompositorGuard
-const { CssCompositorGuard } = require('./extension/css-compositor-guard.js');
+// Nạp module CssCompositorGuard từ root (Unified ESM Root)
+const { CssCompositorGuard } = require('./css-compositor-guard.js');
 
 // =========================================================================
 // TEST CASES

@@ -1,12 +1,12 @@
 # PROGRESS — ST-RUST-ACCELERATOR (Nhánh `v3-breakthrough`)
 
-## Phase Hiện Tại: **P9 — Sửa Lỗi Chí Mạng V2, Chống Mất Dữ Liệu & Cổng G0 (🟡 SẴN SÀNG THI CÔNG)**
+## Phase Hiện Tại: **P10 — Rust WASM Streaming Engine (Crate v3) (🟡 CHỜ THI CÔNG — ĐÃ MỞ CỔNG G0)**
 
 | Phase | Trạng Thái | Commit Hash | Bằng Chứng Nghiệm Thu Thực Nghiệm |
 | :--- | :---: | :---: | :--- |
 | **V2 Baseline (`main` `P0–P8`)** | 📦 Đã đóng băng làm mốc | `6f3945d` | Xem kiểm toán trung thực trong `docs/V3_AUDIT_AND_BENCHMARKS.md` (`stress_bombardment_security.js` FAIL exit 1, `test_p3` ReferenceError fallback, `srcdoc` iframe mù 100%). |
-| **P9: Critical Bugfix, Re-hydration Guard & G0 Freeze** | 🟡 Chờ bắt đầu | - | Vá hook boot `fetch`, bảo vệ Edit Card/Save Chat không mất dữ liệu, sửa `VirtualScroller` truncation & iframe reload, khóa hợp đồng G0. |
-| **P10: Rust WASM Streaming Engine (Crate v3)** *(G1)* | ⚪ Chờ duyệt | - | Streaming Scrubber `1+1 MiB` (`wasmLinearMemory <= 8MB`), Zstd Codec, BLAKE3/xxHash swipe-var dedup. |
+| **P9: Critical Bugfix, Re-hydration Guard & G0 Freeze** | 🟢 Hoàn tất | `P9` | Gỡ `extension/` drift, `test_p3` 9/9 (0 `ReferenceError`, 0 warning), `stress_bombardment_security.js` PASS (`+0.532 MB` heap delta), `test_p9_safety_and_g0.js` 7/7, `test_p1..p8` PASS 100%, khóa `docs/G0_CONTRACT.md` & `D20`. |
+| **P10: Rust WASM Streaming Engine (Crate v3)** *(G1)* | 🟡 Sẵn sàng bắt đầu | - | Streaming Scrubber `1+1 MiB` (`wasmLinearMemory <= 8MB`), Zstd Codec, BLAKE3/xxHash swipe-var dedup. |
 | **P11: Worker OPFS Cold Vault & Streaming Interceptor** | ⚪ Chờ duyệt | - | Stream HTTP $\rightarrow$ WASM $\rightarrow$ OPFS ngoài Main Thread + Write-Back Re-hydration + SHA-256 round-trip test. |
 | **P12: JS Aho-Corasick Unicode & Token Cache** | ⚪ Chờ duyệt | - | `<1ms` cho 961+ entries, 100% khớp semantic tiếng Việt/CJK/Regex của `world-info.js`, giảm bão HTTP `getTokenCountAsync`. |
 | **P13: `JS-Slash-Runner` Asset Hoister & Deep Freeze** *(Chrome CDP)* | ⚪ Chờ duyệt | - | Tách lặp `tailwindcss.min.js` + `<style>` qua `adoptedStyleSheets` + xuyên `iframe.contentDocument`/`contentWindow.rAF`. |
@@ -15,13 +15,13 @@
 
 ---
 
-## Việc Của Phase Hiện Tại (`P9`)
-- [ ] Hợp nhất nguồn ES Module về root (loại bỏ trôi lệch với `extension/`, thay `document.currentScript` bằng `import.meta.url`, sửa `ReferenceError: require` và `wasm-bindgen` init deprecation warning).
-- [ ] Di chuyển đăng ký `window.fetch` Interceptor sang thực thi **đồng bộ ngay top-level** của `index.js` trước `await initWasm()`, bảo đảm bắt kịp `/api/characters/all` ở `script.js:757`.
-- [ ] Cài đặt **Re-hydration Guard** đồng bộ/bất đồng bộ trước khi mở `#character_json_data` (`script.js:8753`), khi gửi `POST /api/characters/edit` (`characters.js:567`), khi unlink world (`world-info.js:5992`), và trước `POST /api/chats/save` (`script.js:7380-7383`).
-- [ ] Sửa `dom-virtual-scroller.js`: hỗ trợ dải `mesid` không bắt đầu từ `0` (`chat_truncation > 0`), dọn Map khi đổi/xóa chat, và cấm `.remove()` trực tiếp `.mes` chứa `<iframe>` đang hoạt động.
-- [ ] Vá `benchmarks/stress_bombardment_security.js` khớp thực tế `contain: layout style`, bổ sung bộ test P9 cho boot hook sync + Edit/Save Re-hydration + `VirtualScroller` `mesid` offset.
-- [ ] Hoàn thành **Cổng G0**: chốt contract Worker RPC + OPFS binary header + Shadow Snapshot metadata trong `docs/V3_BREAKTHROUGH_SPEC.md` (hoặc `docs/G0_CONTRACT.md`) để mở khóa `P10`.
+## Việc Đã Hoàn Thành Ở Phase `P9`
+- [x] Hợp nhất nguồn ES Module về root (xóa thư mục `extension/` trôi lệch, thay `document.currentScript` bằng `import.meta.url`, sửa `ReferenceError: require` qua `node:module` `createRequire` và truyền `{ module_or_path }` hết deprecation warning).
+- [x] Di chuyển đăng ký `window.fetch` Interceptor sang thực thi **đồng bộ ngay top-level** của `index.js` trước `await initWasm()`, bảo đảm bắt kịp `/api/characters/all` ở `script.js:757` và chống gọi trùng `initExtension()`.
+- [x] Cài đặt **Re-hydration Guard** (`rehydration-guard.js`) cho `#character_json_data` (`character_editor_opened`, `script.js:8753`), `POST /api/characters/edit` (`FormData` + cache-miss `/api/characters/get`), unlink world (`world-info.js:5992`), `/api/characters/merge-attributes`, và `POST /api/chats/save` (kèm gzip + `ProxyVariableGuard.unwrap`).
+- [x] Sửa `dom-virtual-scroller.js`: lặp trên khóa `mesid` thực tế đã sắp xếp (`chat_truncation > 0`), reset Map khi `clearChat()` / xóa tin nhắn, giữ thứ tự DOM chuẩn và cấm `.remove()` trực tiếp `.mes` chứa `<iframe>` đang hoạt động.
+- [x] Vá `benchmarks/stress_bombardment_security.js` khớp `contain: layout style`, cập nhật import test về root, sửa async runner ở `test_p3.js`, và bổ sung `test_p9_safety_and_g0.js` (7/7 PASS).
+- [x] Hoàn thành **Cổng G0**: đóng băng Worker RPC, Streaming WASM ABI, OPFS `.stv3` header 32-byte, IDB fallback, và Shadow Snapshot metadata tại `docs/G0_CONTRACT.md` + `DECISIONS.md` (`D20`).
 
 ---
 
@@ -32,8 +32,8 @@
 ---
 
 ## Nhật Ký Handoff Giữa Các Phiên (5 Dòng Tiêu Chuẩn)
-- **Phiên gần nhất hoàn tất**: Kiểm toán v2.0.2 & Thiết lập bộ khung Tier-3 (`skill_project_scaffold`) trên nhánh cô lập `v3-breakthrough`.
-- **Đã làm xong**: Phân tách nhánh `v3-breakthrough` từ `main` (`6f3945d`), xuất bản `AGENTS.md`, `DECISIONS.md` (`D12–D19`), `PROGRESS.md` (`P9–P15`), `docs/V3_AUDIT_AND_BENCHMARKS.md` và `docs/V3_BREAKTHROUGH_SPEC.md` dựa trên đo đạc thật trên Chrome v157 CDP + Rust WASM PoC.
-- **File bị biến đổi**: `AGENTS.md`, `PROGRESS.md`, `DECISIONS.md`, `docs/V3_AUDIT_AND_BENCHMARKS.md`, `docs/V3_BREAKTHROUGH_SPEC.md` (chỉ trên nhánh `v3-breakthrough`, `main` nguyên vẹn 100%).
-- **Việc phiên tới cần làm ngay**: Đọc bộ tài liệu mục 0 của `AGENTS.md`, kiểm tra đang ở đúng nhánh `v3-breakthrough`, và bắt đầu **Phase P9** (sửa boot hook + Re-hydration Guard chống mất dữ liệu + sửa `VirtualScroller` + khóa Cổng G0).
-- **Cảnh báo rủi ro**: Tuyệt đối không đụng nhánh `main` hay core `D:\ST\SillyTavern`; bắt buộc kiểm chứng mọi tối ưu Frontend/RAM (P13–P15) bằng Google Chrome CDP thật thay vì chỉ chạy Node/JSDOM mock.
+- **Phiên gần nhất hoàn tất**: **Phase P9 — Sửa Lỗi Chí Mạng V2, Chống Mất Dữ Liệu & Khóa Cổng G0** trên nhánh `v3-breakthrough`.
+- **Đã làm xong**: Gỡ trùng lặp `extension/`, vá `wasm-bridge.js` ESM (hết `ReferenceError` & warning `wasm-bindgen`), chuyển `window.fetch` hook sang đồng bộ top-level, dựng `rehydration-guard.js` (+ `ProxyVariableGuard.unwrap`), sửa `dom-virtual-scroller.js` (`mesid` offset + `clearChat` + bảo vệ `<iframe>`), vá `stress_bombardment_security.js` (`contain: layout style`), viết `test_p9_safety_and_g0.js` (7/7 PASS) và đóng băng `docs/G0_CONTRACT.md` (`D20`).
+- **File bị biến đổi**: Xóa `extension/`; tạo mới `rehydration-guard.js`, `docs/G0_CONTRACT.md`, `test_p9_safety_and_g0.js`; sửa `wasm-bridge.js`, `index.js`, `dom-virtual-scroller.js`, `proxy-variable-guard.js`, `test_p3.js`, `test_p6_compositor.js`, `test_p7_canvas.js`, `test_p8_e2e_release.js`, `benchmarks/stress_bombardment_security.js`, `docs/V3_BREAKTHROUGH_SPEC.md`, `DECISIONS.md`, `PROGRESS.md`.
+- **Việc phiên tới cần làm ngay**: Khởi công **Phase P10 — Rust WASM Streaming Engine v3** (nâng cấp `crates/st-wasm-core` theo đúng `docs/G0_CONTRACT.md`: cặp buffer tĩnh `1+1 MiB` giữ WASM linear memory `<= 8 MiB`, Streaming JSON FSM scrubber chunk `137B`, Zstd codec, `xxHash64`/`BLAKE3`, biên dịch lại `pkg/` sạch và rà soát Cổng G1).
+- **Cảnh báo rủi ro**: Không để `wasm.memory.buffer.byteLength` vượt quá `8 MiB` khi stream dữ liệu `275.50 MB` cards + `45.34 MB` `Teyvat3`; giữ nguyên tương thích API JS hiện tại trong `pkg/` hoặc cung cấp bridge không làm gãy `test_p2..test_p9`.

@@ -336,7 +336,6 @@ const toUrl = (p) => 'file:///' + p.replace(/\\/g, '/');
 // =========================================================================
 
 async function executeP8Suite() {
-    const extDir = path.join(__dirname, 'extension');
     const rootDir = __dirname;
     const stExtensionDir = 'D:\\ST\\SillyTavern\\public\\scripts\\extensions\\third-party\\st-rust-accelerator';
 
@@ -344,8 +343,8 @@ async function executeP8Suite() {
     // TEST 1: Khởi động toàn bộ Suite 6 lá chắn
     // -------------------------------------------------------------------------
     await runTest('Khởi động toàn bộ Suite 6 lá chắn (WASM Vault, Interceptor, Scroller, Lazy Mounter, Compositor Guard, Canvas Throttler)', async () => {
-        // Nạp index.js từ extension
-        const indexModule = await import(toUrl(path.join(extDir, 'index.js')));
+        // Nạp index.js từ thư mục root (Unified ESM Root)
+        const indexModule = await import(toUrl(path.join(rootDir, 'index.js')));
 
         assert(indexModule.initExtension, 'Phải export initExtension');
         assert(indexModule.VirtualScroller, 'Phải export VirtualScroller');

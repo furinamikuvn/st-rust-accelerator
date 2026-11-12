@@ -13,9 +13,69 @@ function debugLog(message, ...args) {
 let wasmInstance = null;
 let isReady = false;
 let forceDisabled = false;
+let initPromise = null;
+
+/**
+ * Resolves browser/Node WASM binary URL using import.meta.url (ESM standard).
+ *
+ * @param {Object} [options={}]
+ * @returns {string} Resolved URL or path to st_wasm_core_bg.wasm
+ */
+function resolveWasmUrl(options = {}) {
+    if (options.wasmUrl) {
+        return options.wasmUrl;
+    }
+    return new URL('./pkg/st_wasm_core_bg.wasm', import.meta.url).href;
+}
+
+/**
+ * Instantiates WASM in browser / DOM-like ESM environments without deprecated signature warnings.
+ *
+ * @param {string} wasmUrl
+ * @returns {Promise<Object>}
+ */
+async function instantiateBrowserWasm(wasmUrl) {
+    const wasmGlue = await import('./pkg/st_wasm_core.js');
+    const isNodeProcess = typeof process !== 'undefined' && Boolean(process.versions && process.versions.node);
+
+    if (isNodeProcess && wasmUrl.startsWith('file://')) {
+        const [{ readFile }, { fileURLToPath }] = await Promise.all([
+            import('node:fs/promises'),
+            import('node:url')
+        ]);
+        const bytes = await readFile(fileURLToPath(wasmUrl));
+        await wasmGlue.default({ module_or_path: bytes });
+        return wasmGlue;
+    }
+
+    try {
+        await wasmGlue.default({ module_or_path: wasmUrl });
+    } catch (_) {
+        const response = await fetch(wasmUrl);
+        const bytes = await response.arrayBuffer();
+        await wasmGlue.default({ module_or_path: bytes });
+    }
+    return wasmGlue;
+}
+
+/**
+ * Instantiates WASM in Node.js via ESM-safe createRequire.
+ *
+ * @returns {Promise<Object>}
+ */
+async function instantiateNodeWasm() {
+    const { createRequire } = await import('node:module');
+    const nodeRequire = createRequire(import.meta.url);
+    try {
+        return nodeRequire('./pkg-node/st_wasm_core.js');
+    } catch (_) {
+        return nodeRequire('./pkg/st_wasm_core.js');
+    }
+}
 
 /**
  * Initializes the Rust WebAssembly module across Browser and Node.js runtimes.
+ * Deduplicates concurrent initialization calls.
  *
  * @param {Object} [options={}] - Initialization options
  * @param {string} [options.wasmUrl] - Explicit URL or path to st_wasm_core_bg.wasm
@@ -23,61 +83,40 @@ let forceDisabled = false;
  */
 async function initWasm(options = {}) {
     if (isReady && wasmInstance) return true;
+    if (initPromise) return initPromise;
 
-    try {
-        if (typeof window !== 'undefined' && typeof window.document !== 'undefined') {
-            const wasmUrl = options.wasmUrl || 
-                (document.currentScript && document.currentScript.src 
-                    ? new URL('./pkg/st_wasm_core_bg.wasm', document.currentScript.src).href 
-                    : '/scripts/extensions/third-party/st-rust-accelerator/pkg/st_wasm_core_bg.wasm');
-
-            const wasmGlue = await import('./pkg/st_wasm_core.js');
-
-            if (typeof WebAssembly.instantiateStreaming === 'function') {
-                try {
-                    await wasmGlue.default(wasmUrl);
-                } catch (_) {
-                    const response = await fetch(wasmUrl);
-                    const bytes = await response.arrayBuffer();
-                    await wasmGlue.default(bytes);
-                }
+    initPromise = (async () => {
+        try {
+            if (typeof window !== 'undefined' && typeof window.document !== 'undefined') {
+                const wasmUrl = resolveWasmUrl(options);
+                wasmInstance = await instantiateBrowserWasm(wasmUrl);
+                isReady = true;
+                window.__ST_RUST_READY = true;
+                debugLog(`Rust WASM Core v${wasmInstance.get_wasm_core_version()} initialized successfully.`);
+                return true;
             } else {
-                const response = await fetch(wasmUrl);
-                const bytes = await response.arrayBuffer();
-                await wasmGlue.default(bytes);
-            }
-
-            wasmInstance = wasmGlue;
-            isReady = true;
-            window.__ST_RUST_READY = true;
-            debugLog(`Rust WASM Core v${wasmGlue.get_wasm_core_version()} initialized successfully.`);
-            return true;
-        } else {
-            let wasmModule;
-            try {
-                wasmModule = require('./pkg-node/st_wasm_core.js');
-            } catch (_) {
-                try {
-                    wasmModule = require('./pkg/st_wasm_core.js');
-                } catch (e2) {
-                    wasmModule = require('../pkg-node/st_wasm_core.js');
+                wasmInstance = await instantiateNodeWasm();
+                isReady = true;
+                if (typeof globalThis !== 'undefined') {
+                    globalThis.__ST_RUST_READY = true;
                 }
+                return true;
             }
-            wasmInstance = wasmModule;
-            isReady = true;
-            if (typeof globalThis !== 'undefined') {
-                globalThis.__ST_RUST_READY = true;
+        } catch (err) {
+            console.warn('[ST-Rust] Failed to initialize Rust WASM Core (Fail-Safe active):', err);
+            isReady = false;
+            if (typeof window !== 'undefined') {
+                window.__ST_RUST_READY = false;
             }
-            return true;
+            return false;
+        } finally {
+            if (!isReady) {
+                initPromise = null;
+            }
         }
-    } catch (err) {
-        console.warn('[ST-Rust] Failed to initialize Rust WASM Core (Fail-Safe active):', err);
-        isReady = false;
-        if (typeof window !== 'undefined') {
-            window.__ST_RUST_READY = false;
-        }
-        return false;
-    }
+    })();
+
+    return initPromise;
 }
 
 /**
@@ -305,22 +344,3 @@ export {
     getVaultStats,
     clearVault,
 };
-
-if (typeof module !== 'undefined' && module.exports) {
-    module.exports = {
-        initWasm,
-        isWasmReady,
-        setWasmEnabled,
-        storeLine0InVault,
-        getLine0FromVault,
-        storeMessageInVault,
-        getMessageFromVault,
-        assembleContextFromVault,
-        buildWorldbookMatcher,
-        scanWorldbookFast,
-        countTokens,
-        trimContextBudget,
-        getVaultStats,
-        clearVault,
-    };
-}

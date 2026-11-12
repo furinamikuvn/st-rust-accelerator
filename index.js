@@ -16,6 +16,7 @@ import { IframeLazyMounter } from './iframe-lazy-mounter.js';
 import { ProxyVariableGuard } from './proxy-variable-guard.js';
 import { CssCompositorGuard } from './css-compositor-guard.js';
 import { CanvasThrottler } from './canvas-throttler.js';
+import { RehydrationGuard } from './rehydration-guard.js';
 
 function debugLog(message, ...args) {
     if (typeof window !== 'undefined' && window.__ST_RUST_DEBUG) {
@@ -24,10 +25,20 @@ function debugLog(message, ...args) {
 }
 
 let originalFetch = null;
+let wrappedFetchFn = null;
+let initExtensionPromise = null;
+let eventHooksInstalled = false;
+
 let scrollerInstance = null;
 let lazyMounterInstance = null;
 let compositorGuardInstance = null;
 let canvasThrottlerInstance = null;
+
+const rehydrationGuard = new RehydrationGuard({
+    getOriginalFetch: () => originalFetch,
+    getLine0FromVault,
+    getMessageFromVault,
+});
 
 let isInterceptorEnabled = true;
 let isScrollerEnabled = true;
@@ -73,32 +84,39 @@ function saveTelemetryStorage() {
 }
 
 /**
- * Actively scans and prunes unneeded raw JSON metadata from character objects in V8 memory.
- * Resolves lifecycle desynchronization when characters are restored from unshallow cache on page reload.
+ * Resolves the active SillyTavern characters array across standard globals and module context.
+ *
+ * @returns {Array}
  */
-function pruneCharactersInMemory() {
-    let newlyPrunedBytes = 0;
-    let newlyPrunedCards = 0;
-
-    let chars = [];
+function getActiveCharactersArray() {
     if (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) {
         try {
             const ctx = SillyTavern.getContext();
             if (ctx) {
-                if (Array.isArray(ctx.characters)) chars = ctx.characters;
-                else if (typeof ctx.getCharacters === 'function') chars = ctx.getCharacters();
+                if (Array.isArray(ctx.characters)) return ctx.characters;
+                if (typeof ctx.getCharacters === 'function') return ctx.getCharacters() || [];
             }
         } catch (_) {}
     }
-    if (!chars.length && typeof window !== 'undefined') {
-        if (Array.isArray(window.characters)) chars = window.characters;
-        else if (window.SillyTavern && window.SillyTavern.getContext) {
+    if (typeof window !== 'undefined') {
+        if (Array.isArray(window.characters)) return window.characters;
+        if (window.SillyTavern && window.SillyTavern.getContext) {
             try {
                 const ctx = window.SillyTavern.getContext();
-                if (ctx && Array.isArray(ctx.characters)) chars = ctx.characters;
+                if (ctx && Array.isArray(ctx.characters)) return ctx.characters;
             } catch (_) {}
         }
     }
+    return [];
+}
+
+/**
+ * Actively scans and prunes unneeded raw JSON metadata from character objects in V8 memory
+ * after safely capturing originals in RehydrationGuard.
+ */
+function pruneCharactersInMemory() {
+    let newlyPrunedBytes = 0;
+    const chars = getActiveCharactersArray();
 
     if (Array.isArray(chars) && chars.length > 0) {
         for (let i = 0; i < chars.length; i++) {
@@ -106,11 +124,11 @@ function pruneCharactersInMemory() {
             if (!charObj) continue;
 
             if (typeof charObj.json_data === 'string' && charObj.json_data.length > 1000) {
+                rehydrationGuard.captureCharacter(charObj);
                 const len = charObj.json_data.length;
                 totalStrippedBytes += len;
                 totalInterceptedCards++;
                 newlyPrunedBytes += len;
-                newlyPrunedCards++;
 
                 debugLog(`Pruned ${(len / (1024 * 1024)).toFixed(2)} MB json_data from "${charObj.name || ('chara_' + i)}" directly in RAM.`);
                 charObj.json_data = "";
@@ -132,103 +150,191 @@ function pruneCharactersInMemory() {
     }
 }
 
+function resolveFetchUrl(resource) {
+    if (typeof resource === 'string') return resource;
+    if (resource && typeof resource.url === 'string') return resource.url;
+    return '';
+}
+
+function tryParseJsonBody(body) {
+    if (typeof body !== 'string') return null;
+    try {
+        return JSON.parse(body);
+    } catch (_) {
+        return null;
+    }
+}
+
+async function handleCharacterReadResponse(fetchCtx, args) {
+    const response = await originalFetch.apply(fetchCtx, args);
+    try {
+        const cloned = response.clone();
+        const data = await cloned.json();
+        let modified = false;
+
+        const pruneCard = (charObj) => {
+            if (charObj && typeof charObj.json_data === 'string' && charObj.json_data.length > 1000) {
+                rehydrationGuard.captureCharacter(charObj);
+                const strippedLen = charObj.json_data.length;
+                totalStrippedBytes += strippedLen;
+                totalInterceptedCards++;
+
+                debugLog(`Intercepted and pruned ${(strippedLen / (1024 * 1024)).toFixed(2)} MB json_data from "${charObj.name || 'chara'}".`);
+                charObj.json_data = "";
+                charObj.__st_rust_stripped = true;
+                modified = true;
+            }
+        };
+
+        if (Array.isArray(data)) {
+            data.forEach(item => pruneCard(item));
+        } else {
+            const charObj = (data && data.character) ? data.character : data;
+            pruneCard(charObj);
+        }
+
+        if (modified) {
+            saveTelemetryStorage();
+            updateTelemetryUI();
+
+            return new Response(JSON.stringify(data), {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers
+            });
+        }
+    } catch (err) {
+        console.warn('[ST-Rust] Error intercepting character payload (pass-through active):', err);
+    }
+    return response;
+}
+
+async function handleChatGetResponse(fetchCtx, args, init) {
+    const response = await originalFetch.apply(fetchCtx, args);
+    try {
+        const cloned = response.clone();
+        const chatArray = await cloned.json();
+
+        if (Array.isArray(chatArray) && chatArray.length > 0) {
+            totalInterceptedChats++;
+            saveTelemetryStorage();
+
+            if (isWasmReady()) {
+                if (chatArray[0]) {
+                    storeLine0InVault(JSON.stringify(chatArray[0]));
+                }
+                for (let i = 1; i < chatArray.length; i++) {
+                    if (chatArray[i]) {
+                        storeMessageInVault(i, chatArray[i]);
+                    }
+                }
+            }
+
+            const reqBody = tryParseJsonBody(init && init.body);
+            const chatKey = reqBody
+                ? `${reqBody.avatar_url || reqBody.ch_name || ''}::${reqBody.file_name || ''}`
+                : 'active_chat';
+
+            let hasProxied = false;
+            for (let i = 0; i < chatArray.length; i++) {
+                const msg = chatArray[i];
+                if (msg && msg.variables && typeof msg.variables === 'object') {
+                    chatArray[i] = ProxyVariableGuard.protectMessage(msg);
+                    hasProxied = true;
+                }
+            }
+
+            rehydrationGuard.captureChat(chatKey, chatArray, {
+                snapshotLine0: !isWasmReady(),
+                hasProxiedVariables: hasProxied,
+            });
+
+            return new Response(JSON.stringify(ProxyVariableGuard.unwrap(chatArray)), {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers
+            });
+        }
+    } catch (err) {
+        console.warn('[ST-Rust] Error intercepting chat payload (pass-through active):', err);
+    }
+    return response;
+}
+
+async function handleCharacterEditRequest(fetchCtx, resource, init) {
+    const guardResult = await rehydrationGuard.guardCharacterEditInit(init, originalFetch);
+    const response = await originalFetch.call(fetchCtx, resource, init);
+    if (response && response.ok && guardResult.avatar) {
+        rehydrationGuard.invalidateCharacter(guardResult.avatar, { keepKnownFlag: true });
+    }
+    return response;
+}
+
+async function handleCharacterMergeAttributes(fetchCtx, resource, init) {
+    const reqObj = tryParseJsonBody(init && init.body);
+    const response = await originalFetch.call(fetchCtx, resource, init);
+    if (response && response.ok && reqObj && reqObj.avatar) {
+        rehydrationGuard.applyMergeAttributes(reqObj.avatar, reqObj);
+    }
+    return response;
+}
+
 /**
- * Installs fetch interceptor for character loading and chat history endpoints.
+ * Installs synchronous fetch interceptor for character loading, editing, and chat persistence.
+ * Safe to invoke synchronously at module top-level before WASM finishes instantiating.
  */
 function initNetworkInterceptor() {
     if (typeof window === 'undefined' || typeof window.fetch !== 'function') return;
-    if (originalFetch) return;
+    if (window.fetch.__stRustWrapped && window.fetch === wrappedFetchFn) return;
 
     originalFetch = window.fetch;
 
-    window.fetch = async function (resource, init) {
-        const url = typeof resource === 'string' ? resource : (resource && resource.url ? resource.url : '');
+    const wrappedFetch = async function (resource, init) {
+        const fetchCtx = (this && this !== wrappedFetch) ? this : (typeof window !== 'undefined' ? window : globalThis);
+        const url = resolveFetchUrl(resource);
 
         if (!isInterceptorEnabled) {
-            return originalFetch.apply(this, arguments);
+            return originalFetch.apply(fetchCtx, arguments);
         }
 
         if (url.includes('/api/characters/get') || url.includes('/api/characters/all')) {
-            const response = await originalFetch.apply(this, arguments);
-            try {
-                const cloned = response.clone();
-                const data = await cloned.json();
-                let modified = false;
+            return handleCharacterReadResponse(fetchCtx, arguments);
+        }
 
-                const pruneCard = (charObj) => {
-                    if (charObj && typeof charObj.json_data === 'string' && charObj.json_data.length > 1000) {
-                        const strippedLen = charObj.json_data.length;
-                        totalStrippedBytes += strippedLen;
-                        totalInterceptedCards++;
+        if (url.includes('/api/characters/edit')) {
+            return handleCharacterEditRequest(fetchCtx, resource, init);
+        }
 
-                        debugLog(`Intercepted and pruned ${(strippedLen / (1024 * 1024)).toFixed(2)} MB json_data from "${charObj.name || 'chara'}".`);
-                        charObj.json_data = "";
-                        charObj.__st_rust_stripped = true;
-                        modified = true;
-                    }
-                };
+        if (url.includes('/api/characters/merge-attributes')) {
+            return handleCharacterMergeAttributes(fetchCtx, resource, init);
+        }
 
-                if (Array.isArray(data)) {
-                    data.forEach(item => pruneCard(item));
-                } else {
-                    const charObj = (data && data.character) ? data.character : data;
-                    pruneCard(charObj);
-                }
-
-                if (modified) {
-                    saveTelemetryStorage();
-                    try { updateTelemetryUI(); } catch (_) {}
-
-                    return new Response(JSON.stringify(data), {
-                        status: response.status,
-                        statusText: response.statusText,
-                        headers: response.headers
-                    });
-                }
-            } catch (err) {
-                console.warn('[ST-Rust] Error intercepting character payload (pass-through active):', err);
+        if (url.includes('/api/characters/delete') || url.includes('/api/characters/rename')) {
+            const reqObj = tryParseJsonBody(init && init.body);
+            const response = await originalFetch.apply(fetchCtx, arguments);
+            if (response && response.ok && reqObj) {
+                rehydrationGuard.invalidateCharacter(reqObj.avatar_url || reqObj.avatar);
             }
             return response;
         }
 
         if (url.includes('/api/chats/get')) {
-            const response = await originalFetch.apply(this, arguments);
-            try {
-                const cloned = response.clone();
-                const chatArray = await cloned.json();
-
-                if (Array.isArray(chatArray) && chatArray.length > 0) {
-                    totalInterceptedChats++;
-                    saveTelemetryStorage();
-
-                    if (chatArray[0] && isWasmReady()) {
-                        const line0Str = JSON.stringify(chatArray[0]);
-                        storeLine0InVault(line0Str);
-                    }
-
-                    for (let i = 0; i < chatArray.length; i++) {
-                        const msg = chatArray[i];
-                        if (msg && msg.variables && typeof msg.variables === 'object') {
-                            chatArray[i] = ProxyVariableGuard.protectMessage(msg);
-                        }
-                    }
-
-                    return new Response(JSON.stringify(chatArray), {
-                        status: response.status,
-                        statusText: response.statusText,
-                        headers: response.headers
-                    });
-                }
-            } catch (err) {
-                console.warn('[ST-Rust] Error intercepting chat payload (pass-through active):', err);
-            }
-            return response;
+            return handleChatGetResponse(fetchCtx, arguments, init);
         }
 
-        return originalFetch.apply(this, arguments);
+        if (url.includes('/api/chats/save') || url.includes('/api/chats/group/save')) {
+            await rehydrationGuard.guardChatSaveInit(init);
+            return originalFetch.call(fetchCtx, resource, init);
+        }
+
+        return originalFetch.apply(fetchCtx, arguments);
     };
 
-    debugLog('Network Fetch Interceptor registered.');
+    wrappedFetch.__stRustWrapped = true;
+    wrappedFetchFn = wrappedFetch;
+    window.fetch = wrappedFetch;
+
+    debugLog('Network Fetch Interceptor registered synchronously.');
 }
 
 /**
@@ -323,6 +429,7 @@ function installSettingsDrawer() {
     const toggleHeader = drawer.querySelector('.inline-drawer-toggle');
     const content = drawer.querySelector('.inline-drawer-content');
     const icon = drawer.querySelector('.inline-drawer-icon');
+    if (!toggleHeader || !content) return;
 
     toggleHeader.addEventListener('click', () => {
         if (typeof window.$ === 'undefined' || !window.$.fn || !window.$.fn.slideToggle) {
@@ -395,6 +502,7 @@ function installSettingsDrawer() {
  * Updates telemetry data displayed within the Settings Drawer UI.
  */
 function updateTelemetryUI() {
+    if (typeof document === 'undefined' || typeof document.getElementById !== 'function') return;
     const elStripped = document.getElementById('st-rust-stat-stripped');
     const elCards = document.getElementById('st-rust-stat-cards');
     const elDom = document.getElementById('st-rust-stat-dom');
@@ -433,17 +541,21 @@ function updateTelemetryUI() {
  * Probes the backend server plugin status and updates status badge.
  */
 async function checkServerStatus() {
+    if (typeof document === 'undefined' || typeof document.getElementById !== 'function') return;
     const badge = document.getElementById('st-rust-server-badge');
     const desc = document.getElementById('st-rust-server-desc');
     if (!badge || !desc) return;
+
+    const probeFetch = originalFetch || (typeof window !== 'undefined' ? window.fetch : null);
+    if (typeof probeFetch !== 'function') return;
 
     try {
         badge.style.background = '#eab308';
         badge.textContent = 'Đang dò...';
 
-        let res = await originalFetch('/api/plugins/st-rust-accelerator/status').catch(() => null);
+        let res = await probeFetch('/api/plugins/st-rust-accelerator/status').catch(() => null);
         if (!res || !res.ok) {
-            res = await originalFetch('/api/plugins/st-rust-accelerator/api/plugins/st-rust-accelerator/status').catch(() => null);
+            res = await probeFetch('/api/plugins/st-rust-accelerator/api/plugins/st-rust-accelerator/status').catch(() => null);
         }
         if (res && res.ok) {
             const data = await res.json();
@@ -461,117 +573,171 @@ async function checkServerStatus() {
     desc.innerHTML = 'Server SillyTavern chưa nạp Plugin. Khởi động lại ST với cờ <code>SILLYTAVERN_ENABLESERVERPLUGINS=true</code> để kích hoạt lõi ghi đĩa 0.05ms.';
 }
 
+function installEventSourceHooks() {
+    if (eventHooksInstalled) return;
+    try {
+        const ctx = (typeof SillyTavern !== 'undefined' && SillyTavern.getContext)
+            ? SillyTavern.getContext()
+            : (typeof window !== 'undefined' ? window : null);
+        const ev = ctx && (ctx.eventSource || (typeof window !== 'undefined' && window.eventSource));
+        if (!ev || typeof ev.on !== 'function') return;
+
+        eventHooksInstalled = true;
+        ev.on('chatLoaded', () => {
+            if (scrollerInstance) scrollerInstance.update();
+            pruneCharactersInMemory();
+            updateTelemetryUI();
+        });
+        ev.on('chat_id_changed', () => {
+            if (scrollerInstance) scrollerInstance.reset();
+            pruneCharactersInMemory();
+            updateTelemetryUI();
+        });
+        ev.on('character_page_loaded', () => {
+            pruneCharactersInMemory();
+            updateTelemetryUI();
+        });
+        ev.on('app_ready', () => {
+            pruneCharactersInMemory();
+            updateTelemetryUI();
+        });
+        ev.on('character_editor_opened', (chid) => {
+            rehydrationGuard.syncCharacterFormDom(chid, getActiveCharactersArray());
+        });
+        ev.on('character_edited', (chid) => {
+            const chars = getActiveCharactersArray();
+            const charObj = chars && chars[Number(chid)];
+            if (charObj) {
+                rehydrationGuard.invalidateCharacter(rehydrationGuard.getCharacterKey(charObj), { keepKnownFlag: true });
+            }
+            updateTelemetryUI();
+        });
+        ev.on('characterDeleted', ({ character } = {}) => {
+            if (character) {
+                rehydrationGuard.invalidateCharacter(rehydrationGuard.getCharacterKey(character));
+            }
+        });
+    } catch (_) {}
+}
+
 /**
  * Initializes the ST-Rust-Accelerator suite and registers all active subsystems.
+ * Deduplicated so concurrent auto-boot and explicit calls share the same initialization lifecycle.
  */
 async function initExtension() {
-    debugLog('Initializing ST-Rust-Accelerator Suite v2.0...');
+    if (initExtensionPromise) return initExtensionPromise;
 
-    loadTelemetryStorage();
+    initExtensionPromise = (async () => {
+        debugLog('Initializing ST-Rust-Accelerator Suite...');
 
-    await initWasm();
+        // Ensure network hook is active synchronously prior to awaiting WASM init.
+        initNetworkInterceptor();
+        loadTelemetryStorage();
+
+        await initWasm();
+
+        if (typeof document !== 'undefined') {
+            scrollerInstance = new VirtualScroller('#chat', {
+                maxVisibleItems: 18,
+                estimatedItemHeight: 120
+            });
+            scrollerInstance.init();
+
+            lazyMounterInstance = new IframeLazyMounter();
+            lazyMounterInstance.init();
+
+            compositorGuardInstance = new CssCompositorGuard({
+                chatSelector: '#chat',
+                maxBlurPx: 8
+            });
+            compositorGuardInstance.init();
+
+            canvasThrottlerInstance = new CanvasThrottler({
+                chatSelector: '#chat',
+                targetIdleFps: 30,
+                activeDurationMs: 3000
+            });
+            canvasThrottlerInstance.init();
+
+            installSettingsDrawer();
+            installEventSourceHooks();
+
+            pruneCharactersInMemory();
+            updateTelemetryUI();
+        }
+
+        if (typeof window !== 'undefined') {
+            window.__ST_RUST_ACCELERATOR = {
+                isReady: isWasmReady,
+                scroller: scrollerInstance,
+                lazyMounter: lazyMounterInstance,
+                compositorGuard: compositorGuardInstance,
+                canvasThrottler: canvasThrottlerInstance,
+                proxyGuard: ProxyVariableGuard,
+                rehydrationGuard,
+                buildMatcher: buildWorldbookMatcher,
+                scanWorldbook: scanWorldbookFast,
+                countTokens: countTokens,
+                trimContext: trimContextBudget,
+                pruneRAM: pruneCharactersInMemory,
+                loadStorage: loadTelemetryStorage,
+                saveStorage: saveTelemetryStorage,
+                toggleScroller: (val) => {
+                    isScrollerEnabled = val;
+                    if (scrollerInstance) scrollerInstance.setEnabled(val);
+                    updateTelemetryUI();
+                },
+                toggleInterceptor: (val) => {
+                    isInterceptorEnabled = val;
+                    updateTelemetryUI();
+                },
+                toggleLazyMounter: (val) => {
+                    isLazyMounterEnabled = val;
+                    if (lazyMounterInstance) lazyMounterInstance.setEnabled(val);
+                    updateTelemetryUI();
+                },
+                toggleCompositor: (val) => {
+                    isCompositorGuardEnabled = val;
+                    if (compositorGuardInstance) compositorGuardInstance.setEnabled(val);
+                    updateTelemetryUI();
+                },
+                toggleCanvas: (val) => {
+                    isCanvasThrottlerEnabled = val;
+                    if (canvasThrottlerInstance) canvasThrottlerInstance.setEnabled(val);
+                    updateTelemetryUI();
+                },
+                checkServer: checkServerStatus,
+                getStats: () => ({
+                    wasmReady: isWasmReady(),
+                    isScrollerEnabled,
+                    isInterceptorEnabled,
+                    isLazyMounterEnabled,
+                    isCompositorGuardEnabled,
+                    isCanvasThrottlerEnabled,
+                    totalStrippedBytes,
+                    totalStrippedMb: (totalStrippedBytes / (1024 * 1024)).toFixed(2),
+                    totalInterceptedCards,
+                    totalInterceptedChats,
+                    rehydrationStats: rehydrationGuard.getStats(),
+                    scrollerStats: scrollerInstance ? scrollerInstance.getStats() : null,
+                    lazyMounterStats: lazyMounterInstance ? lazyMounterInstance.getStats() : null,
+                    compositorStats: compositorGuardInstance ? compositorGuardInstance.getStats() : null,
+                    canvasStats: canvasThrottlerInstance ? canvasThrottlerInstance.getStats() : null,
+                })
+            };
+        }
+
+        debugLog('ST-Rust-Accelerator Suite initialized and ready.');
+        return true;
+    })();
+
+    return initExtensionPromise;
+}
+
+// Synchronous top-level boot hook: runs BEFORE async WASM instantiation or DOMContentLoaded.
+// Guarantees interception of early SillyTavern startup calls such as /api/characters/all (script.js:757).
+if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
     initNetworkInterceptor();
-
-    if (typeof document !== 'undefined') {
-        scrollerInstance = new VirtualScroller('#chat', {
-            maxVisibleItems: 18,
-            estimatedItemHeight: 120
-        });
-        scrollerInstance.init();
-
-        lazyMounterInstance = new IframeLazyMounter();
-        lazyMounterInstance.init();
-
-        compositorGuardInstance = new CssCompositorGuard({
-            chatSelector: '#chat',
-            maxBlurPx: 8
-        });
-        compositorGuardInstance.init();
-
-        canvasThrottlerInstance = new CanvasThrottler({
-            chatSelector: '#chat',
-            targetIdleFps: 30,
-            activeDurationMs: 3000
-        });
-        canvasThrottlerInstance.init();
-
-        installSettingsDrawer();
-
-        pruneCharactersInMemory();
-        updateTelemetryUI();
-
-        try {
-            const ctx = (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) ? SillyTavern.getContext() : (typeof window !== 'undefined' ? window : null);
-            const ev = ctx && (ctx.eventSource || (typeof window !== 'undefined' && window.eventSource));
-            if (ev && typeof ev.on === 'function') {
-                ev.on('chatLoaded', () => { pruneCharactersInMemory(); updateTelemetryUI(); });
-                ev.on('chat_id_changed', () => { pruneCharactersInMemory(); updateTelemetryUI(); });
-                ev.on('character_page_loaded', () => { pruneCharactersInMemory(); updateTelemetryUI(); });
-                ev.on('app_ready', () => { pruneCharactersInMemory(); updateTelemetryUI(); });
-            }
-        } catch (_) {}
-    }
-
-    if (typeof window !== 'undefined') {
-        window.__ST_RUST_ACCELERATOR = {
-            isReady: isWasmReady,
-            scroller: scrollerInstance,
-            lazyMounter: lazyMounterInstance,
-            compositorGuard: compositorGuardInstance,
-            canvasThrottler: canvasThrottlerInstance,
-            proxyGuard: ProxyVariableGuard,
-            buildMatcher: buildWorldbookMatcher,
-            scanWorldbook: scanWorldbookFast,
-            countTokens: countTokens,
-            trimContext: trimContextBudget,
-            pruneRAM: pruneCharactersInMemory,
-            loadStorage: loadTelemetryStorage,
-            saveStorage: saveTelemetryStorage,
-            toggleScroller: (val) => {
-                isScrollerEnabled = val;
-                if (scrollerInstance) scrollerInstance.setEnabled(val);
-                updateTelemetryUI();
-            },
-            toggleInterceptor: (val) => {
-                isInterceptorEnabled = val;
-                updateTelemetryUI();
-            },
-            toggleLazyMounter: (val) => {
-                isLazyMounterEnabled = val;
-                if (lazyMounterInstance) lazyMounterInstance.setEnabled(val);
-                updateTelemetryUI();
-            },
-            toggleCompositor: (val) => {
-                isCompositorGuardEnabled = val;
-                if (compositorGuardInstance) compositorGuardInstance.setEnabled(val);
-                updateTelemetryUI();
-            },
-            toggleCanvas: (val) => {
-                isCanvasThrottlerEnabled = val;
-                if (canvasThrottlerInstance) canvasThrottlerInstance.setEnabled(val);
-                updateTelemetryUI();
-            },
-            checkServer: checkServerStatus,
-            getStats: () => ({
-                wasmReady: isWasmReady(),
-                isScrollerEnabled,
-                isInterceptorEnabled,
-                isLazyMounterEnabled,
-                isCompositorGuardEnabled,
-                isCanvasThrottlerEnabled,
-                totalStrippedBytes,
-                totalStrippedMb: (totalStrippedBytes / (1024 * 1024)).toFixed(2),
-                totalInterceptedCards,
-                totalInterceptedChats,
-                scrollerStats: scrollerInstance ? scrollerInstance.getStats() : null,
-                lazyMounterStats: lazyMounterInstance ? lazyMounterInstance.getStats() : null,
-                compositorStats: compositorGuardInstance ? compositorGuardInstance.getStats() : null,
-                canvasStats: canvasThrottlerInstance ? canvasThrottlerInstance.getStats() : null,
-            })
-        };
-    }
-
-    debugLog('ST-Rust-Accelerator Suite v2.0 initialized and ready.');
 }
 
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
@@ -589,6 +755,8 @@ export {
     pruneCharactersInMemory,
     loadTelemetryStorage,
     saveTelemetryStorage,
+    rehydrationGuard,
+    RehydrationGuard,
     VirtualScroller,
     IframeLazyMounter,
     ProxyVariableGuard,

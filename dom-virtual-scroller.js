@@ -30,15 +30,102 @@ class VirtualScroller {
         
         this.heightCache = new Map();
         this.messageNodes = new Map();
+        this.detachedNodes = new Set();
         this.totalMessages = 0;
-        
+
         this.spacerTop = null;
         this.spacerBottom = null;
-        
+
         this.isTicking = false;
         this.isEnabled = true;
+        this.isInternalMutation = false;
         this.lastScrollTop = 0;
         this.visibleRange = { start: 0, end: 0 };
+        this.protectedIframeCount = 0;
+    }
+
+    /**
+     * Checks whether a message element hosts an active <iframe> (e.g., JS-Slash-Runner srcdoc HUD).
+     * Removing a live iframe node from DOM destroys its browsing context and forces a full reload.
+     *
+     * @param {Element|Object} node
+     * @returns {boolean}
+     */
+    containsActiveIframe(node) {
+        if (!node) return false;
+        if (node.tagName === 'IFRAME') return true;
+        if (typeof node.querySelector === 'function' && node.querySelector('iframe')) {
+            return true;
+        }
+        const kids = node.children || node.childNodes;
+        if (kids && kids.length) {
+            for (let i = 0; i < kids.length; i++) {
+                if (this.containsActiveIframe(kids[i])) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Checks whether the virtual spacer is still mounted directly inside `this.container`.
+     */
+    _isSpacerAttached(spacer) {
+        if (!spacer || !this.container) return false;
+        if (spacer.parentNode !== this.container) return false;
+        if (typeof this.container.contains === 'function') {
+            return this.container.contains(spacer);
+        }
+        if (this.container.children && typeof this.container.children.length === 'number') {
+            for (let i = 0; i < this.container.children.length; i++) {
+                if (this.container.children[i] === spacer) return true;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Ensures top/bottom virtual spacers are attached inside the container.
+     */
+    _ensureSpacers() {
+        if (!this.container || typeof document === 'undefined') return;
+        this.isInternalMutation = true;
+        try {
+            if (!this.spacerTop) {
+                this.spacerTop = document.createElement('div');
+                this.spacerTop.className = 'st-virtual-spacer-top';
+                this.spacerTop.style.cssText = 'width: 100%; height: 0px; pointer-events: none; margin: 0; padding: 0;';
+            }
+            if (!this._isSpacerAttached(this.spacerTop)) {
+                this.container.prepend(this.spacerTop);
+            }
+
+            if (!this.spacerBottom) {
+                this.spacerBottom = document.createElement('div');
+                this.spacerBottom.className = 'st-virtual-spacer-bottom';
+                this.spacerBottom.style.cssText = 'width: 100%; height: 0px; pointer-events: none; margin: 0; padding: 0;';
+            }
+            if (!this._isSpacerAttached(this.spacerBottom)) {
+                this.container.appendChild(this.spacerBottom);
+            }
+        } finally {
+            this.isInternalMutation = false;
+        }
+    }
+
+    /**
+     * Clears tracked message Maps and spacer state (used on chat switches / clearChat()).
+     */
+    reset() {
+        this.messageNodes.clear();
+        this.heightCache.clear();
+        this.detachedNodes.clear();
+        this.visibleRange = { start: 0, end: 0 };
+        this.protectedIframeCount = 0;
+        if (this.spacerTop) this.spacerTop.style.height = '0px';
+        if (this.spacerBottom) this.spacerBottom.style.height = '0px';
+        this._ensureSpacers();
+        debugLog('DOM Virtual Scroller state reset.');
     }
 
     /**
@@ -53,24 +140,11 @@ class VirtualScroller {
             return;
         }
 
-        if (!this.spacerTop) {
-            this.spacerTop = document.createElement('div');
-            this.spacerTop.className = 'st-virtual-spacer-top';
-            this.spacerTop.style.cssText = 'width: 100%; height: 0px; pointer-events: none; margin: 0; padding: 0;';
-            this.container.prepend(this.spacerTop);
-        }
-
-        if (!this.spacerBottom) {
-            this.spacerBottom = document.createElement('div');
-            this.spacerBottom.className = 'st-virtual-spacer-bottom';
-            this.spacerBottom.style.cssText = 'width: 100%; height: 0px; pointer-events: none; margin: 0; padding: 0;';
-            this.container.appendChild(this.spacerBottom);
-        }
-
+        this._ensureSpacers();
         this.container.addEventListener('scroll', () => this.onScroll(), { passive: true });
 
         if (typeof MutationObserver !== 'undefined') {
-            this.observer = new MutationObserver(() => this.onDomMutated());
+            this.observer = new MutationObserver((mutations) => this.onDomMutated(mutations));
             this.observer.observe(this.container, { childList: true, subtree: false });
         }
 
@@ -93,10 +167,37 @@ class VirtualScroller {
     }
 
     /**
-     * Handles DOM mutations and measures heights of new items.
+     * Reconciles external DOM changes (clearChat(), deleteMessage(), or new messages).
+     *
+     * @param {MutationRecord[]} [mutations=[]]
      */
-    onDomMutated() {
+    onDomMutated(mutations = []) {
+        if (this.isInternalMutation) return;
+
+        // If SillyTavern clearChat() ran $('#chat').children().remove(), spacers were detached too.
+        if (this.spacerTop && !this._isSpacerAttached(this.spacerTop)) {
+            this.reset();
+        } else if (Array.isArray(mutations) && mutations.length > 0) {
+            for (const m of mutations) {
+                if (!m.removedNodes || m.removedNodes.length === 0) continue;
+                for (const removed of m.removedNodes) {
+                    if (this.detachedNodes.has(removed)) continue;
+                    const mesAttr = removed && removed.getAttribute ? removed.getAttribute('mesid') : null;
+                    if (mesAttr !== null) {
+                        const mesId = parseInt(mesAttr, 10);
+                        if (!isNaN(mesId) && this.messageNodes.get(mesId) === removed) {
+                            this.messageNodes.delete(mesId);
+                            this.heightCache.delete(mesId);
+                        }
+                    }
+                }
+            }
+        }
+
         this.measureElements();
+        if (this.isEnabled) {
+            this.update();
+        }
     }
 
     /**
@@ -117,33 +218,66 @@ class VirtualScroller {
     }
 
     /**
+     * Synchronizes tracked message nodes against external removals / chat clears.
+     */
+    _syncTrackedNodes(allMesNodes) {
+        if (this.spacerTop && !this._isSpacerAttached(this.spacerTop)) {
+            this.messageNodes.clear();
+            this.heightCache.clear();
+            this.detachedNodes.clear();
+            this._ensureSpacers();
+        } else {
+            for (const [mesId, trackedNode] of this.messageNodes.entries()) {
+                if (trackedNode.parentNode !== this.container && !this.detachedNodes.has(trackedNode)) {
+                    this.messageNodes.delete(mesId);
+                    this.heightCache.delete(mesId);
+                }
+            }
+        }
+
+        allMesNodes.forEach(node => {
+            const mesId = parseInt(node.getAttribute('mesid'), 10);
+            if (!isNaN(mesId)) {
+                this.messageNodes.set(mesId, node);
+                this.detachedNodes.delete(node);
+                const h = node.getBoundingClientRect().height;
+                if (h > 0) this.heightCache.set(mesId, h);
+            }
+        });
+    }
+
+    /**
      * Recalculates visible message range and updates spacers and mounted nodes.
      */
     update() {
         if (!this.container || !this.isEnabled) return;
 
         const allMesNodes = Array.from(this.container.querySelectorAll('.mes'));
+        if (this.spacerTop && !this._isSpacerAttached(this.spacerTop)) {
+            this.messageNodes.clear();
+            this.heightCache.clear();
+            this.detachedNodes.clear();
+            this._ensureSpacers();
+        }
+
         if (allMesNodes.length <= this.maxVisibleItems && this.messageNodes.size === 0) {
             if (this.spacerTop) this.spacerTop.style.height = '0px';
             if (this.spacerBottom) this.spacerBottom.style.height = '0px';
             return;
         }
 
-        allMesNodes.forEach(node => {
-            const mesId = parseInt(node.getAttribute('mesid'), 10);
-            if (!isNaN(mesId)) {
-                if (!this.messageNodes.has(mesId)) {
-                    this.messageNodes.set(mesId, node);
-                }
-                const h = node.getBoundingClientRect().height;
-                if (h > 0) this.heightCache.set(mesId, h);
-            }
-        });
+        this._syncTrackedNodes(allMesNodes);
 
-        const totalCount = this.messageNodes.size;
-        if (totalCount === 0) return;
+        const sortedMesIds = Array.from(this.messageNodes.keys()).sort((a, b) => a - b);
+        const totalCount = sortedMesIds.length;
+        if (totalCount === 0) {
+            if (this.spacerTop) this.spacerTop.style.height = '0px';
+            if (this.spacerBottom) this.spacerBottom.style.height = '0px';
+            this.visibleRange = { start: 0, end: 0 };
+            return;
+        }
 
-        const scrollTop = this.container.scrollTop;
+        const scrollTop = this.container.scrollTop || 0;
         const clientHeight = this.container.clientHeight || 800;
         const buffer = clientHeight * this.bufferRatio;
 
@@ -155,10 +289,11 @@ class VirtualScroller {
         let endIndex = totalCount - 1;
         let foundStart = false;
 
-        const heights = [];
+        const heights = new Array(totalCount);
         for (let i = 0; i < totalCount; i++) {
-            const h = this.heightCache.get(i) || this.estimatedItemHeight;
-            heights.push(h);
+            const mesId = sortedMesIds[i];
+            const h = this.heightCache.get(mesId) || this.estimatedItemHeight;
+            heights[i] = h;
 
             const itemTop = accumulatedHeight;
             const itemBottom = accumulatedHeight + h;
@@ -179,55 +314,91 @@ class VirtualScroller {
             endIndex = Math.min(totalCount - 1, startIndex + this.maxVisibleItems - 1);
         }
 
-        const isNearBottom = (this.container.scrollHeight - this.container.scrollTop - clientHeight) < 150;
+        const effectiveScrollHeight = Math.max(this.container.scrollHeight || 0, accumulatedHeight);
+        const isNearBottom = scrollTop > 0 && (effectiveScrollHeight - scrollTop - clientHeight) < 150;
         if (isNearBottom) {
             endIndex = totalCount - 1;
             startIndex = Math.max(0, endIndex - this.maxVisibleItems + 1);
         }
 
         let topSpacerHeight = 0;
-        for (let i = 0; i < startIndex; i++) {
-            topSpacerHeight += heights[i] || this.estimatedItemHeight;
-        }
-
         let bottomSpacerHeight = 0;
-        for (let i = endIndex + 1; i < totalCount; i++) {
-            bottomSpacerHeight += heights[i] || this.estimatedItemHeight;
+        let protectedIframes = 0;
+
+        this.isInternalMutation = true;
+        try {
+            // Walk in reverse so visible nodes inserted dynamically maintain strict ascending mesid order.
+            let nextMountedRef = this.spacerBottom;
+            for (let i = totalCount - 1; i >= 0; i--) {
+                const mesId = sortedMesIds[i];
+                const node = this.messageNodes.get(mesId);
+                if (!node) continue;
+
+                const isVisible = (i >= startIndex && i <= endIndex);
+                const isInDom = node.parentNode === this.container;
+
+                if (isVisible && !isInDom) {
+                    this.detachedNodes.delete(node);
+                    this.container.insertBefore(node, nextMountedRef);
+                    nextMountedRef = node;
+                } else if (!isVisible && isInDom) {
+                    if (this.containsActiveIframe(node)) {
+                        // Never .remove() live <iframe> hosts — preserve JS browsing context until Pool handles them.
+                        protectedIframes++;
+                        nextMountedRef = node;
+                    } else {
+                        this.detachedNodes.add(node);
+                        node.remove();
+                        if (i < startIndex) topSpacerHeight += heights[i] || this.estimatedItemHeight;
+                        else if (i > endIndex) bottomSpacerHeight += heights[i] || this.estimatedItemHeight;
+                    }
+                } else if (isInDom) {
+                    nextMountedRef = node;
+                } else {
+                    if (i < startIndex) topSpacerHeight += heights[i] || this.estimatedItemHeight;
+                    else if (i > endIndex) bottomSpacerHeight += heights[i] || this.estimatedItemHeight;
+                }
+            }
+        } finally {
+            this.isInternalMutation = false;
         }
 
         if (this.spacerTop) this.spacerTop.style.height = `${topSpacerHeight}px`;
         if (this.spacerBottom) this.spacerBottom.style.height = `${bottomSpacerHeight}px`;
 
-        for (let i = 0; i < totalCount; i++) {
-            const node = this.messageNodes.get(i);
-            if (!node) continue;
-
-            const isVisible = (i >= startIndex && i <= endIndex);
-            const isInDom = node.parentNode === this.container;
-
-            if (isVisible && !isInDom) {
-                this.container.insertBefore(node, this.spacerBottom);
-            } else if (!isVisible && isInDom) {
-                node.remove();
-            }
-        }
-
-        this.visibleRange = { start: startIndex, end: endIndex };
+        this.protectedIframeCount = protectedIframes;
+        this.visibleRange = {
+            start: sortedMesIds[startIndex],
+            end: sortedMesIds[endIndex],
+        };
     }
 
     /**
-     * Toggles virtualization mode. Restores all nodes into DOM when disabled.
+     * Toggles virtualization mode. Restores all nodes into DOM in chronological order when disabled.
      *
      * @param {boolean} enabled - Whether virtualization is active
      */
     setEnabled(enabled) {
         this.isEnabled = enabled;
         if (!enabled) {
-            this.messageNodes.forEach(node => {
-                if (this.container && node.parentNode !== this.container) {
-                    this.container.insertBefore(node, this.spacerBottom);
+            if (this.container) {
+                const sortedMesIds = Array.from(this.messageNodes.keys()).sort((a, b) => a - b);
+                this.isInternalMutation = true;
+                try {
+                    let nextMountedRef = this.spacerBottom;
+                    for (let i = sortedMesIds.length - 1; i >= 0; i--) {
+                        const node = this.messageNodes.get(sortedMesIds[i]);
+                        if (!node) continue;
+                        if (node.parentNode !== this.container) {
+                            this.detachedNodes.delete(node);
+                            this.container.insertBefore(node, nextMountedRef);
+                        }
+                        nextMountedRef = node;
+                    }
+                } finally {
+                    this.isInternalMutation = false;
                 }
-            });
+            }
             if (this.spacerTop) this.spacerTop.style.height = '0px';
             if (this.spacerBottom) this.spacerBottom.style.height = '0px';
         } else {
@@ -241,20 +412,17 @@ class VirtualScroller {
      * @returns {Object} Scroller metrics
      */
     getStats() {
-        const renderedCount = this.container 
-            ? this.container.querySelectorAll('.mes').length 
+        const renderedCount = this.container
+            ? this.container.querySelectorAll('.mes').length
             : 0;
         return {
             totalMessages: this.messageNodes.size,
             renderedDomNodes: renderedCount,
             visibleRange: this.visibleRange,
+            protectedIframeCount: this.protectedIframeCount,
             isEnabled: this.isEnabled,
         };
     }
 }
 
 export { VirtualScroller };
-
-if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { VirtualScroller };
-}

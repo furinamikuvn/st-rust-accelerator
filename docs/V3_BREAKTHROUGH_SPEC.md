@@ -36,7 +36,7 @@ Bản đặc tả kiến trúc cho nhánh `v3-breakthrough`, tuân thủ tuyệt
   3. Thiết lập **Safety In-Memory/Store Cache & Re-hydration Hook** cho `json_data`, `character_book`, `tavern_helper`, `regex_scripts`: khi người dùng mở Character Editor (`#character_json_data`), gọi `POST /api/characters/edit`, unlink world (`world-info.js:5992`), hoặc `POST /api/chats/save`, bắt buộc khôi phục đủ dữ liệu gốc trước khi gửi lên server.
   4. Sửa `dom-virtual-scroller.js`: không phụ thuộc `mesid` chạy từ `0`; dọn Map khi `clearChat()` / xóa message; bỏ qua (không `.remove()`) các `.mes` đang giữ `<iframe>` chưa được Pool ngủ đông.
   5. Sửa `benchmarks/stress_bombardment_security.js` cho khớp `contain: layout style` (`b91dc76`), và thêm test chặn mất dữ liệu `/api/characters/edit` + `/api/chats/save`.
-  6. **Cổng G0**: Đóng băng Worker RPC message schema, binary format OPFS header, và Shadow Snapshot metadata interface ngay cuối P9.
+  6. **Cổng G0**: Đóng băng Worker RPC message schema, binary format OPFS header, và Shadow Snapshot metadata interface ngay cuối P9 (xem tài liệu hợp đồng chuẩn tại [docs/G0_CONTRACT.md](file:///d:/st-rust-accelerator/docs/G0_CONTRACT.md)).
 
 ### Phase P10 — Rust WASM Streaming Engine v3 (`P10: Rust WASM Streaming Engine`) *(Cổng G1)*
 - **Mục tiêu**: Tối ưu hóa crate `crates/st-wasm-core` đúng điểm mạnh thật của Rust trên `wasm32-unknown-unknown` (non-SAB).

@@ -272,9 +272,9 @@ global.document = {
 global.IntersectionObserver = MockIntersectionObserver;
 global.MutationObserver = MockMutationObserver;
 
-// Nạp 2 module từ extension
-const { CssCompositorGuard } = require('../extension/css-compositor-guard.js');
-const { CanvasThrottler } = require('../extension/canvas-throttler.js');
+// Nạp 2 module từ thư mục root (Unified ESM Root)
+const { CssCompositorGuard } = require('../css-compositor-guard.js');
+const { CanvasThrottler } = require('../canvas-throttler.js');
 
 async function runBombardmentAudit() {
     console.log(`=============================================================================`);
@@ -362,7 +362,7 @@ async function runBombardmentAudit() {
 
             // Kiểm tra tính hợp lệ tức thời của Compositor
             assert(thienChuongHud.classList.contains('st-hud-isolated'), 'HUD phải được tiêm CSS Containment st-hud-isolated');
-            assert.strictEqual(thienChuongHud.style.contain, 'layout style paint', 'HUD phải có contain: layout style paint');
+            assert.strictEqual(thienChuongHud.style.contain, 'layout style', 'HUD phải có contain: layout style');
 
             // Kiểm tra Backdrop Blur đã được khống chế về 8px
             const cappedChild = thienChuongHud.children.find(c => c.id === `glass-card-${cycle}-0`);

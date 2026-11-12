@@ -4,13 +4,25 @@
  * saving approximately 108MB of V8 heap per clone operation.
  */
 
+const proxyMetaMap = new WeakMap();
+
 /**
  * Provides lazy Copy-on-Write proxies and snapshot utilities for complex objects.
  */
 class ProxyVariableGuard {
     /**
+     * Checks whether a reference is a Copy-on-Write proxy created by ProxyVariableGuard.
+     *
+     * @param {any} value
+     * @returns {boolean}
+     */
+    static isCoWProxy(value) {
+        return Boolean(value && typeof value === 'object' && proxyMetaMap.has(value));
+    }
+
+    /**
      * Wraps a target object with a Copy-on-Write Proxy.
-     * Reads are zero-allocation; writes are isolated in local mutation maps without modifying the base object.
+     * Reads are zero-allocation; writes and deletes are isolated without modifying the base object.
      *
      * @param {Object} target - The source object to wrap
      * @returns {Proxy|Object} Wrapped CoW proxy or original primitive
@@ -19,12 +31,20 @@ class ProxyVariableGuard {
         if (!target || typeof target !== 'object') {
             return target;
         }
+        if (proxyMetaMap.has(target)) {
+            return target;
+        }
 
         const modifications = new Map();
         const childProxies = new Map();
+        const deletions = new Set();
 
         const handler = {
             get(obj, prop) {
+                if (deletions.has(prop)) {
+                    return undefined;
+                }
+
                 if (modifications.has(prop)) {
                     return modifications.get(prop);
                 }
@@ -43,22 +63,35 @@ class ProxyVariableGuard {
             },
 
             set(obj, prop, value) {
+                deletions.delete(prop);
                 childProxies.delete(prop);
                 modifications.set(prop, value);
                 return true;
             },
 
+            deleteProperty(obj, prop) {
+                childProxies.delete(prop);
+                modifications.delete(prop);
+                deletions.add(prop);
+                return true;
+            },
+
             has(obj, prop) {
+                if (deletions.has(prop)) return false;
                 if (modifications.has(prop) || childProxies.has(prop)) return true;
                 return Reflect.has(obj, prop);
             },
 
             ownKeys(obj) {
-                const keys = new Set([...Reflect.ownKeys(obj), ...modifications.keys()]);
+                const baseKeys = Reflect.ownKeys(obj).filter(k => !deletions.has(k));
+                const keys = new Set([...baseKeys, ...modifications.keys()]);
                 return Array.from(keys);
             },
 
             getOwnPropertyDescriptor(obj, prop) {
+                if (deletions.has(prop)) {
+                    return undefined;
+                }
                 if (modifications.has(prop)) {
                     return {
                         value: modifications.get(prop),
@@ -71,7 +104,88 @@ class ProxyVariableGuard {
             }
         };
 
-        return new Proxy(target, handler);
+        const proxy = new Proxy(target, handler);
+        proxyMetaMap.set(proxy, { target, modifications, childProxies, deletions });
+        return proxy;
+    }
+
+    /**
+     * Recursively materializes a clean, plain JSON-safe object from a value that may contain CoW proxies.
+     * Preserves all proxy writes and deletions without mutating the underlying base object.
+     *
+     * @param {any} value
+     * @param {WeakMap} [seen]
+     * @returns {any}
+     */
+    static unwrap(value, seen = new WeakMap()) {
+        if (!value || typeof value !== 'object') {
+            return value;
+        }
+        if (value instanceof Date || value instanceof RegExp) {
+            return value;
+        }
+        if (seen.has(value)) {
+            return seen.get(value);
+        }
+
+        const meta = proxyMetaMap.get(value);
+        if (meta) {
+            const { target, modifications, childProxies, deletions } = meta;
+            if (Array.isArray(target)) {
+                const len = modifications.has('length') ? Number(modifications.get('length')) : target.length;
+                const arr = new Array(len);
+                seen.set(value, arr);
+                for (let i = 0; i < len; i++) {
+                    const key = String(i);
+                    if (deletions.has(key) || deletions.has(i)) {
+                        continue;
+                    }
+                    if (modifications.has(key)) {
+                        arr[i] = ProxyVariableGuard.unwrap(modifications.get(key), seen);
+                    } else if (modifications.has(i)) {
+                        arr[i] = ProxyVariableGuard.unwrap(modifications.get(i), seen);
+                    } else if (childProxies.has(key)) {
+                        arr[i] = ProxyVariableGuard.unwrap(childProxies.get(key), seen);
+                    } else {
+                        arr[i] = ProxyVariableGuard.unwrap(target[i], seen);
+                    }
+                }
+                return arr;
+            }
+
+            const out = {};
+            seen.set(value, out);
+            const keys = new Set([
+                ...Object.keys(target).filter(k => !deletions.has(k)),
+                ...Array.from(modifications.keys()).filter(k => typeof k === 'string')
+            ]);
+            for (const key of keys) {
+                if (modifications.has(key)) {
+                    out[key] = ProxyVariableGuard.unwrap(modifications.get(key), seen);
+                } else if (childProxies.has(key)) {
+                    out[key] = ProxyVariableGuard.unwrap(childProxies.get(key), seen);
+                } else {
+                    out[key] = ProxyVariableGuard.unwrap(target[key], seen);
+                }
+            }
+            return out;
+        }
+
+        if (Array.isArray(value)) {
+            const arr = new Array(value.length);
+            seen.set(value, arr);
+            for (let i = 0; i < value.length; i++) {
+                arr[i] = ProxyVariableGuard.unwrap(value[i], seen);
+            }
+            return arr;
+        }
+
+        const out = {};
+        seen.set(value, out);
+        for (const key of Object.keys(value)) {
+            out[key] = ProxyVariableGuard.unwrap(value[key], seen);
+        }
+        return out;
     }
 
     /**
@@ -106,7 +220,3 @@ class ProxyVariableGuard {
 }
 
 export { ProxyVariableGuard };
-
-if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { ProxyVariableGuard };
-}
