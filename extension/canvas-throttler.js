@@ -409,6 +409,11 @@ class CanvasThrottler {
         }
 
         this.canvasRegistry.delete(canvas);
+
+        // Nếu không còn canvas nào trên DOM, dọn dẹp các request đang hoãn (Zero Leak)
+        if (this.canvasRegistry.size === 0 && this.activeRequests.size > 0) {
+            this.activeRequests.clear();
+        }
     }
 
     /**

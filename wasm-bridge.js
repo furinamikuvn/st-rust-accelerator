@@ -16,13 +16,29 @@ async function initWasm(options = {}) {
 
     try {
         if (typeof window !== 'undefined' && typeof window.document !== 'undefined') {
-            // Môi trường Browser: nạp bản build Web (ESM)
+            // Môi trường Browser
+            const wasmUrl = options.wasmUrl || 
+                (document.currentScript && document.currentScript.src 
+                    ? new URL('./pkg/st_wasm_core_bg.wasm', document.currentScript.src).href 
+                    : '/scripts/extensions/third-party/st-rust-accelerator/pkg/st_wasm_core_bg.wasm');
+
+            // Nạp module JS glue sinh bởi wasm-bindgen
             const wasmGlue = await import('./pkg/st_wasm_core.js');
 
-            // Khởi tạo WASM module (mặc định nạp st_wasm_core_bg.wasm cùng thư mục)
-            if (typeof wasmGlue.default === 'function') {
-                const wasmUrl = options.wasmUrl || new URL('./pkg/st_wasm_core_bg.wasm', import.meta.url).href;
-                await wasmGlue.default(wasmUrl);
+            // Nạp binary .wasm (hỗ trợ instantiateStreaming hoặc fetch arrayBuffer)
+            if (typeof WebAssembly.instantiateStreaming === 'function') {
+                try {
+                    await wasmGlue.default(wasmUrl);
+                } catch (_) {
+                    // Fallback sang arrayBuffer nếu server không cấu hình MIME type application/wasm
+                    const response = await fetch(wasmUrl);
+                    const bytes = await response.arrayBuffer();
+                    await wasmGlue.default(bytes);
+                }
+            } else {
+                const response = await fetch(wasmUrl);
+                const bytes = await response.arrayBuffer();
+                await wasmGlue.default(bytes);
             }
 
             wasmInstance = wasmGlue;

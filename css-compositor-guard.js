@@ -150,10 +150,19 @@ class CssCompositorGuard {
             if (!this.isEnabled) return;
 
             for (const mutation of mutations) {
-                if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
-                    for (const node of mutation.addedNodes) {
-                        if (node.nodeType === 1) { // Element node
-                            this.inspectAndAttach(node);
+                if (mutation.type === 'childList') {
+                    if (mutation.addedNodes && mutation.addedNodes.length > 0) {
+                        for (const node of mutation.addedNodes) {
+                            if (node.nodeType === 1) { // Element node
+                                this.inspectAndAttach(node);
+                            }
+                        }
+                    }
+                    if (mutation.removedNodes && mutation.removedNodes.length > 0) {
+                        for (const node of mutation.removedNodes) {
+                            if (node.nodeType === 1) { // Element node
+                                this.inspectAndDetach(node);
+                            }
                         }
                     }
                 }
@@ -172,10 +181,18 @@ class CssCompositorGuard {
     isHudContainer(element) {
         if (!element || typeof element.matches !== 'function') return false;
 
+        // Container chính của chat (#chat) không bao giờ là HUD container
+        try {
+            if (this.options.chatSelector && element.matches(this.options.chatSelector)) {
+                return false;
+            }
+            if (element.id === 'chat') return false;
+        } catch (_) {}
+
         // 1. Kiểm tra qua selector nhận diện danh mục
         for (const selector of this.hudSelectors) {
             try {
-                if (element.matches(selector) || element.querySelector(selector)) {
+                if (element.matches(selector)) {
                     return true;
                 }
             } catch (_) {}
@@ -231,6 +248,56 @@ class CssCompositorGuard {
         // Tối ưu hóa các lớp kính mờ backdrop-filter bên trong
         if (this.options.enableBackdropFilterCap) {
             this.optimizeBackdropFilters(rootElement);
+        }
+    }
+
+    /**
+     * Dọn dẹp và hủy theo dõi khi một phần tử HUD bị gỡ khỏi DOM (Chống Rò Rỉ Bộ Nhớ)
+     */
+    inspectAndDetach(rootElement) {
+        if (!rootElement) return;
+
+        const containers = [];
+        if (this.observedContainers.has(rootElement)) {
+            containers.push(rootElement);
+        }
+
+        if (typeof rootElement.querySelectorAll === 'function') {
+            for (const selector of this.hudSelectors) {
+                try {
+                    const found = rootElement.querySelectorAll(selector);
+                    if (found && found.length > 0) {
+                        for (const el of found) {
+                            if (this.observedContainers.has(el)) {
+                                containers.push(el);
+                            }
+                        }
+                    }
+                } catch (_) {}
+            }
+        }
+
+        const uniqueContainers = Array.from(new Set(containers));
+        for (const container of uniqueContainers) {
+            this.unprotectContainer(container);
+        }
+    }
+
+    /**
+     * Hủy theo dõi và giải phóng container khỏi các tập hợp quản lý
+     */
+    unprotectContainer(container) {
+        if (!container) return;
+
+        if (this.intersectionObserver) {
+            this.intersectionObserver.unobserve(container);
+        }
+
+        this.observedContainers.delete(container);
+        this.pausedContainers.delete(container);
+
+        if (typeof container.removeAttribute === 'function') {
+            container.removeAttribute('data-st-compositor-guarded');
         }
     }
 

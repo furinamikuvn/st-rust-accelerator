@@ -48,7 +48,16 @@ async function initWasm(options = {}) {
             return true;
         } else {
             // Môi trường Node.js (dành cho Unit Testing và Server Runner)
-            const wasmModule = require('./pkg/st_wasm_core.js');
+            let wasmModule;
+            try {
+                wasmModule = require('./pkg-node/st_wasm_core.js');
+            } catch (_) {
+                try {
+                    wasmModule = require('./pkg/st_wasm_core.js');
+                } catch (e2) {
+                    wasmModule = require('../pkg-node/st_wasm_core.js');
+                }
+            }
             wasmInstance = wasmModule;
             isReady = true;
             if (typeof globalThis !== 'undefined') {
