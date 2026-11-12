@@ -36,6 +36,101 @@ let totalStrippedBytes = 0;
 let totalInterceptedChats = 0;
 let totalInterceptedCards = 0;
 
+const STORAGE_STRIPPED_BYTES = 'st_rust_total_stripped_bytes';
+const STORAGE_INTERCEPTED_CARDS = 'st_rust_total_cards';
+const STORAGE_INTERCEPTED_CHATS = 'st_rust_total_chats';
+
+/**
+ * Khôi phục số liệu Telemetry từ sessionStorage (Chống mất số liệu khi người dùng F5)
+ */
+function loadTelemetryStorage() {
+    try {
+        if (typeof sessionStorage !== 'undefined') {
+            const b = sessionStorage.getItem(STORAGE_STRIPPED_BYTES);
+            const c = sessionStorage.getItem(STORAGE_INTERCEPTED_CARDS);
+            const ch = sessionStorage.getItem(STORAGE_INTERCEPTED_CHATS);
+            if (b) totalStrippedBytes = parseInt(b, 10) || 0;
+            if (c) totalInterceptedCards = parseInt(c, 10) || 0;
+            if (ch) totalInterceptedChats = parseInt(ch, 10) || 0;
+        }
+    } catch (_) {}
+}
+
+/**
+ * Lưu trữ số liệu Telemetry vào sessionStorage
+ */
+function saveTelemetryStorage() {
+    try {
+        if (typeof sessionStorage !== 'undefined') {
+            sessionStorage.setItem(STORAGE_STRIPPED_BYTES, totalStrippedBytes.toString());
+            sessionStorage.setItem(STORAGE_INTERCEPTED_CARDS, totalInterceptedCards.toString());
+            sessionStorage.setItem(STORAGE_INTERCEPTED_CHATS, totalInterceptedChats.toString());
+        }
+    } catch (_) {}
+}
+
+/**
+ * QUÉT VÀ CẮT TỈA CHỦ ĐỘNG ĐỐI TƯỢNG THẺ TRONG RAM V8 (ACTIVE IN-MEMORY PRUNING)
+ * Giải quyết lệch pha lifecycle: Khi F5, ST nạp thẻ từ cache/unshallow không qua fetch.
+ */
+function pruneCharactersInMemory() {
+    let newlyPrunedBytes = 0;
+    let newlyPrunedCards = 0;
+
+    let chars = [];
+    if (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) {
+        try {
+            const ctx = SillyTavern.getContext();
+            if (ctx) {
+                if (Array.isArray(ctx.characters)) chars = ctx.characters;
+                else if (typeof ctx.getCharacters === 'function') chars = ctx.getCharacters();
+            }
+        } catch (_) {}
+    }
+    if (!chars.length && typeof window !== 'undefined') {
+        if (Array.isArray(window.characters)) chars = window.characters;
+        else if (window.SillyTavern && window.SillyTavern.getContext) {
+            try {
+                const ctx = window.SillyTavern.getContext();
+                if (ctx && Array.isArray(ctx.characters)) chars = ctx.characters;
+            } catch (_) {}
+        }
+    }
+
+    if (Array.isArray(chars) && chars.length > 0) {
+        for (let i = 0; i < chars.length; i++) {
+            const charObj = chars[i];
+            if (!charObj) continue;
+
+            // 1. Cắt tỉa charObj.json_data trực tiếp
+            if (typeof charObj.json_data === 'string' && charObj.json_data.length > 1000) {
+                const len = charObj.json_data.length;
+                totalStrippedBytes += len;
+                totalInterceptedCards++;
+                newlyPrunedBytes += len;
+                newlyPrunedCards++;
+
+                console.log(`[ST-Rust] ✂️ Đã cắt tỉa ${(len / (1024 * 1024)).toFixed(2)} MB json_data của thẻ "${charObj.name || ('chara_' + i)}" trực tiếp trong RAM!`);
+                charObj.json_data = ""; // Giải phóng chuỗi rác khổng lồ
+                charObj.__st_rust_stripped = true;
+            }
+
+            // 2. Cắt tỉa thêm nếu nằm trong charObj.data.json_data
+            if (charObj.data && typeof charObj.data.json_data === 'string' && charObj.data.json_data.length > 1000) {
+                const len = charObj.data.json_data.length;
+                totalStrippedBytes += len;
+                newlyPrunedBytes += len;
+                charObj.data.json_data = "";
+            }
+        }
+    }
+
+    if (newlyPrunedBytes > 0) {
+        saveTelemetryStorage();
+        updateTelemetryUI();
+    }
+}
+
 /**
  * SHIELD 2: NETWORK FETCH INTERCEPTOR (GIAO ƯỚC MẠNG BẤT BIẾN)
  */
@@ -53,33 +148,49 @@ function initNetworkInterceptor() {
             return originalFetch.apply(this, arguments);
         }
 
-        // 1. CHẶN ROUTE /api/characters/get (Cắt tỉa 46.8MB json_data khổng lồ)
-        if (url.includes('/api/characters/get')) {
+        // 1. CHẶN ROUTE /api/characters/get HOẶC /api/characters/all (Cắt tỉa json_data khổng lồ)
+        if (url.includes('/api/characters/get') || url.includes('/api/characters/all')) {
             const response = await originalFetch.apply(this, arguments);
             try {
                 const cloned = response.clone();
                 const data = await cloned.json();
+                let modified = false;
 
-                // Kiểm tra và cắt tỉa json_data thừa thãi
-                if (data && data.character) {
-                    if (typeof data.character.json_data === 'string' && data.character.json_data.length > 1000) {
-                        const strippedLen = data.character.json_data.length;
+                // Hàm cắt tỉa 1 đối tượng thẻ
+                const pruneCard = (charObj) => {
+                    if (charObj && typeof charObj.json_data === 'string' && charObj.json_data.length > 1000) {
+                        const strippedLen = charObj.json_data.length;
                         totalStrippedBytes += strippedLen;
                         totalInterceptedCards++;
 
-                        console.log(`[ST-Rust] Đã cắt tỉa ${(strippedLen / (1024 * 1024)).toFixed(2)} MB json_data của thẻ "${data.character.name || 'chara'}" (Tiết kiệm V8 Heap)!`);
-                        data.character.json_data = ""; // CẮT BỎ CHUỖI THÔ!
-                        data.character.__st_rust_stripped = true;
-
-                        return new Response(JSON.stringify(data), {
-                            status: response.status,
-                            statusText: response.statusText,
-                            headers: response.headers
-                        });
+                        console.log(`[ST-Rust] Đã cắt tỉa ${(strippedLen / (1024 * 1024)).toFixed(2)} MB json_data của thẻ "${charObj.name || 'chara'}" (Tiết kiệm V8 Heap)!`);
+                        charObj.json_data = ""; // CẮT BỎ CHUỖI THÔ!
+                        charObj.__st_rust_stripped = true;
+                        modified = true;
                     }
+                };
+
+                if (Array.isArray(data)) {
+                    // Trường hợp /api/characters/all trả về danh sách thẻ
+                    data.forEach(item => pruneCard(item));
+                } else {
+                    // Trường hợp /api/characters/get trả về 1 thẻ
+                    const charObj = (data && data.character) ? data.character : data;
+                    pruneCard(charObj);
+                }
+
+                if (modified) {
+                    saveTelemetryStorage();
+                    try { updateTelemetryUI(); } catch (_) {}
+
+                    return new Response(JSON.stringify(data), {
+                        status: response.status,
+                        statusText: response.statusText,
+                        headers: response.headers
+                    });
                 }
             } catch (err) {
-                console.warn('[ST-Rust] Lỗi xử lý intercept /api/characters/get (Fail-Safe nhả luồng gốc):', err);
+                console.warn('[ST-Rust] Lỗi xử lý intercept character (Fail-Safe nhả luồng gốc):', err);
             }
             return response;
         }
@@ -93,6 +204,7 @@ function initNetworkInterceptor() {
 
                 if (Array.isArray(chatArray) && chatArray.length > 0) {
                     totalInterceptedChats++;
+                    saveTelemetryStorage();
 
                     // Lưu Line 0 (Chat Metadata) vào WASM Vault
                     if (chatArray[0] && isWasmReady()) {
@@ -278,6 +390,7 @@ function installSettingsDrawer() {
 
     // Xử lý các nút bấm:
     drawer.querySelector('#st-rust-btn-refresh').addEventListener('click', () => {
+        pruneCharactersInMemory();
         updateTelemetryUI();
     });
 
@@ -367,6 +480,9 @@ async function checkServerStatus() {
 async function initExtension() {
     console.log('[ST-Rust] Đang khởi động ST-Rust-Accelerator Suite v2.0 (Full 6-Layer Suite)...');
 
+    // Khôi phục Telemetry đã lưu từ sessionStorage (Chống mất số liệu khi F5)
+    loadTelemetryStorage();
+
     // 1. Nạp Wasm Core
     await initWasm();
 
@@ -402,9 +518,25 @@ async function initExtension() {
 
         // 7. Cài đặt Settings Drawer
         installSettingsDrawer();
+
+        // 8. Quét và cắt tỉa RAM chủ động ngay khi nạp + cập nhật Telemetry
+        pruneCharactersInMemory();
+        updateTelemetryUI();
+
+        // 9. Đăng ký lắng nghe sự kiện của SillyTavern (Tự động cắt tỉa RAM khi đổi chat hoặc nạp thẻ mới)
+        try {
+            const ctx = (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) ? SillyTavern.getContext() : (typeof window !== 'undefined' ? window : null);
+            const ev = ctx && (ctx.eventSource || (typeof window !== 'undefined' && window.eventSource));
+            if (ev && typeof ev.on === 'function') {
+                ev.on('chatLoaded', () => { pruneCharactersInMemory(); updateTelemetryUI(); });
+                ev.on('chat_id_changed', () => { pruneCharactersInMemory(); updateTelemetryUI(); });
+                ev.on('character_page_loaded', () => { pruneCharactersInMemory(); updateTelemetryUI(); });
+                ev.on('app_ready', () => { pruneCharactersInMemory(); updateTelemetryUI(); });
+            }
+        } catch (_) {}
     }
 
-    // 8. Cung cấp API toàn cục cho SillyTavern & kiểm thử console
+    // 10. Cung cấp API toàn cục cho SillyTavern & kiểm thử console
     if (typeof window !== 'undefined') {
         window.__ST_RUST_ACCELERATOR = {
             isReady: isWasmReady,
@@ -417,6 +549,9 @@ async function initExtension() {
             scanWorldbook: scanWorldbookFast,
             countTokens: countTokens,
             trimContext: trimContextBudget,
+            pruneRAM: pruneCharactersInMemory,
+            loadStorage: loadTelemetryStorage,
+            saveStorage: saveTelemetryStorage,
             toggleScroller: (val) => {
                 isScrollerEnabled = val;
                 if (scrollerInstance) scrollerInstance.setEnabled(val);
@@ -477,6 +612,9 @@ export {
     initExtension,
     initNetworkInterceptor,
     installSettingsDrawer,
+    pruneCharactersInMemory,
+    loadTelemetryStorage,
+    saveTelemetryStorage,
     VirtualScroller,
     IframeLazyMounter,
     ProxyVariableGuard,

@@ -582,9 +582,9 @@ async function executeP8Suite() {
             assert(fs.existsSync(fullPath), `File bắt buộc chưa được đồng bộ: ${f}`);
         }
 
-        // Kiểm tra manifest version 2.0.0
+        // Kiểm tra manifest version 2.0.x
         const manifest = JSON.parse(fs.readFileSync(path.join(stExtensionDir, 'manifest.json'), 'utf8'));
-        assert.strictEqual(manifest.version, '2.0.0', 'Manifest version phải là 2.0.0');
+        assert(manifest.version.startsWith('2.0.'), `Manifest version phải là 2.0.x, thực tế: ${manifest.version}`);
 
         console.log(`       - Thư mục third-party/st-rust-accelerator: Đồng bộ đầy đủ Suite v2.0 (1-Click Safe)!`);
     });

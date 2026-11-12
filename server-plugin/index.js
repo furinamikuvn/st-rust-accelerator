@@ -24,8 +24,15 @@ export const info = {
 export async function init(app) {
     console.log('[ST-Rust-Server] Khởi tạo Server Plugin st-rust-accelerator...');
 
+    const registerGet = (paths, handler) => {
+        paths.forEach(p => app.get(p, handler));
+    };
+    const registerPost = (paths, handler) => {
+        paths.forEach(p => app.post(p, handler));
+    };
+
     // 1. Endpoint kiểm tra trạng thái
-    app.get(['/status', '/api/plugins/st-rust-accelerator/status'], (req, res) => {
+    registerGet(['/status', '/api/plugins/st-rust-accelerator/status'], (req, res) => {
         if (!addon) {
             return res.json({ status: 'warning', rust_ready: false, message: 'Addon chưa được nạp' });
         }
@@ -38,7 +45,7 @@ export async function init(app) {
     });
 
     // 2. Endpoint Append Chat Delta siêu tốc (< 0.2ms)
-    app.post(['/append-chat', '/api/plugins/st-rust-accelerator/append-chat'], (req, res) => {
+    registerPost(['/append-chat', '/api/plugins/st-rust-accelerator/append-chat'], (req, res) => {
         try {
             const { chatPath, messageJson } = req.body;
             if (!chatPath || !messageJson) {
@@ -58,7 +65,7 @@ export async function init(app) {
     });
 
     // 3. Endpoint Update Last Message / Swipe (< 1.0ms)
-    app.post(['/update-last-chat', '/api/plugins/st-rust-accelerator/update-last-chat'], (req, res) => {
+    registerPost(['/update-last-chat', '/api/plugins/st-rust-accelerator/update-last-chat'], (req, res) => {
         try {
             const { chatPath, messageJson } = req.body;
             if (!chatPath || !messageJson) {
@@ -78,7 +85,7 @@ export async function init(app) {
     });
 
     // 4. Endpoint Tách Snapshot Line 0
-    app.post(['/extract-line0', '/api/plugins/st-rust-accelerator/extract-line0'], (req, res) => {
+    registerPost(['/extract-line0', '/api/plugins/st-rust-accelerator/extract-line0'], (req, res) => {
         try {
             const { chatPath } = req.body;
             if (!chatPath) {
@@ -98,7 +105,7 @@ export async function init(app) {
     });
 
     // 5. Endpoint Bóc Tách Card PNG Zero-Copy & Cắt Tỉa json_data
-    app.post(['/extract-card', '/api/plugins/st-rust-accelerator/extract-card'], (req, res) => {
+    registerPost(['/extract-card', '/api/plugins/st-rust-accelerator/extract-card'], (req, res) => {
         try {
             const { cardPath, stripJsonData } = req.body;
             if (!cardPath) {
