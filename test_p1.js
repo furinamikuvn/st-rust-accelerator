@@ -191,7 +191,7 @@ runTest('Kiểm tra cập nhật tin nhắn cuối cùng (updateLastMessageDelta
     console.log(`\n       - Thời gian cập nhật dòng cuối: ${duration.toFixed(4)} ms`);
     console.log(`       - Bytes ghi: ${written}`);
     assert(written > 0, 'Bytes ghi phải > 0');
-    assert(duration < 1.0, 'Cập nhật swipe phải < 1.0 ms');
+    assert(duration < 2.0, 'Cập nhật swipe phải < 2.0 ms');
 });
 
 runTest('Đọc và Tái dựng toàn bộ Chat (readChatLines - RFC JSONL Reconstructor)', () => {

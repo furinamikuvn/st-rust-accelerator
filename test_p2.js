@@ -8,8 +8,8 @@ const fs = require('fs');
 const path = require('path');
 const assert = require('assert');
 
-// 1. Nạp Wasm Module sinh ra bởi wasm-bindgen
-const wasmPath = path.resolve(__dirname, 'pkg', 'st_wasm_core.js');
+// 1. Nạp Wasm Module Node-target sinh ra bởi wasm-bindgen
+const wasmPath = path.resolve(__dirname, 'pkg-node', 'st_wasm_core.js');
 console.log(`[INIT] Nạp WebAssembly Core từ: ${wasmPath}`);
 const wasm = require(wasmPath);
 
