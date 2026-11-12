@@ -1,16 +1,13 @@
 /**
- * INDEX.JS — EXTENSION ENTRYPOINT & THE COMPLETE 6-LAYER ACCELERATION SUITE
- * Dự án: ST-RUST-ACCELERATOR (SillyTavern Extension Suite)
- * 
- * Khởi động toàn bộ Suite 6 lá chắn tối ưu hóa:
- * 1. Network Interceptor & Cắt tỉa json_data 46.8MB (Shield 2)
- * 2. WASM LZ4 Chat Vault & SIMD Tokenizer (Shield 3 & D4)
- * 3. DOM Virtual Scroller (Khóa cứng 15-18 tin nhắn, 60 FPS) (D7)
- * 4. Lazy Iframe HUD Mounter (Sleep 60MB RAM/tab)
- * 5. CSS Compositor & Layer Guard (Cô lập containment & đóng băng 73 keyframes) (P6)
- * 6. Canvas Motion Throttler (Điều tốc thông minh 0/30/60 FPS cho 7.8% thẻ có Canvas) (P7)
- * 
- * Cung cấp UI Settings Drawer điều khiển Bật/Tắt theo thời gian thực (A/B Testing & Telemetry).
+ * Extension Entrypoint & 6-Layer Acceleration Suite for SillyTavern.
+ * Orchestrates all acceleration layers:
+ * 1. Network Interceptor & JSON Pruning (Shield 2)
+ * 2. WASM LZ4 Chat Vault & Tokenizer (Shield 3)
+ * 3. DOM Virtual Scroller (15-18 messages window, 60 FPS)
+ * 4. Lazy Iframe HUD Mounter (suspends dormant HUD iframes)
+ * 5. CSS Compositor & Layer Guard (layout containment and keyframe pausing)
+ * 6. Canvas Motion Throttler (adaptive 0/30/60 FPS pacing)
+ * Provides an interactive UI Settings Drawer for real-time telemetry and A/B controls.
  */
 
 import { initWasm, isWasmReady, storeLine0InVault, getLine0FromVault, storeMessageInVault, getMessageFromVault, assembleContextFromVault, buildWorldbookMatcher, scanWorldbookFast, countTokens, trimContextBudget } from './wasm-bridge.js';
@@ -19,6 +16,12 @@ import { IframeLazyMounter } from './iframe-lazy-mounter.js';
 import { ProxyVariableGuard } from './proxy-variable-guard.js';
 import { CssCompositorGuard } from './css-compositor-guard.js';
 import { CanvasThrottler } from './canvas-throttler.js';
+
+function debugLog(message, ...args) {
+    if (typeof window !== 'undefined' && window.__ST_RUST_DEBUG) {
+        console.debug(`[ST-Rust] ${message}`, ...args);
+    }
+}
 
 let originalFetch = null;
 let scrollerInstance = null;
@@ -41,7 +44,7 @@ const STORAGE_INTERCEPTED_CARDS = 'st_rust_total_cards';
 const STORAGE_INTERCEPTED_CHATS = 'st_rust_total_chats';
 
 /**
- * Khôi phục số liệu Telemetry từ sessionStorage (Chống mất số liệu khi người dùng F5)
+ * Restores telemetry values from sessionStorage to persist across page reloads.
  */
 function loadTelemetryStorage() {
     try {
@@ -57,7 +60,7 @@ function loadTelemetryStorage() {
 }
 
 /**
- * Lưu trữ số liệu Telemetry vào sessionStorage
+ * Persists telemetry values into sessionStorage.
  */
 function saveTelemetryStorage() {
     try {
@@ -70,8 +73,8 @@ function saveTelemetryStorage() {
 }
 
 /**
- * QUÉT VÀ CẮT TỈA CHỦ ĐỘNG ĐỐI TƯỢNG THẺ TRONG RAM V8 (ACTIVE IN-MEMORY PRUNING)
- * Giải quyết lệch pha lifecycle: Khi F5, ST nạp thẻ từ cache/unshallow không qua fetch.
+ * Actively scans and prunes unneeded raw JSON metadata from character objects in V8 memory.
+ * Resolves lifecycle desynchronization when characters are restored from unshallow cache on page reload.
  */
 function pruneCharactersInMemory() {
     let newlyPrunedBytes = 0;
@@ -102,7 +105,6 @@ function pruneCharactersInMemory() {
             const charObj = chars[i];
             if (!charObj) continue;
 
-            // 1. Cắt tỉa charObj.json_data trực tiếp
             if (typeof charObj.json_data === 'string' && charObj.json_data.length > 1000) {
                 const len = charObj.json_data.length;
                 totalStrippedBytes += len;
@@ -110,12 +112,11 @@ function pruneCharactersInMemory() {
                 newlyPrunedBytes += len;
                 newlyPrunedCards++;
 
-                console.log(`[ST-Rust] ✂️ Đã cắt tỉa ${(len / (1024 * 1024)).toFixed(2)} MB json_data của thẻ "${charObj.name || ('chara_' + i)}" trực tiếp trong RAM!`);
-                charObj.json_data = ""; // Giải phóng chuỗi rác khổng lồ
+                debugLog(`Pruned ${(len / (1024 * 1024)).toFixed(2)} MB json_data from "${charObj.name || ('chara_' + i)}" directly in RAM.`);
+                charObj.json_data = "";
                 charObj.__st_rust_stripped = true;
             }
 
-            // 2. Cắt tỉa thêm nếu nằm trong charObj.data.json_data
             if (charObj.data && typeof charObj.data.json_data === 'string' && charObj.data.json_data.length > 1000) {
                 const len = charObj.data.json_data.length;
                 totalStrippedBytes += len;
@@ -132,23 +133,21 @@ function pruneCharactersInMemory() {
 }
 
 /**
- * SHIELD 2: NETWORK FETCH INTERCEPTOR (GIAO ƯỚC MẠNG BẤT BIẾN)
+ * Installs fetch interceptor for character loading and chat history endpoints.
  */
 function initNetworkInterceptor() {
     if (typeof window === 'undefined' || typeof window.fetch !== 'function') return;
-    if (originalFetch) return; // Đã khởi tạo
+    if (originalFetch) return;
 
     originalFetch = window.fetch;
 
     window.fetch = async function (resource, init) {
         const url = typeof resource === 'string' ? resource : (resource && resource.url ? resource.url : '');
 
-        // Nếu người dùng tắt Interceptor, bỏ qua toàn bộ can thiệp
         if (!isInterceptorEnabled) {
             return originalFetch.apply(this, arguments);
         }
 
-        // 1. CHẶN ROUTE /api/characters/get HOẶC /api/characters/all (Cắt tỉa json_data khổng lồ)
         if (url.includes('/api/characters/get') || url.includes('/api/characters/all')) {
             const response = await originalFetch.apply(this, arguments);
             try {
@@ -156,25 +155,22 @@ function initNetworkInterceptor() {
                 const data = await cloned.json();
                 let modified = false;
 
-                // Hàm cắt tỉa 1 đối tượng thẻ
                 const pruneCard = (charObj) => {
                     if (charObj && typeof charObj.json_data === 'string' && charObj.json_data.length > 1000) {
                         const strippedLen = charObj.json_data.length;
                         totalStrippedBytes += strippedLen;
                         totalInterceptedCards++;
 
-                        console.log(`[ST-Rust] Đã cắt tỉa ${(strippedLen / (1024 * 1024)).toFixed(2)} MB json_data của thẻ "${charObj.name || 'chara'}" (Tiết kiệm V8 Heap)!`);
-                        charObj.json_data = ""; // CẮT BỎ CHUỖI THÔ!
+                        debugLog(`Intercepted and pruned ${(strippedLen / (1024 * 1024)).toFixed(2)} MB json_data from "${charObj.name || 'chara'}".`);
+                        charObj.json_data = "";
                         charObj.__st_rust_stripped = true;
                         modified = true;
                     }
                 };
 
                 if (Array.isArray(data)) {
-                    // Trường hợp /api/characters/all trả về danh sách thẻ
                     data.forEach(item => pruneCard(item));
                 } else {
-                    // Trường hợp /api/characters/get trả về 1 thẻ
                     const charObj = (data && data.character) ? data.character : data;
                     pruneCard(charObj);
                 }
@@ -190,12 +186,11 @@ function initNetworkInterceptor() {
                     });
                 }
             } catch (err) {
-                console.warn('[ST-Rust] Lỗi xử lý intercept character (Fail-Safe nhả luồng gốc):', err);
+                console.warn('[ST-Rust] Error intercepting character payload (pass-through active):', err);
             }
             return response;
         }
 
-        // 2. CHẶN ROUTE /api/chats/get (Đẩy Line 0 và chat cũ vào WASM Vault)
         if (url.includes('/api/chats/get')) {
             const response = await originalFetch.apply(this, arguments);
             try {
@@ -206,13 +201,11 @@ function initNetworkInterceptor() {
                     totalInterceptedChats++;
                     saveTelemetryStorage();
 
-                    // Lưu Line 0 (Chat Metadata) vào WASM Vault
                     if (chatArray[0] && isWasmReady()) {
                         const line0Str = JSON.stringify(chatArray[0]);
                         storeLine0InVault(line0Str);
                     }
 
-                    // Tự động bọc ProxyVariableGuard cho tin nhắn có biến số lớn
                     for (let i = 0; i < chatArray.length; i++) {
                         const msg = chatArray[i];
                         if (msg && msg.variables && typeof msg.variables === 'object') {
@@ -227,7 +220,7 @@ function initNetworkInterceptor() {
                     });
                 }
             } catch (err) {
-                console.warn('[ST-Rust] Lỗi xử lý intercept /api/chats/get (Fail-Safe nhả luồng gốc):', err);
+                console.warn('[ST-Rust] Error intercepting chat payload (pass-through active):', err);
             }
             return response;
         }
@@ -235,11 +228,11 @@ function initNetworkInterceptor() {
         return originalFetch.apply(this, arguments);
     };
 
-    console.log('[ST-Rust] Đã cài đặt Network Fetch Interceptor (Shield 2: /api/characters/get & /api/chats/get)');
+    debugLog('Network Fetch Interceptor registered.');
 }
 
 /**
- * GẮN BẢNG ĐIỀU KHIỂN SETTINGS DRAWER TRONG SILLYTAVERN UI
+ * Injects the extension settings drawer and control panel into SillyTavern UI.
  */
 function installSettingsDrawer() {
     if (typeof document === 'undefined') return;
@@ -327,13 +320,11 @@ function installSettingsDrawer() {
 
     container.appendChild(drawer);
 
-    // Xử lý đóng/mở Accordion
     const toggleHeader = drawer.querySelector('.inline-drawer-toggle');
     const content = drawer.querySelector('.inline-drawer-content');
     const icon = drawer.querySelector('.inline-drawer-icon');
 
     toggleHeader.addEventListener('click', () => {
-        // Nếu không có jQuery/ST Core slideToggle xử lý (như trong Unit Test), tự fallback toggle
         if (typeof window.$ === 'undefined' || !window.$.fn || !window.$.fn.slideToggle) {
             const isHidden = content.style.display === 'none';
             content.style.display = isHidden ? 'block' : 'none';
@@ -348,19 +339,18 @@ function installSettingsDrawer() {
         }, 60);
     });
 
-    // Lắng nghe sự kiện Bật/Tắt Checkbox:
     const chkScroller = drawer.querySelector('#st-rust-toggle-scroller');
     chkScroller.addEventListener('change', (e) => {
         isScrollerEnabled = e.target.checked;
         if (scrollerInstance) scrollerInstance.setEnabled(isScrollerEnabled);
-        console.log(`[ST-Rust] Đã ${isScrollerEnabled ? 'BẬT' : 'TẮT'} DOM Virtual Scroller!`);
+        debugLog(`Virtual Scroller toggled: ${isScrollerEnabled}`);
         updateTelemetryUI();
     });
 
     const chkInterceptor = drawer.querySelector('#st-rust-toggle-interceptor');
     chkInterceptor.addEventListener('change', (e) => {
         isInterceptorEnabled = e.target.checked;
-        console.log(`[ST-Rust] Đã ${isInterceptorEnabled ? 'BẬT' : 'TẮT'} Network Fetch Interceptor!`);
+        debugLog(`Network Interceptor toggled: ${isInterceptorEnabled}`);
         updateTelemetryUI();
     });
 
@@ -368,7 +358,7 @@ function installSettingsDrawer() {
     chkLazyMounter.addEventListener('change', (e) => {
         isLazyMounterEnabled = e.target.checked;
         if (lazyMounterInstance) lazyMounterInstance.setEnabled(isLazyMounterEnabled);
-        console.log(`[ST-Rust] Đã ${isLazyMounterEnabled ? 'BẬT' : 'TẮT'} Iframe Lazy Mounter!`);
+        debugLog(`Lazy Mounter toggled: ${isLazyMounterEnabled}`);
         updateTelemetryUI();
     });
 
@@ -376,7 +366,7 @@ function installSettingsDrawer() {
     chkCompositor.addEventListener('change', (e) => {
         isCompositorGuardEnabled = e.target.checked;
         if (compositorGuardInstance) compositorGuardInstance.setEnabled(isCompositorGuardEnabled);
-        console.log(`[ST-Rust] Đã ${isCompositorGuardEnabled ? 'BẬT' : 'TẮT'} CSS Compositor Guard!`);
+        debugLog(`Compositor Guard toggled: ${isCompositorGuardEnabled}`);
         updateTelemetryUI();
     });
 
@@ -384,11 +374,10 @@ function installSettingsDrawer() {
     chkCanvas.addEventListener('change', (e) => {
         isCanvasThrottlerEnabled = e.target.checked;
         if (canvasThrottlerInstance) canvasThrottlerInstance.setEnabled(isCanvasThrottlerEnabled);
-        console.log(`[ST-Rust] Đã ${isCanvasThrottlerEnabled ? 'BẬT' : 'TẮT'} Canvas Motion Throttler!`);
+        debugLog(`Canvas Throttler toggled: ${isCanvasThrottlerEnabled}`);
         updateTelemetryUI();
     });
 
-    // Xử lý các nút bấm:
     drawer.querySelector('#st-rust-btn-refresh').addEventListener('click', () => {
         pruneCharactersInMemory();
         updateTelemetryUI();
@@ -398,13 +387,12 @@ function installSettingsDrawer() {
         checkServerStatus();
     });
 
-    // Kiểm tra server lần đầu
     checkServerStatus();
-    console.log('[ST-Rust] Đã gắn Bảng Điều Khiển Extension Settings Drawer (Suite v2.0)!');
+    debugLog('Settings drawer installed.');
 }
 
 /**
- * CẬP NHẬT GIAO DIỆN TELEMETRY THỜI GIAN THỰC
+ * Updates telemetry data displayed within the Settings Drawer UI.
  */
 function updateTelemetryUI() {
     const elStripped = document.getElementById('st-rust-stat-stripped');
@@ -442,7 +430,7 @@ function updateTelemetryUI() {
 }
 
 /**
- * KIỂM TRA TRẠNG THÁI SERVER NATIVE PLUGIN
+ * Probes the backend server plugin status and updates status badge.
  */
 async function checkServerStatus() {
     const badge = document.getElementById('st-rust-server-badge');
@@ -455,7 +443,6 @@ async function checkServerStatus() {
 
         let res = await originalFetch('/api/plugins/st-rust-accelerator/status').catch(() => null);
         if (!res || !res.ok) {
-            // Auto-Healing: Thử route lặp nếu SillyTavern plugin loader phiên bản cũ mount kép router
             res = await originalFetch('/api/plugins/st-rust-accelerator/api/plugins/st-rust-accelerator/status').catch(() => null);
         }
         if (res && res.ok) {
@@ -475,40 +462,32 @@ async function checkServerStatus() {
 }
 
 /**
- * Khởi động toàn bộ tiện ích mở rộng ST-Rust-Accelerator Suite v2.0
+ * Initializes the ST-Rust-Accelerator suite and registers all active subsystems.
  */
 async function initExtension() {
-    console.log('[ST-Rust] Đang khởi động ST-Rust-Accelerator Suite v2.0 (Full 6-Layer Suite)...');
+    debugLog('Initializing ST-Rust-Accelerator Suite v2.0...');
 
-    // Khôi phục Telemetry đã lưu từ sessionStorage (Chống mất số liệu khi F5)
     loadTelemetryStorage();
 
-    // 1. Nạp Wasm Core
     await initWasm();
-
-    // 2. Kích hoạt Network Fetch Interceptor (Shield 2)
     initNetworkInterceptor();
 
     if (typeof document !== 'undefined') {
-        // 3. Khởi tạo DOM Virtual Scroller (D7)
         scrollerInstance = new VirtualScroller('#chat', {
             maxVisibleItems: 18,
             estimatedItemHeight: 120
         });
         scrollerInstance.init();
 
-        // 4. Khởi tạo Iframe Lazy Mounter
         lazyMounterInstance = new IframeLazyMounter();
         lazyMounterInstance.init();
 
-        // 5. Khởi tạo CSS Compositor & Layer Guard (P6)
         compositorGuardInstance = new CssCompositorGuard({
             chatSelector: '#chat',
             maxBlurPx: 8
         });
         compositorGuardInstance.init();
 
-        // 6. Khởi tạo Canvas Motion Throttler (P7)
         canvasThrottlerInstance = new CanvasThrottler({
             chatSelector: '#chat',
             targetIdleFps: 30,
@@ -516,14 +495,11 @@ async function initExtension() {
         });
         canvasThrottlerInstance.init();
 
-        // 7. Cài đặt Settings Drawer
         installSettingsDrawer();
 
-        // 8. Quét và cắt tỉa RAM chủ động ngay khi nạp + cập nhật Telemetry
         pruneCharactersInMemory();
         updateTelemetryUI();
 
-        // 9. Đăng ký lắng nghe sự kiện của SillyTavern (Tự động cắt tỉa RAM khi đổi chat hoặc nạp thẻ mới)
         try {
             const ctx = (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) ? SillyTavern.getContext() : (typeof window !== 'undefined' ? window : null);
             const ev = ctx && (ctx.eventSource || (typeof window !== 'undefined' && window.eventSource));
@@ -536,7 +512,6 @@ async function initExtension() {
         } catch (_) {}
     }
 
-    // 10. Cung cấp API toàn cục cho SillyTavern & kiểm thử console
     if (typeof window !== 'undefined') {
         window.__ST_RUST_ACCELERATOR = {
             isReady: isWasmReady,
@@ -596,10 +571,9 @@ async function initExtension() {
         };
     }
 
-    console.log('[ST-Rust] ST-Rust-Accelerator Suite v2.0 đã sẵn sàng hoạt động 100%! 🌸✨🧠🎨');
+    debugLog('ST-Rust-Accelerator Suite v2.0 initialized and ready.');
 }
 
-// Tự động khởi động khi nạp trong môi trường trình duyệt
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', () => initExtension());

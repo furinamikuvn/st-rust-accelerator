@@ -1,22 +1,28 @@
 /**
- * CSS-COMPOSITOR-GUARD.JS — BỘ CÁCH LY LỚP ĐỒ HỌA & ĐÓNG BĂNG ANIMATION
- * Dự án: ST-RUST-ACCELERATOR (Phase P6: CSS Compositor & Layer Guard)
- * 
- * Vấn đề giải quyết:
- * 77.6% thẻ SillyTavern dùng CSS Keyframes (như Thiên Chương Định Mệnh v4.3 với 73 animation,
- * 82 phép xoay transform, 331 box-shadow, 24 backdrop-filter) gây ra hiện tượng Bùng nổ lớp
- * đồ họa (Compositor Layer Explosion) khiến Chrome ngốn tới 4.2 GB RAM và drop FPS.
- * 
- * Cơ chế tối ưu hóa:
- * 1. CSS Containment: Tự động tiêm `contain: layout style paint;` vào container HUD để cô lập repaint.
- * 2. Đóng băng Animation ngoài Viewport (IntersectionObserver): Gán class `.st-hud-paused` làm dừng
- *    ngay lập tức các vòng lặp animation khi HUD trượt khỏi tầm mắt, giải phóng 100% GPU Compositor.
- * 3. Khống chế Kính Mờ (Backdrop-filter Guard): Giới hạn blur(>12px) về mức tối đa 8px để triệt tiêu
- *    tải nặng GPU Gaussian Blur bộ nhớ đệm.
- * 4. Passive Sensing (Zero Overhead): Tự động ngủ đông trên 12% thẻ văn bản thuần túy.
+ * CSS Compositor Guard & Graphic Layer Isolation Suite.
+ * Prevents Chromium Compositor Layer Explosion caused by excessive CSS animations and blur filters.
+ * Injects CSS containment and pauses off-screen keyframe animations via IntersectionObserver.
  */
 
+function debugLog(message, ...args) {
+    if (typeof window !== 'undefined' && window.__ST_RUST_DEBUG) {
+        console.debug(`[ST-Rust] ${message}`, ...args);
+    }
+}
+
+/**
+ * CssCompositorGuard manages layout containment, offscreen animation suspension, and filter limits.
+ */
 class CssCompositorGuard {
+    /**
+     * @param {Object} [options={}] - Configuration options
+     * @param {string} [options.chatSelector='#chat'] - Chat message container selector
+     * @param {number} [options.maxBlurPx=8] - Maximum blur radius in pixels for backdrop-filter
+     * @param {boolean} [options.enableContainment=true] - Enable CSS containment on HUD containers
+     * @param {boolean} [options.enableAnimationPausing=true] - Pause animations outside the viewport
+     * @param {boolean} [options.enableBackdropFilterCap=true] - Cap high blur radius values
+     * @param {boolean} [options.debug=false] - Enable verbose debug logging
+     */
     constructor(options = {}) {
         this.options = Object.assign({
             chatSelector: '#chat',
@@ -32,12 +38,10 @@ class CssCompositorGuard {
         this.intersectionObserver = null;
         this.mutationObserver = null;
 
-        // Bộ nhớ theo dõi trạng thái
         this.observedContainers = new Set();
         this.pausedContainers = new Set();
         this.cappedFilterCount = 0;
 
-        // Selector nhận diện đặc trưng của container Game HUD / Regex Scripts
         this.hudSelectors = [
             '[class*="dream-"]',
             '[class*="hud-"]',
@@ -55,7 +59,7 @@ class CssCompositorGuard {
     }
 
     /**
-     * Khởi động toàn bộ Suite CSS Compositor Guard
+     * Initializes styles, observers, and performs an initial scan of the DOM.
      */
     init() {
         if (!this.isEnabled) return;
@@ -65,25 +69,21 @@ class CssCompositorGuard {
         this.initMutationObserver();
         this.scanAllExistingHuds();
 
-        if (this.options.debug) {
-            console.log('[ST-Rust-Compositor] Đã kích hoạt CSS Compositor & Layer Guard (P6)! 🌸✨');
-        }
+        debugLog('CSS Compositor & Layer Guard initialized.');
     }
 
     /**
-     * Tiêm style sheet điều khiển animation và containment vào document.head
+     * Injects global helper styles for animation pause and layout containment.
      */
     injectGlobalStyles() {
         if (typeof document === 'undefined') return;
         if (document.getElementById('st-css-compositor-styles')) return;
 
         const css = `
-            /* [ST-Rust-Compositor] Đóng băng toàn bộ animation khi trượt khỏi Viewport */
             .st-hud-paused, .st-hud-paused * {
                 animation-play-state: paused !important;
             }
 
-            /* [ST-Rust-Compositor] Cô lập tính toán layout/repaint với phần còn lại của SillyTavern */
             .st-hud-isolated {
                 contain: layout style paint !important;
             }
@@ -101,7 +101,7 @@ class CssCompositorGuard {
     }
 
     /**
-     * Khởi tạo IntersectionObserver theo dõi việc trượt khỏi tầm mắt của HUD
+     * Initializes the IntersectionObserver for viewport tracking.
      */
     initIntersectionObserver() {
         if (typeof IntersectionObserver === 'undefined') return;
@@ -112,33 +112,27 @@ class CssCompositorGuard {
             for (const entry of entries) {
                 const target = entry.target;
                 if (!entry.isIntersecting || entry.intersectionRatio <= 0) {
-                    // Trượt khỏi màn hình: Đóng băng ngay lập tức các animation
                     if (!target.classList.contains('st-hud-paused')) {
                         target.classList.add('st-hud-paused');
                         this.pausedContainers.add(target);
-                        if (this.options.debug) {
-                            console.log('[ST-Rust-Compositor] ❄️ Đã đóng băng animation HUD ngoài Viewport:', target);
-                        }
+                        debugLog('Paused off-screen HUD animation:', target);
                     }
                 } else {
-                    // Quay trở lại màn hình: Hồi sinh animation mượt mà ngay trong 1 frame
                     if (target.classList.contains('st-hud-paused')) {
                         target.classList.remove('st-hud-paused');
                         this.pausedContainers.delete(target);
-                        if (this.options.debug) {
-                            console.log('[ST-Rust-Compositor] ⚡ Đã hồi sinh animation HUD trong Viewport:', target);
-                        }
+                        debugLog('Resumed on-screen HUD animation:', target);
                     }
                 }
             }
         }, {
-            root: null, // Viewport trình duyệt
+            root: null,
             threshold: [0, 0.05]
         });
     }
 
     /**
-     * Khởi tạo MutationObserver theo dõi tin nhắn hoặc HUD mới render vào DOM
+     * Initializes MutationObserver to capture dynamically rendered HUD elements.
      */
     initMutationObserver() {
         if (typeof MutationObserver === 'undefined' || typeof document === 'undefined') return;
@@ -153,14 +147,14 @@ class CssCompositorGuard {
                 if (mutation.type === 'childList') {
                     if (mutation.addedNodes && mutation.addedNodes.length > 0) {
                         for (const node of mutation.addedNodes) {
-                            if (node.nodeType === 1) { // Element node
+                            if (node.nodeType === 1) {
                                 this.inspectAndAttach(node);
                             }
                         }
                     }
                     if (mutation.removedNodes && mutation.removedNodes.length > 0) {
                         for (const node of mutation.removedNodes) {
-                            if (node.nodeType === 1) { // Element node
+                            if (node.nodeType === 1) {
                                 this.inspectAndDetach(node);
                             }
                         }
@@ -176,12 +170,14 @@ class CssCompositorGuard {
     }
 
     /**
-     * Kiểm tra một phần tử có phải là container HUD cần quản lý hay không
+     * Evaluates if a given element matches known HUD container criteria.
+     *
+     * @param {Element} element - DOM element to inspect
+     * @returns {boolean} True if element is recognized as a HUD container
      */
     isHudContainer(element) {
         if (!element || typeof element.matches !== 'function') return false;
 
-        // Container chính của chat (#chat) không bao giờ là HUD container
         try {
             if (this.options.chatSelector && element.matches(this.options.chatSelector)) {
                 return false;
@@ -189,7 +185,6 @@ class CssCompositorGuard {
             if (element.id === 'chat') return false;
         } catch (_) {}
 
-        // 1. Kiểm tra qua selector nhận diện danh mục
         for (const selector of this.hudSelectors) {
             try {
                 if (element.matches(selector)) {
@@ -198,13 +193,11 @@ class CssCompositorGuard {
             } catch (_) {}
         }
 
-        // 2. Kiểm tra phần tử có chứa inline animation hoặc thẻ style @keyframes
         const styleAttr = element.getAttribute && element.getAttribute('style');
         if (styleAttr && (styleAttr.includes('animation') || styleAttr.includes('transform'))) {
             return true;
         }
 
-        // 3. Kiểm tra nếu chứa nhiều hơn 2 phần tử có animation con
         if (typeof element.querySelectorAll === 'function') {
             const animatedChildren = element.querySelectorAll('[style*="animation"], [class*="spin"], [class*="rotate"]');
             if (animatedChildren && animatedChildren.length >= 2) {
@@ -216,12 +209,13 @@ class CssCompositorGuard {
     }
 
     /**
-     * Kiểm tra và gắn các cơ chế bảo vệ vào phần tử nếu là HUD
+     * Inspects a DOM subtree and attaches containment and observers to matched HUD containers.
+     *
+     * @param {Element} rootElement - Subtree root element
      */
     inspectAndAttach(rootElement) {
         if (!rootElement || typeof rootElement.querySelectorAll !== 'function') return;
 
-        // Tìm các container HUD bên trong hoặc chính nó
         let candidates = [];
         if (this.isHudContainer(rootElement)) {
             candidates.push(rootElement);
@@ -238,21 +232,20 @@ class CssCompositorGuard {
             } catch (_) {}
         }
 
-        // Lọc trùng
         const uniqueContainers = Array.from(new Set(candidates));
-
         for (const container of uniqueContainers) {
             this.protectContainer(container);
         }
 
-        // Tối ưu hóa các lớp kính mờ backdrop-filter bên trong
         if (this.options.enableBackdropFilterCap) {
             this.optimizeBackdropFilters(rootElement);
         }
     }
 
     /**
-     * Dọn dẹp và hủy theo dõi khi một phần tử HUD bị gỡ khỏi DOM (Chống Rò Rỉ Bộ Nhớ)
+     * Detaches and frees observers for elements removed from the DOM.
+     *
+     * @param {Element} rootElement - Removed subtree root element
      */
     inspectAndDetach(rootElement) {
         if (!rootElement) return;
@@ -284,7 +277,9 @@ class CssCompositorGuard {
     }
 
     /**
-     * Hủy theo dõi và giải phóng container khỏi các tập hợp quản lý
+     * Removes protection and unobserves a specified container.
+     *
+     * @param {Element} container - Container element
      */
     unprotectContainer(container) {
         if (!container) return;
@@ -302,18 +297,18 @@ class CssCompositorGuard {
     }
 
     /**
-     * Áp dụng Containment và đăng ký IntersectionObserver cho một container HUD
+     * Applies CSS containment and registers container with IntersectionObserver.
+     *
+     * @param {Element} container - Container element to protect
      */
     protectContainer(container) {
         if (!container || !container.setAttribute) return;
 
-        // Tránh gắn lặp lại
         if (container.getAttribute('data-st-compositor-guarded') === 'true') {
             return;
         }
         container.setAttribute('data-st-compositor-guarded', 'true');
 
-        // 1. Áp dụng CSS Containment
         if (this.options.enableContainment) {
             container.classList.add('st-hud-isolated');
             if (container.style) {
@@ -321,7 +316,6 @@ class CssCompositorGuard {
             }
         }
 
-        // 2. Đăng ký theo dõi vị trí Viewport
         if (this.intersectionObserver && this.options.enableAnimationPausing) {
             this.intersectionObserver.observe(container);
             this.observedContainers.add(container);
@@ -329,7 +323,9 @@ class CssCompositorGuard {
     }
 
     /**
-     * Quét và khống chế bán kính blur của các phần tử có backdrop-filter lớn hơn maxBlurPx
+     * Caps blur radius in backdrop-filter rules exceeding the configured threshold.
+     *
+     * @param {Element} rootElement - Subtree root element
      */
     optimizeBackdropFilters(rootElement) {
         if (!rootElement || typeof rootElement.querySelectorAll !== 'function') return;
@@ -337,7 +333,6 @@ class CssCompositorGuard {
         const maxBlur = this.options.maxBlurPx || 8;
         const blurRegex = /blur\(\s*(\d+(\.\d+)?)\s*px\s*\)/gi;
 
-        // Quét các phần tử có inline style backdrop-filter
         const elementsWithStyle = rootElement.querySelectorAll('[style*="backdrop-filter"], [style*="-webkit-backdrop-filter"]');
         const elementsToCheck = [rootElement, ...elementsWithStyle];
 
@@ -367,7 +362,7 @@ class CssCompositorGuard {
     }
 
     /**
-     * Quét toàn bộ HUD hiện có trên DOM khi khởi động
+     * Scans all existing HUD elements currently present in the DOM.
      */
     scanAllExistingHuds() {
         if (typeof document === 'undefined') return;
@@ -378,13 +373,14 @@ class CssCompositorGuard {
     }
 
     /**
-     * Bật hoặc Tắt tính năng động theo thời gian thực (hỗ trợ Settings Drawer)
+     * Toggles guard activity dynamically.
+     *
+     * @param {boolean} enabled - Whether guard is active
      */
     setEnabled(enabled) {
         this.isEnabled = !!enabled;
 
         if (!this.isEnabled) {
-            // Khi tắt: Khôi phục toàn bộ animation đang bị tạm dừng
             for (const container of this.pausedContainers) {
                 container.classList.remove('st-hud-paused');
             }
@@ -395,7 +391,6 @@ class CssCompositorGuard {
                 if (container.style) container.style.contain = '';
             }
         } else {
-            // Khi bật lại: Tái kích hoạt containment cho các container đã ghi nhận và quét thêm
             for (const container of this.observedContainers) {
                 if (this.options.enableContainment) {
                     container.classList.add('st-hud-isolated');
@@ -407,7 +402,9 @@ class CssCompositorGuard {
     }
 
     /**
-     * Lấy dữ liệu thống kê Telemetry của CSS Compositor Guard
+     * Returns telemetry statistics for monitored containers and modified filters.
+     *
+     * @returns {Object} Guard statistics
      */
     getStats() {
         return {
@@ -419,7 +416,7 @@ class CssCompositorGuard {
     }
 
     /**
-     * Hủy bỏ guard và giải phóng toàn bộ tài nguyên observers
+     * Completely destroys observers and removes injected styles.
      */
     destroy() {
         this.setEnabled(false);
@@ -444,7 +441,6 @@ class CssCompositorGuard {
     }
 }
 
-// Xuất bản tương thích cả ESM và CommonJS
 export { CssCompositorGuard };
 
 if (typeof module !== 'undefined' && module.exports) {

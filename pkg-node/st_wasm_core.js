@@ -117,7 +117,7 @@ function vault_assemble_context(indices) {
 exports.vault_assemble_context = vault_assemble_context;
 
 /**
- * Xóa sạch két sắt khi chuyển phiên chat mới.
+ * Xóa sạch bộ nhớ của két sắt WASM.
  */
 function vault_clear() {
     wasm.vault_clear();
@@ -156,7 +156,7 @@ function vault_get_message(index) {
 exports.vault_get_message = vault_get_message;
 
 /**
- * Lấy thống kê nén của két sắt WASM.
+ * Lấy số liệu thống kê RAM tiết kiệm được bởi két sắt WASM.
  * @returns {any}
  */
 function vault_get_stats() {

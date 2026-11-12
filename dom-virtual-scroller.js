@@ -1,20 +1,35 @@
 /**
- * DOM-VIRTUAL-SCROLLER.JS — BỘ ẢO HÓA DOM KHUNG CHAT SILLYTAVERN (60 FPS)
- * Dự án: ST-RUST-ACCELERATOR
- * Khóa cứng số lượng DOM node hiển thị ở mức 15-20 tin nhắn trong viewport.
- * Giảm Style Recalculation từ 70ms xuống < 1.5ms/frame, triệt tiêu giật lag khi cuộn và stream AI.
+ * DOM Virtual Scroller for SillyTavern Chat Container.
+ * Restricts active rendered DOM elements to a 15-20 message window inside the viewport.
+ * Reduces style recalculation times from ~70ms to <1.5ms per frame during message streaming and scrolling.
  */
 
+function debugLog(message, ...args) {
+    if (typeof window !== 'undefined' && window.__ST_RUST_DEBUG) {
+        console.debug(`[ST-Rust] ${message}`, ...args);
+    }
+}
+
+/**
+ * VirtualScroller manages high-performance DOM mounting/unmounting for chat messages.
+ */
 class VirtualScroller {
+    /**
+     * @param {string} containerSelector - CSS selector for chat message container
+     * @param {Object} options - Configuration options
+     * @param {number} [options.maxVisibleItems=18] - Maximum number of message nodes rendered simultaneously
+     * @param {number} [options.bufferRatio=1.2] - Viewport buffer multiplier for smooth scrolling
+     * @param {number} [options.estimatedItemHeight=120] - Fallback height estimate in pixels
+     */
     constructor(containerSelector = '#chat', options = {}) {
         this.containerSelector = containerSelector;
         this.container = null;
-        this.maxVisibleItems = options.maxVisibleItems || 18; // Giới hạn cứng 15-20 tin nhắn
-        this.bufferRatio = options.bufferRatio || 1.2; // Vùng đệm 120% viewport
-        this.estimatedItemHeight = options.estimatedItemHeight || 120; // px
+        this.maxVisibleItems = options.maxVisibleItems || 18;
+        this.bufferRatio = options.bufferRatio || 1.2;
+        this.estimatedItemHeight = options.estimatedItemHeight || 120;
         
-        this.heightCache = new Map(); // mesId -> height (px)
-        this.messageNodes = new Map(); // mesId -> detached DOM Node
+        this.heightCache = new Map();
+        this.messageNodes = new Map();
         this.totalMessages = 0;
         
         this.spacerTop = null;
@@ -26,17 +41,18 @@ class VirtualScroller {
         this.visibleRange = { start: 0, end: 0 };
     }
 
+    /**
+     * Initializes DOM elements, mutation observer, and scroll event listeners.
+     */
     init() {
         if (typeof document === 'undefined') return;
 
         this.container = document.querySelector(this.containerSelector);
         if (!this.container) {
-            // Thử lại khi DOM sẵn sàng
             setTimeout(() => this.init(), 500);
             return;
         }
 
-        // Tạo 2 phantom spacers để bảo toàn thanh cuộn tự nhiên của trình duyệt
         if (!this.spacerTop) {
             this.spacerTop = document.createElement('div');
             this.spacerTop.className = 'st-virtual-spacer-top';
@@ -51,19 +67,20 @@ class VirtualScroller {
             this.container.appendChild(this.spacerBottom);
         }
 
-        // Lắng nghe sự kiện scroll với requestAnimationFrame throttling
         this.container.addEventListener('scroll', () => this.onScroll(), { passive: true });
 
-        // Quan sát DOM changes khi ST thêm tin nhắn mới (AI stream hoặc gửi tin)
         if (typeof MutationObserver !== 'undefined') {
             this.observer = new MutationObserver(() => this.onDomMutated());
             this.observer.observe(this.container, { childList: true, subtree: false });
         }
 
-        console.log('[ST-Rust] Đã kích hoạt DOM Virtual Scroller (Khóa 15-20 nodes, 60 FPS)');
+        debugLog('DOM Virtual Scroller initialized (15-20 nodes window, 60 FPS target).');
         this.update();
     }
 
+    /**
+     * Throttles scroll updates via requestAnimationFrame.
+     */
     onScroll() {
         if (!this.isEnabled) return;
         if (!this.isTicking) {
@@ -75,16 +92,21 @@ class VirtualScroller {
         }
     }
 
+    /**
+     * Handles DOM mutations and measures heights of new items.
+     */
     onDomMutated() {
-        // Tự động quét chiều cao của các node mới được render
         this.measureElements();
     }
 
+    /**
+     * Measures and caches height values of active message elements.
+     */
     measureElements() {
         if (!this.container) return;
         const nodes = this.container.querySelectorAll('.mes');
         nodes.forEach(node => {
-            const mesId = parseInt(node.getAttribute('mesid'));
+            const mesId = parseInt(node.getAttribute('mesid'), 10);
             if (!isNaN(mesId)) {
                 const rect = node.getBoundingClientRect();
                 if (rect.height > 0) {
@@ -95,22 +117,20 @@ class VirtualScroller {
     }
 
     /**
-     * Thuật toán cốt lõi: Tính toán và chỉ giữ các tin nhắn nằm trong Viewport
+     * Recalculates visible message range and updates spacers and mounted nodes.
      */
     update() {
         if (!this.container || !this.isEnabled) return;
 
         const allMesNodes = Array.from(this.container.querySelectorAll('.mes'));
-        // Nếu số lượng tin nhắn <= 20: Không cần ảo hóa, hiển thị toàn bộ
         if (allMesNodes.length <= this.maxVisibleItems && this.messageNodes.size === 0) {
             if (this.spacerTop) this.spacerTop.style.height = '0px';
             if (this.spacerBottom) this.spacerBottom.style.height = '0px';
             return;
         }
 
-        // Lưu trữ các node vào bộ nhớ tạm messageNodes
         allMesNodes.forEach(node => {
-            const mesId = parseInt(node.getAttribute('mesid'));
+            const mesId = parseInt(node.getAttribute('mesid'), 10);
             if (!isNaN(mesId)) {
                 if (!this.messageNodes.has(mesId)) {
                     this.messageNodes.set(mesId, node);
@@ -130,7 +150,6 @@ class VirtualScroller {
         const viewportTop = Math.max(0, scrollTop - buffer);
         const viewportBottom = scrollTop + clientHeight + buffer;
 
-        // Tính toán vị trí tương đối của từng tin nhắn theo cache chiều cao
         let accumulatedHeight = 0;
         let startIndex = 0;
         let endIndex = totalCount - 1;
@@ -155,21 +174,17 @@ class VirtualScroller {
             }
         }
 
-        // Giới hạn số lượng tin nhắn hiển thị không vượt quá maxVisibleItems
         const windowSize = endIndex - startIndex + 1;
         if (windowSize > this.maxVisibleItems) {
-            // Ưu tiên các tin nhắn gần tầm nhìn của scrollTop nhất
             endIndex = Math.min(totalCount - 1, startIndex + this.maxVisibleItems - 1);
         }
 
-        // Luôn luôn giữ lại tin nhắn cuối cùng nếu người dùng đang ở sát đáy (để AI stream mượt)
         const isNearBottom = (this.container.scrollHeight - this.container.scrollTop - clientHeight) < 150;
         if (isNearBottom) {
             endIndex = totalCount - 1;
             startIndex = Math.max(0, endIndex - this.maxVisibleItems + 1);
         }
 
-        // Tính chiều cao spacer top & bottom
         let topSpacerHeight = 0;
         for (let i = 0; i < startIndex; i++) {
             topSpacerHeight += heights[i] || this.estimatedItemHeight;
@@ -180,11 +195,9 @@ class VirtualScroller {
             bottomSpacerHeight += heights[i] || this.estimatedItemHeight;
         }
 
-        // Cập nhật Spacers
         if (this.spacerTop) this.spacerTop.style.height = `${topSpacerHeight}px`;
         if (this.spacerBottom) this.spacerBottom.style.height = `${bottomSpacerHeight}px`;
 
-        // Render đúng các node trong dải [startIndex, endIndex]
         for (let i = 0; i < totalCount; i++) {
             const node = this.messageNodes.get(i);
             if (!node) continue;
@@ -193,10 +206,8 @@ class VirtualScroller {
             const isInDom = node.parentNode === this.container;
 
             if (isVisible && !isInDom) {
-                // Mount lại vào DOM
                 this.container.insertBefore(node, this.spacerBottom);
             } else if (!isVisible && isInDom) {
-                // Unmount khỏi DOM để giải phóng render tree
                 node.remove();
             }
         }
@@ -205,12 +216,13 @@ class VirtualScroller {
     }
 
     /**
-     * Bật hoặc tắt chế độ ảo hóa
+     * Toggles virtualization mode. Restores all nodes into DOM when disabled.
+     *
+     * @param {boolean} enabled - Whether virtualization is active
      */
     setEnabled(enabled) {
         this.isEnabled = enabled;
         if (!enabled) {
-            // Khi tắt, khôi phục lại toàn bộ tin nhắn vào DOM
             this.messageNodes.forEach(node => {
                 if (this.container && node.parentNode !== this.container) {
                     this.container.insertBefore(node, this.spacerBottom);
@@ -223,6 +235,11 @@ class VirtualScroller {
         }
     }
 
+    /**
+     * Retrieves current scroller telemetry and metrics.
+     *
+     * @returns {Object} Scroller metrics
+     */
     getStats() {
         const renderedCount = this.container 
             ? this.container.querySelectorAll('.mes').length 
@@ -236,7 +253,6 @@ class VirtualScroller {
     }
 }
 
-// Export cho cả ESM và CJS
 export { VirtualScroller };
 
 if (typeof module !== 'undefined' && module.exports) {

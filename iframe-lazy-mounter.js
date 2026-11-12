@@ -1,9 +1,18 @@
 /**
- * IFRAME-LAZY-MOUNTER.JS — BỘ QUẢN LÝ SLEEP / LAZY-MOUNT CHO HUD IFRAME
- * Dự án: ST-RUST-ACCELERATOR
- * Đóng băng và gỡ bỏ context iframe khi tab HUD bị ẩn, tiết kiệm 50MB-80MB RAM Blink cho mỗi iframe.
+ * Iframe Lazy Mounter and Sleep State Manager for HUD Iframes.
+ * Suspends hidden HUD iframe render contexts by switching src to about:blank,
+ * saving approximately 50MB-80MB of Blink renderer heap per dormant iframe.
  */
 
+function debugLog(message, ...args) {
+    if (typeof window !== 'undefined' && window.__ST_RUST_DEBUG) {
+        console.debug(`[ST-Rust] ${message}`, ...args);
+    }
+}
+
+/**
+ * Manages dormant and active lifecycle states of embedded iframes.
+ */
 class IframeLazyMounter {
     constructor() {
         this.managedIframes = new Set();
@@ -11,10 +20,12 @@ class IframeLazyMounter {
         this.isEnabled = true;
     }
 
+    /**
+     * Initializes IntersectionObserver and attaches DOM mutation listeners.
+     */
     init() {
         if (typeof document === 'undefined') return;
 
-        // Sử dụng IntersectionObserver để phát hiện khi iframe bị ẩn khỏi màn hình
         if (typeof IntersectionObserver !== 'undefined') {
             this.observer = new IntersectionObserver((entries) => {
                 entries.forEach(entry => {
@@ -27,26 +38,26 @@ class IframeLazyMounter {
                 });
             }, {
                 root: null,
-                threshold: 0.01 // Chỉ cần xuất hiện 1% diện tích là đánh thức
+                threshold: 0.01
             });
         }
 
-        // Quét tự động các iframe hiện có
         this.scanAndRegister();
 
-        // Lắng nghe DOM mutations để tự động đăng ký các iframe được thêm mới bởi TavernHelper
         const bodyObserver = new MutationObserver(() => this.scanAndRegister());
         bodyObserver.observe(document.body, { childList: true, subtree: true });
 
-        console.log('[ST-Rust] Đã kích hoạt Iframe Lazy Mounter (Tiết kiệm 50-80MB RAM/HUD)');
+        debugLog('Iframe Lazy Mounter initialized (50-80MB RAM savings per dormant HUD).');
     }
 
+    /**
+     * Scans document for unmanaged iframes and registers them for intersection monitoring.
+     */
     scanAndRegister() {
         if (!this.isEnabled || typeof document === 'undefined') return;
 
         const iframes = document.querySelectorAll('iframe:not([data-st-managed="true"])');
         iframes.forEach(iframe => {
-            // Đánh dấu đã quản lý
             iframe.setAttribute('data-st-managed', 'true');
             this.managedIframes.add(iframe);
 
@@ -54,14 +65,18 @@ class IframeLazyMounter {
                 this.observer.observe(iframe);
             }
 
-            // Kiểm tra trạng thái ẩn ban đầu
-            const isHidden = this.isElementHidden(iframe);
-            if (isHidden) {
+            if (this.isElementHidden(iframe)) {
                 this.sleepIframe(iframe);
             }
         });
     }
 
+    /**
+     * Checks if an element is currently hidden via CSS or parent styling.
+     *
+     * @param {HTMLElement} element - Target element to inspect
+     * @returns {boolean} True if element is hidden
+     */
     isElementHidden(element) {
         if (!element) return true;
         const style = window.getComputedStyle ? window.getComputedStyle(element) : element.style;
@@ -70,35 +85,54 @@ class IframeLazyMounter {
         return false;
     }
 
+    /**
+     * Places target iframe into sleep mode to conserve memory.
+     *
+     * @param {HTMLIFrameElement} iframe - Target iframe element
+     */
     sleepIframe(iframe) {
         if (!this.isEnabled || !iframe) return;
         const currentSrc = iframe.getAttribute('src');
         if (currentSrc && currentSrc !== 'about:blank') {
             iframe.setAttribute('data-lazy-src', currentSrc);
             iframe.setAttribute('src', 'about:blank');
-            console.log(`[ST-Rust] Đã chuyển Iframe sang chế độ Sleep (-60MB RAM): ${currentSrc.substring(0, 40)}...`);
+            debugLog(`Suspended iframe into sleep state: ${currentSrc.substring(0, 40)}...`);
         }
     }
 
+    /**
+     * Restores dormant iframe to active state with original src.
+     *
+     * @param {HTMLIFrameElement} iframe - Target iframe element
+     */
     wakeIframe(iframe) {
         if (!this.isEnabled || !iframe) return;
         const lazySrc = iframe.getAttribute('data-lazy-src');
         if (lazySrc && iframe.getAttribute('src') === 'about:blank') {
             iframe.setAttribute('src', lazySrc);
-            console.log(`[ST-Rust] Đã đánh thức Iframe: ${lazySrc.substring(0, 40)}...`);
+            debugLog(`Restored iframe from sleep state: ${lazySrc.substring(0, 40)}...`);
         }
     }
 
+    /**
+     * Toggles lazy mounting behavior. Wakes all managed iframes when disabled.
+     *
+     * @param {boolean} enabled - Whether lazy mounting is enabled
+     */
     setEnabled(enabled) {
         this.isEnabled = enabled;
         if (!enabled) {
-            // Khi tắt, đánh thức lại toàn bộ iframe
             this.managedIframes.forEach(iframe => {
                 this.wakeIframe(iframe);
             });
         }
     }
 
+    /**
+     * Retrieves telemetry statistics for managed iframes.
+     *
+     * @returns {Object} Statistics object
+     */
     getStats() {
         let sleepingCount = 0;
         let activeCount = 0;
@@ -113,12 +147,11 @@ class IframeLazyMounter {
             totalIframes: this.managedIframes.size,
             sleepingIframes: sleepingCount,
             activeIframes: activeCount,
-            estimatedRamSavedMb: sleepingCount * 60, // Trung bình 60MB/iframe
+            estimatedRamSavedMb: sleepingCount * 60,
         };
     }
 }
 
-// Export cho cả ESM và CJS
 export { IframeLazyMounter };
 
 if (typeof module !== 'undefined' && module.exports) {

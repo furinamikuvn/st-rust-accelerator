@@ -1,24 +1,29 @@
 /**
- * CANVAS-THROTTLER.JS — BỘ ĐIỀU TỐC KHUNG HÌNH CANVAS THÔNG MINH (0/30/60 FPS)
- * Dự án: ST-RUST-ACCELERATOR (Phase P7: Canvas Motion Throttler)
- * 
- * Vấn đề giải quyết:
- * 7.8% số thẻ SillyTavern có nhúng thẻ <canvas> (Tensura++ có 9 canvas, Hoàng Thiên Hậu Thổ có 2 canvas,
- * Toàn Chức Cao Thủ có 2 canvas, Đạo Uyên v5.3 có 2 canvas). Các script này chạy vòng lặp vẽ 60 FPS
- * liên tục bằng requestAnimationFrame ngay cả khi người dùng không tương tác hoặc canvas đã trôi khỏi
- * màn hình, gây hao pin, nóng máy và ngốn GPU.
- * 
- * Cơ chế tối ưu hóa 3 tầng:
- * 1. Tầng 0 FPS (OFFSCREEN): Khi canvas trượt khỏi tầm mắt (isIntersecting = false), đóng băng/hoãn
- *    callback vẽ, giải phóng 100% tài nguyên GPU.
- * 2. Tầng 30 FPS (IDLE AMBIENT): Khi canvas hiển thị nhưng người dùng không tương tác, điều tốc nhịp
- *    vẽ ở mức 30 FPS (~33ms/frame), cắt giảm 50% số khung hình thừa.
- * 3. Tầng 60 FPS (ACTIVE INTERACTION): Khi người dùng rê chuột (mouseenter, mousemove, click, touch),
- *    tự động bung hết tốc lực 60 FPS mượt mà trong 3.000ms.
- * 4. Zero-Overhead Invariant: Với 92.2% thẻ không có Canvas, tự động bypass 100% về native rAF!
+ * Canvas Motion Throttler & Adaptive Frame Rate Controller (0/30/60 FPS).
+ * Intercepts requestAnimationFrame to throttle HTML5 canvas rendering loops:
+ * - 0 FPS: When off-screen (deferred execution to save 100% GPU cycles).
+ * - 30 FPS: When visible but idle (ambient rendering mode).
+ * - 60 FPS: When actively receiving user interaction (hover, click, touch) for 3 seconds.
+ * Features zero-overhead bypass when no canvas elements exist in the DOM.
  */
 
+function debugLog(message, ...args) {
+    if (typeof window !== 'undefined' && window.__ST_RUST_DEBUG) {
+        console.debug(`[ST-Rust] ${message}`, ...args);
+    }
+}
+
+/**
+ * CanvasThrottler manages frame rate pacing and interaction states for canvas elements.
+ */
 class CanvasThrottler {
+    /**
+     * @param {Object} [options={}] - Configuration options
+     * @param {string} [options.chatSelector='#chat'] - Chat message container selector
+     * @param {number} [options.targetIdleFps=30] - Target frame rate during idle visible state
+     * @param {number} [options.activeDurationMs=3000] - Duration in ms to sustain 60 FPS after interaction
+     * @param {boolean} [options.debug=false] - Enable verbose debug logging
+     */
     constructor(options = {}) {
         this.options = Object.assign({
             chatSelector: '#chat',
@@ -34,21 +39,18 @@ class CanvasThrottler {
         this.mutationObserver = null;
         this.intersectionObserver = null;
 
-        // Quản lý danh sách các canvas: CanvasElement -> State { isIntersecting, activeUntil, listeners }
         this.canvasRegistry = new Map();
 
-        // Hàng đợi rAF & Quản lý ID
         this.nextRequestId = 1;
-        this.activeRequests = new Map(); // id -> { callback, originalId, isDeferred }
+        this.activeRequests = new Map();
         this.lastFrameTimestamp = 0;
         this.totalFramesSaved = 0;
 
-        // Bound methods
         this.boundHandleRAF = this.handleRequestAnimationFrame.bind(this);
     }
 
     /**
-     * Khởi động bộ điều tốc CanvasThrottler
+     * Initializes rAF interception, observers, and registers existing DOM canvases.
      */
     init() {
         if (!this.isEnabled) return;
@@ -59,17 +61,15 @@ class CanvasThrottler {
         this.initMutationObserver();
         this.scanExistingCanvases();
 
-        if (this.options.debug) {
-            console.log('[ST-Rust-Canvas] Đã kích hoạt Canvas Motion Throttler (P7)! 🎨⚡');
-        }
+        debugLog('Canvas Motion Throttler initialized.');
     }
 
     /**
-     * Bọc an toàn window.requestAnimationFrame và cancelAnimationFrame
+     * Intercepts window.requestAnimationFrame and window.cancelAnimationFrame.
      */
     interceptRAF() {
         if (typeof window === 'undefined' || typeof window.requestAnimationFrame !== 'function') return;
-        if (this.originalRAF) return; // Đã bọc
+        if (this.originalRAF) return;
 
         this.originalRAF = window.requestAnimationFrame;
         this.originalCAF = window.cancelAnimationFrame ? window.cancelAnimationFrame : null;
@@ -93,13 +93,14 @@ class CanvasThrottler {
     }
 
     /**
-     * Xử lý điều tốc callback requestAnimationFrame
+     * Throttles requestAnimationFrame callbacks according to current active canvas state.
+     *
+     * @param {Function} callback - Animation callback
+     * @returns {number} Request ID
      */
     handleRequestAnimationFrame(callback) {
         if (typeof callback !== 'function') return 0;
 
-        // NGUYÊN LÝ THĂM DÒ THỤ ĐỘNG (D10): Nếu không có thẻ canvas nào đang tồn tại trong DOM,
-        // bypass 100% về native rAF với 0 overhead!
         if (this.canvasRegistry.size === 0) {
             return this.originalRAF.call(window, callback);
         }
@@ -107,7 +108,6 @@ class CanvasThrottler {
         const id = this.nextRequestId++;
         const currentMode = this.getCurrentGlobalMode();
 
-        // TẦNG 1: 0 FPS (Tất cả canvas đều đang ẩn ngoài Viewport)
         if (currentMode === 'OFFSCREEN') {
             this.activeRequests.set(id, {
                 callback,
@@ -118,9 +118,8 @@ class CanvasThrottler {
             return id;
         }
 
-        // TẦNG 2: 30 FPS (IDLE AMBIENT)
         if (currentMode === 'IDLE') {
-            const minIntervalMs = 1000 / (this.options.targetIdleFps || 30) - 2; // ~31.3ms
+            const minIntervalMs = 1000 / (this.options.targetIdleFps || 30) - 2;
 
             const scheduleCallback = () => {
                 const originalId = this.originalRAF.call(window, (timestamp) => {
@@ -128,17 +127,15 @@ class CanvasThrottler {
                     const elapsed = now - this.lastFrameTimestamp;
 
                     if (elapsed < minIntervalMs) {
-                        // Chưa đủ thời gian nhịp 30 FPS -> hoãn sang frame tiếp theo của rAF
                         this.totalFramesSaved++;
                         scheduleCallback();
                     } else {
-                        // Đã đủ >= 31.3ms -> thực thi và cập nhật timestamp
                         this.activeRequests.delete(id);
                         this.lastFrameTimestamp = now;
                         try {
                             callback(timestamp);
                         } catch (err) {
-                            console.error('[ST-Rust-Canvas] Lỗi thực thi callback rAF:', err);
+                            console.error('[ST-Rust-Canvas] Error in rAF callback execution:', err);
                         }
                     }
                 });
@@ -157,14 +154,13 @@ class CanvasThrottler {
             return id;
         }
 
-        // TẦNG 3: 60 FPS (ACTIVE INTERACTION)
         const originalId = this.originalRAF.call(window, (timestamp) => {
             this.activeRequests.delete(id);
             this.lastFrameTimestamp = typeof performance !== 'undefined' ? performance.now() : Date.now();
             try {
                 callback(timestamp);
             } catch (err) {
-                console.error('[ST-Rust-Canvas] Lỗi thực thi callback rAF:', err);
+                console.error('[ST-Rust-Canvas] Error in rAF callback execution:', err);
             }
         });
 
@@ -177,7 +173,9 @@ class CanvasThrottler {
     }
 
     /**
-     * Hủy yêu cầu Animation Frame an toàn
+     * Cancels an active or deferred animation frame request.
+     *
+     * @param {number} id - Request ID
      */
     handleCancelAnimationFrame(id) {
         if (!id) return;
@@ -193,7 +191,9 @@ class CanvasThrottler {
     }
 
     /**
-     * Xác định chế độ điều tốc toàn cục dựa trên trạng thái của các canvas đang tồn tại
+     * Determines current global throttling mode (NONE, OFFSCREEN, IDLE, ACTIVE).
+     *
+     * @returns {string} Mode identifier
      */
     getCurrentGlobalMode() {
         if (this.canvasRegistry.size === 0) return 'NONE';
@@ -204,22 +204,21 @@ class CanvasThrottler {
         for (const [_, state] of this.canvasRegistry) {
             if (state.isIntersecting) {
                 hasOnscreen = true;
-                // Nếu có bất kỳ canvas nào đang trong thời gian tương tác tích cực (< 3000ms)
                 if (state.activeUntil && state.activeUntil > now) {
-                    return 'ACTIVE'; // 60 FPS
+                    return 'ACTIVE';
                 }
             }
         }
 
         if (!hasOnscreen) {
-            return 'OFFSCREEN'; // 0 FPS
+            return 'OFFSCREEN';
         }
 
-        return 'IDLE'; // 30 FPS
+        return 'IDLE';
     }
 
     /**
-     * Khởi tạo IntersectionObserver theo dõi hiển thị trong Viewport của từng Canvas
+     * Initializes IntersectionObserver for monitoring canvas visibility.
      */
     initIntersectionObserver() {
         if (typeof IntersectionObserver === 'undefined') return;
@@ -238,14 +237,9 @@ class CanvasThrottler {
                         becameOnscreen = true;
                     }
                     state.isIntersecting = isVisible;
-
-                    if (this.options.debug) {
-                        console.log(`[ST-Rust-Canvas] Canvas ${isVisible ? '👀 HIỆN (ONSCREEN)' : '❄️ ẨN (OFFSCREEN)'}:`, canvas);
-                    }
                 }
             }
 
-            // Nếu có canvas vừa quay lại màn hình, kích hoạt giải phóng các callback bị hoãn
             if (becameOnscreen) {
                 this.flushDeferredRequests();
             }
@@ -256,7 +250,7 @@ class CanvasThrottler {
     }
 
     /**
-     * Xả và thực thi lại các callback rAF đã bị tạm hoãn ở chế độ 0 FPS
+     * Dispatches deferred animation frame requests when a canvas re-enters the viewport.
      */
     flushDeferredRequests() {
         if (this.activeRequests.size === 0) return;
@@ -275,7 +269,7 @@ class CanvasThrottler {
     }
 
     /**
-     * Khởi tạo MutationObserver tự động phát hiện thẻ <canvas> mới thêm vào DOM
+     * Initializes MutationObserver to capture dynamically created canvas elements.
      */
     initMutationObserver() {
         if (typeof MutationObserver === 'undefined' || typeof document === 'undefined') return;
@@ -288,13 +282,11 @@ class CanvasThrottler {
 
             for (const mutation of mutations) {
                 if (mutation.type === 'childList') {
-                    // Phát hiện thêm node mới
                     for (const node of mutation.addedNodes) {
                         if (node.nodeType === 1) {
                             this.inspectAndRegisterCanvases(node);
                         }
                     }
-                    // Phát hiện xóa node (dọn dẹp canvas khi chuyển chat hoặc swipe)
                     for (const node of mutation.removedNodes) {
                         if (node.nodeType === 1) {
                             this.inspectAndUnregisterCanvases(node);
@@ -311,7 +303,9 @@ class CanvasThrottler {
     }
 
     /**
-     * Quét và đăng ký các thẻ canvas bên trong một phần tử DOM
+     * Inspects a subtree and registers all found canvas elements.
+     *
+     * @param {Element} rootElement - Subtree root element
      */
     inspectAndRegisterCanvases(rootElement) {
         if (!rootElement) return;
@@ -330,24 +324,23 @@ class CanvasThrottler {
     }
 
     /**
-     * Đăng ký quản lý một thẻ Canvas cụ thể
+     * Registers a specific canvas element with interaction listeners and observers.
+     *
+     * @param {HTMLCanvasElement} canvas - Canvas element to monitor
      */
     registerCanvas(canvas) {
         if (!canvas || this.canvasRegistry.has(canvas)) return;
 
         const state = {
-            isIntersecting: true, // Mặc định giả định hiển thị cho đến khi observer báo
+            isIntersecting: true,
             activeUntil: 0,
             listeners: []
         };
 
-        // Gắn sự kiện tương tác người dùng (mouseenter, mousemove, click, touchstart)
         const activateInteraction = () => {
             const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
             state.activeUntil = now + (this.options.activeDurationMs || 3000);
-            if (this.options.debug) {
-                console.log('[ST-Rust-Canvas] ⚡ Kích hoạt chế độ 60 FPS (Tương tác chuột) trong 3s');
-            }
+            debugLog('Activated 60 FPS interaction mode for 3s.');
         };
 
         const events = ['mouseenter', 'mousemove', 'click', 'touchstart'];
@@ -358,20 +351,17 @@ class CanvasThrottler {
             }
         }
 
-        // Đăng ký theo dõi vị trí Viewport
         if (this.intersectionObserver) {
             this.intersectionObserver.observe(canvas);
         }
 
         this.canvasRegistry.set(canvas, state);
-
-        if (this.options.debug) {
-            console.log('[ST-Rust-Canvas] Đã đăng ký quản lý Canvas mới:', canvas);
-        }
     }
 
     /**
-     * Hủy đăng ký các thẻ canvas khi bị gỡ khỏi DOM
+     * Inspects a removed subtree and unregisters associated canvases.
+     *
+     * @param {Element} rootElement - Subtree root element
      */
     inspectAndUnregisterCanvases(rootElement) {
         if (!rootElement) return;
@@ -390,34 +380,33 @@ class CanvasThrottler {
     }
 
     /**
-     * Hủy đăng ký một thẻ Canvas
+     * Unregisters a canvas, detaches listeners, and cleans up state.
+     *
+     * @param {HTMLCanvasElement} canvas - Canvas element to unregister
      */
     unregisterCanvas(canvas) {
         const state = this.canvasRegistry.get(canvas);
         if (!state) return;
 
-        // Gỡ bỏ listeners
         for (const item of state.listeners) {
             if (typeof item.target.removeEventListener === 'function') {
                 item.target.removeEventListener(item.event, item.handler);
             }
         }
 
-        // Hủy IntersectionObserver
         if (this.intersectionObserver) {
             this.intersectionObserver.unobserve(canvas);
         }
 
         this.canvasRegistry.delete(canvas);
 
-        // Nếu không còn canvas nào trên DOM, dọn dẹp các request đang hoãn (Zero Leak)
         if (this.canvasRegistry.size === 0 && this.activeRequests.size > 0) {
             this.activeRequests.clear();
         }
     }
 
     /**
-     * Quét toàn bộ canvas hiện có trên DOM khi khởi động
+     * Scans for existing canvas elements in the chat container.
      */
     scanExistingCanvases() {
         if (typeof document === 'undefined') return;
@@ -428,13 +417,14 @@ class CanvasThrottler {
     }
 
     /**
-     * Bật hoặc Tắt tính năng động theo thời gian thực (phục vụ UI Drawer)
+     * Dynamically enables or disables the throttler.
+     *
+     * @param {boolean} enabled - Whether throttler is enabled
      */
     setEnabled(enabled) {
         this.isEnabled = !!enabled;
 
         if (!this.isEnabled) {
-            // Khi tắt: Xả toàn bộ callback bị hoãn
             this.flushDeferredRequests();
         } else {
             this.scanExistingCanvases();
@@ -442,7 +432,9 @@ class CanvasThrottler {
     }
 
     /**
-     * Lấy dữ liệu thống kê Telemetry của CanvasThrottler
+     * Retrieves telemetry statistics for monitored canvases and saved frames.
+     *
+     * @returns {Object} Statistics object
      */
     getStats() {
         let offscreenCount = 0;
@@ -473,12 +465,11 @@ class CanvasThrottler {
     }
 
     /**
-     * Hủy bỏ throttler và hoàn nguyên hoàn toàn window.requestAnimationFrame
+     * Completely destroys the throttler and restores original window.requestAnimationFrame.
      */
     destroy() {
         this.setEnabled(false);
 
-        // Khôi phục native rAF & cAF
         if (typeof window !== 'undefined' && this.originalRAF) {
             window.requestAnimationFrame = this.originalRAF;
             if (this.originalCAF) {
@@ -498,7 +489,6 @@ class CanvasThrottler {
             this.mutationObserver = null;
         }
 
-        // Dọn dẹp listeners của tất cả canvas
         for (const [canvas, _] of this.canvasRegistry) {
             this.unregisterCanvas(canvas);
         }
@@ -507,7 +497,6 @@ class CanvasThrottler {
     }
 }
 
-// Xuất bản tương thích cả ESM và CommonJS
 export { CanvasThrottler };
 
 if (typeof module !== 'undefined' && module.exports) {

@@ -1,13 +1,19 @@
 /**
- * PROXY-VARIABLE-GUARD.JS — COPY-ON-WRITE PROXY CHẶN ĐỨNG KLONA() 40MB
- * Dự án: ST-RUST-ACCELERATOR
- * Ngăn chặn nhân bản mù quáng cây biến 34MB (giải phóng 108MB V8 Heap mỗi bản sao).
+ * Proxy Variable Guard & Copy-on-Write (CoW) Virtualization.
+ * Prevents redundant deep cloning of large variable trees (e.g., TavernHelper state),
+ * saving approximately 108MB of V8 heap per clone operation.
  */
 
+/**
+ * Provides lazy Copy-on-Write proxies and snapshot utilities for complex objects.
+ */
 class ProxyVariableGuard {
     /**
-     * Tạo một Proxy Copy-on-Write (CoW) cho object lớn.
-     * Cho phép đọc không tốn bộ nhớ (Zero Alloc) và chỉ clone shallow khi ghi.
+     * Wraps a target object with a Copy-on-Write Proxy.
+     * Reads are zero-allocation; writes are isolated in local mutation maps without modifying the base object.
+     *
+     * @param {Object} target - The source object to wrap
+     * @returns {Proxy|Object} Wrapped CoW proxy or original primitive
      */
     static createCoWProxy(target) {
         if (!target || typeof target !== 'object') {
@@ -15,22 +21,19 @@ class ProxyVariableGuard {
         }
 
         const modifications = new Map();
-        const childProxies = new Map(); // Cache child proxies để bảo toàn trạng thái ghi nhánh con
+        const childProxies = new Map();
 
         const handler = {
             get(obj, prop) {
-                // Nếu thuộc tính này đã bị chỉnh sửa ở cấp hiện tại, trả về giá trị đã sửa
                 if (modifications.has(prop)) {
                     return modifications.get(prop);
                 }
 
-                // Nếu đã có child proxy cho thuộc tính này, trả về instance đã cache
                 if (childProxies.has(prop)) {
                     return childProxies.get(prop);
                 }
 
                 const value = Reflect.get(obj, prop);
-                // Nếu là object con lồng nhau, bọc lazy CoW proxy và cache lại
                 if (value && typeof value === 'object' && !(value instanceof Date) && !(value instanceof RegExp)) {
                     const childProxy = ProxyVariableGuard.createCoWProxy(value);
                     childProxies.set(prop, childProxy);
@@ -40,7 +43,6 @@ class ProxyVariableGuard {
             },
 
             set(obj, prop, value) {
-                // Nếu gán đè một object mới, xóa child proxy cũ nếu có
                 childProxies.delete(prop);
                 modifications.set(prop, value);
                 return true;
@@ -73,7 +75,10 @@ class ProxyVariableGuard {
     }
 
     /**
-     * Bọc bảo vệ toàn bộ object message (tự động gắn CoW Proxy cho trường variables).
+     * Protects a message object by wrapping its variables dictionary in a CoW proxy.
+     *
+     * @param {Object} msg - The chat message object
+     * @returns {Object} Message with protected variables
      */
     static protectMessage(msg) {
         if (!msg || typeof msg !== 'object') return msg;
@@ -84,25 +89,22 @@ class ProxyVariableGuard {
     }
 
     /**
-     * Chặn đứng việc gọi klona() hoặc structuredClone() trên object 34MB:
-     * Trả về snapshot phẳng chỉ chứa các trường cần thiết.
+     * Creates a shallow snapshot dictionary to avert recursive cloning over massive metadata.
+     *
+     * @param {Object} largeMetadata - Large metadata container
+     * @returns {Object} Safe shallow snapshot
      */
     static createSafeSnapshot(largeMetadata) {
         if (!largeMetadata || typeof largeMetadata !== 'object') return {};
 
         const safeClone = {};
         for (const key of Object.keys(largeMetadata)) {
-            if (key === '__mv_wb_overlay' || key === 'slots') {
-                safeClone[key] = largeMetadata[key];
-            } else {
-                safeClone[key] = largeMetadata[key];
-            }
+            safeClone[key] = largeMetadata[key];
         }
         return safeClone;
     }
 }
 
-// Export cho cả ESM và CJS
 export { ProxyVariableGuard };
 
 if (typeof module !== 'undefined' && module.exports) {

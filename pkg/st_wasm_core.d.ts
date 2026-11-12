@@ -39,7 +39,7 @@ export function trim_context_budget(messages_json: string, max_tokens: number, r
 export function vault_assemble_context(indices: Uint32Array): Uint8Array;
 
 /**
- * Xóa sạch két sắt khi chuyển phiên chat mới.
+ * Xóa sạch bộ nhớ của két sắt WASM.
  */
 export function vault_clear(): void;
 
@@ -54,7 +54,7 @@ export function vault_get_line0(): Uint8Array;
 export function vault_get_message(index: number): Uint8Array;
 
 /**
- * Lấy thống kê nén của két sắt WASM.
+ * Lấy số liệu thống kê RAM tiết kiệm được bởi két sắt WASM.
  */
 export function vault_get_stats(): any;
 

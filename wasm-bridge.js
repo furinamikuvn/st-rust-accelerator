@@ -1,36 +1,42 @@
 /**
- * WASM-BRIDGE.JS — CẦU NỐI WEBASSMEBLY AN TOÀN KÈM FAIL-SAFE
- * Dự án: ST-RUST-ACCELERATOR
- * Quản lý vòng đời và giao tiếp với lõi Rust WASM st-wasm-core
+ * WebAssembly Bridge & Fail-Safe Runtime Manager for ST-Rust-Accelerator.
+ * Orchestrates instantiation and FFI bindings for the st-wasm-core WebAssembly binary,
+ * providing LZ4 chat vault compression, Aho-Corasick worldbook scanning, and token trimming.
  */
+
+function debugLog(message, ...args) {
+    if (typeof window !== 'undefined' && window.__ST_RUST_DEBUG) {
+        console.debug(`[ST-Rust] ${message}`, ...args);
+    }
+}
 
 let wasmInstance = null;
 let isReady = false;
+let forceDisabled = false;
 
 /**
- * Khởi tạo lõi Rust WebAssembly.
- * Hỗ trợ cả môi trường Trình duyệt (Browser) và môi trường Node.js.
+ * Initializes the Rust WebAssembly module across Browser and Node.js runtimes.
+ *
+ * @param {Object} [options={}] - Initialization options
+ * @param {string} [options.wasmUrl] - Explicit URL or path to st_wasm_core_bg.wasm
+ * @returns {Promise<boolean>} Resolves true if WebAssembly instantiated successfully
  */
 async function initWasm(options = {}) {
     if (isReady && wasmInstance) return true;
 
     try {
         if (typeof window !== 'undefined' && typeof window.document !== 'undefined') {
-            // Môi trường Browser
             const wasmUrl = options.wasmUrl || 
                 (document.currentScript && document.currentScript.src 
                     ? new URL('./pkg/st_wasm_core_bg.wasm', document.currentScript.src).href 
                     : '/scripts/extensions/third-party/st-rust-accelerator/pkg/st_wasm_core_bg.wasm');
 
-            // Nạp module JS glue sinh bởi wasm-bindgen
             const wasmGlue = await import('./pkg/st_wasm_core.js');
 
-            // Nạp binary .wasm (hỗ trợ instantiateStreaming hoặc fetch arrayBuffer)
             if (typeof WebAssembly.instantiateStreaming === 'function') {
                 try {
                     await wasmGlue.default(wasmUrl);
                 } catch (_) {
-                    // Fallback sang arrayBuffer nếu server không cấu hình MIME type application/wasm
                     const response = await fetch(wasmUrl);
                     const bytes = await response.arrayBuffer();
                     await wasmGlue.default(bytes);
@@ -44,10 +50,9 @@ async function initWasm(options = {}) {
             wasmInstance = wasmGlue;
             isReady = true;
             window.__ST_RUST_READY = true;
-            console.log('[ST-Rust] Đã khởi tạo thành công lõi Rust WASM Core v' + wasmGlue.get_wasm_core_version());
+            debugLog(`Rust WASM Core v${wasmGlue.get_wasm_core_version()} initialized successfully.`);
             return true;
         } else {
-            // Môi trường Node.js (dành cho Unit Testing và Server Runner)
             let wasmModule;
             try {
                 wasmModule = require('./pkg-node/st_wasm_core.js');
@@ -66,7 +71,7 @@ async function initWasm(options = {}) {
             return true;
         }
     } catch (err) {
-        console.warn('[ST-Rust] Không thể khởi tạo Rust WASM (Kích hoạt Fail-Safe Fallback):', err);
+        console.warn('[ST-Rust] Failed to initialize Rust WASM Core (Fail-Safe active):', err);
         isReady = false;
         if (typeof window !== 'undefined') {
             window.__ST_RUST_READY = false;
@@ -75,19 +80,30 @@ async function initWasm(options = {}) {
     }
 }
 
-let forceDisabled = false;
-
+/**
+ * Sets whether WASM execution is forcefully disabled (e.g. for A/B testing).
+ *
+ * @param {boolean} enabled - Whether WASM should be enabled
+ */
 function setWasmEnabled(enabled) {
     forceDisabled = !enabled;
 }
 
+/**
+ * Checks whether WASM core is ready and active.
+ *
+ * @returns {boolean} True if active and instantiated
+ */
 function isWasmReady() {
     if (forceDisabled) return false;
     return isReady && wasmInstance !== null;
 }
 
 /**
- * Nén và lưu Line 0 (chat_metadata khổng lồ) vào két sắt WASM.
+ * Compresses and stores Line 0 (large metadata) into the off-heap WASM vault.
+ *
+ * @param {string|Uint8Array} line0Data - The metadata string or byte buffer
+ * @returns {number} Compressed size in bytes
  */
 function storeLine0InVault(line0Data) {
     if (!isWasmReady()) return 0;
@@ -97,13 +113,15 @@ function storeLine0InVault(line0Data) {
             : line0Data;
         return wasmInstance.vault_store_line0(bytes);
     } catch (e) {
-        console.warn('[ST-Rust] Lỗi lưu Line 0 vào vault:', e);
+        console.warn('[ST-Rust] Error storing Line 0 in vault:', e);
         return 0;
     }
 }
 
 /**
- * Giải nén và lấy lại Line 0 từ két sắt WASM.
+ * Decompresses and retrieves Line 0 from the WASM vault.
+ *
+ * @returns {string|null} Restored metadata JSON string
  */
 function getLine0FromVault() {
     if (!isWasmReady()) return null;
@@ -111,13 +129,17 @@ function getLine0FromVault() {
         const bytes = wasmInstance.vault_get_line0();
         return new TextDecoder().decode(bytes);
     } catch (e) {
-        console.warn('[ST-Rust] Lỗi lấy Line 0 từ vault:', e);
+        console.warn('[ST-Rust] Error retrieving Line 0 from vault:', e);
         return null;
     }
 }
 
 /**
- * Nén và lưu một tin nhắn vào két sắt theo index.
+ * Compresses and stores a message at the specified index in the WASM vault.
+ *
+ * @param {number} index - Message index
+ * @param {string|Object|Uint8Array} messageData - Message data payload
+ * @returns {number} Compressed size in bytes
  */
 function storeMessageInVault(index, messageData) {
     if (!isWasmReady()) return 0;
@@ -127,13 +149,16 @@ function storeMessageInVault(index, messageData) {
             : (messageData instanceof Uint8Array ? messageData : new TextEncoder().encode(JSON.stringify(messageData)));
         return wasmInstance.vault_store_message(index, bytes);
     } catch (e) {
-        console.warn(`[ST-Rust] Lỗi lưu message [${index}] vào vault:`, e);
+        console.warn(`[ST-Rust] Error storing message [${index}] in vault:`, e);
         return 0;
     }
 }
 
 /**
- * Giải nén và lấy lại một tin nhắn từ két sắt theo index.
+ * Decompresses and retrieves a message from the WASM vault by index.
+ *
+ * @param {number} index - Message index
+ * @returns {Object|null} Parsed message object
  */
 function getMessageFromVault(index) {
     if (!isWasmReady()) return null;
@@ -142,14 +167,16 @@ function getMessageFromVault(index) {
         const str = new TextDecoder().decode(bytes);
         return JSON.parse(str);
     } catch (e) {
-        console.warn(`[ST-Rust] Lỗi lấy message [${index}] từ vault:`, e);
+        console.warn(`[ST-Rust] Error retrieving message [${index}] from vault:`, e);
         return null;
     }
 }
 
 /**
- * Nối trực tiếp các tin nhắn trong WASM memory thành mảng JSON hoàn chỉnh.
- * Zero JS Garbage, không sinh rác V8.
+ * Assembles and decodes specified message indices directly within WASM memory.
+ *
+ * @param {number[]} indices - Array of message indices to assemble
+ * @returns {string|null} Serialized JSON array string
  */
 function assembleContextFromVault(indices) {
     if (!isWasmReady()) return null;
@@ -157,13 +184,16 @@ function assembleContextFromVault(indices) {
         const bytes = wasmInstance.vault_assemble_context(indices);
         return new TextDecoder().decode(bytes);
     } catch (e) {
-        console.warn('[ST-Rust] Lỗi assemble context từ vault:', e);
+        console.warn('[ST-Rust] Error assembling context from vault:', e);
         return null;
     }
 }
 
 /**
- * Biên dịch Automaton Aho-Corasick từ dữ liệu Worldbook.
+ * Compiles an Aho-Corasick automaton from Worldbook JSON data.
+ *
+ * @param {string|Object} worldbookJsonOrObject - Worldbook data
+ * @returns {number} Number of keywords compiled
  */
 function buildWorldbookMatcher(worldbookJsonOrObject) {
     if (!isWasmReady()) return 0;
@@ -173,30 +203,35 @@ function buildWorldbookMatcher(worldbookJsonOrObject) {
             : JSON.stringify(worldbookJsonOrObject);
         return wasmInstance.build_worldbook_matcher(jsonStr);
     } catch (e) {
-        console.warn('[ST-Rust] Lỗi build Worldbook Matcher:', e);
+        console.warn('[ST-Rust] Error building Worldbook matcher:', e);
         return 0;
     }
 }
 
 /**
- * Quét toàn bộ văn bản bằng Aho-Corasick O(N + M) (0.4ms, 0 Bytes GC).
+ * Scans text using Aho-Corasick algorithm in O(N + M) complexity.
+ *
+ * @param {string} haystack - Target text to scan
+ * @returns {Array} List of matched keyword structures
  */
 function scanWorldbookFast(haystack) {
     if (!isWasmReady()) return [];
     try {
         return wasmInstance.scan_worldbook_text(haystack);
     } catch (e) {
-        console.warn('[ST-Rust] Lỗi scan Worldbook Aho-Corasick:', e);
+        console.warn('[ST-Rust] Error scanning Worldbook keywords:', e);
         return [];
     }
 }
 
 /**
- * Đếm số token ước lượng của văn bản.
+ * Computes an estimated token count for the given text.
+ *
+ * @param {string} text - Input text
+ * @returns {number} Token count estimate
  */
 function countTokens(text) {
     if (!isWasmReady()) {
-        // Fallback xấp xỉ đơn giản nếu chưa có WASM
         return Math.ceil((text || '').length / 3.5);
     }
     try {
@@ -207,22 +242,34 @@ function countTokens(text) {
 }
 
 /**
- * Cắt tỉa tin nhắn vượt quá ngân sách token trong < 1.0 ms.
+ * Trims message list to fit within maxTokens budget.
+ *
+ * @param {Array|string} messages - Message array or JSON string
+ * @param {number} maxTokens - Maximum allowed token budget
+ * @param {number} [reserveTokens=0] - Tokens reserved for generation
+ * @param {boolean} [keepFirst=true] - Whether to preserve the initial prompt message
+ * @returns {Object} Result structure with kept_indices, total_kept_tokens, dropped_count
  */
 function trimContextBudget(messages, maxTokens, reserveTokens = 0, keepFirst = true) {
     if (!isWasmReady()) {
-        // Fallback JS: giữ nguyên toàn bộ tin nhắn
-        return { kept_indices: messages.map((_, i) => i), total_kept_tokens: 0, dropped_count: 0 };
+        const list = Array.isArray(messages) ? messages : [];
+        return { kept_indices: list.map((_, i) => i), total_kept_tokens: 0, dropped_count: 0 };
     }
     try {
         const jsonStr = typeof messages === 'string' ? messages : JSON.stringify(messages);
         return wasmInstance.trim_context_budget(jsonStr, maxTokens, reserveTokens, keepFirst);
     } catch (e) {
-        console.warn('[ST-Rust] Lỗi trim context budget:', e);
-        return { kept_indices: messages.map((_, i) => i), total_kept_tokens: 0, dropped_count: 0 };
+        console.warn('[ST-Rust] Error trimming context budget:', e);
+        const list = Array.isArray(messages) ? messages : [];
+        return { kept_indices: list.map((_, i) => i), total_kept_tokens: 0, dropped_count: 0 };
     }
 }
 
+/**
+ * Retrieves memory statistics from the WASM vault.
+ *
+ * @returns {Object|null} Vault statistics
+ */
 function getVaultStats() {
     if (!isWasmReady()) return null;
     try {
@@ -232,6 +279,9 @@ function getVaultStats() {
     }
 }
 
+/**
+ * Clears all data cached within the WASM vault.
+ */
 function clearVault() {
     if (!isWasmReady()) return;
     try {
@@ -239,7 +289,6 @@ function clearVault() {
     } catch (_) {}
 }
 
-// Export cho cả ESM (Browser & Node.js 24+) và CJS
 export {
     initWasm,
     isWasmReady,

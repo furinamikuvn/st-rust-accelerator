@@ -27,6 +27,7 @@ const PLUGIN_DEST = path.join(ST_ROOT, 'plugins', 'st-rust-accelerator');
 // Nạp Addon và Wasm từ Extension đã tích hợp trong SillyTavern
 const serverAddon = require(path.join(PLUGIN_DEST, 'st_server_addon.node'));
 const wasmCore = require(path.join(EXTENSION_DEST, 'pkg-node', 'st_wasm_core.js'));
+import { assertSafePath, init as initServerPlugin } from './server-plugin/index.js';
 
 let testsPassed = 0;
 let testsFailed = 0;
@@ -314,6 +315,82 @@ async function main() {
 
         assert.strictEqual(handledErrors, testCases.length, "Toàn bộ file PNG hỏng phải bị bắt lỗi an toàn bởi Rust!");
         console.log(`       - Cơ chế phòng vệ của Rust Native Addon chặn đứng 100% file dị dạng mà KHÔNG gây SEGFAULT hay sập tiến trình Node.js!`);
+    });
+
+    runAuditTest('Kiểm toán Phòng thủ Path Traversal & Whitelist Extension (CWE-22 Security Hardening)', () => {
+        // 1. Kiểm tra assertSafePath unit validation
+        // Null bytes
+        assert.throws(() => assertSafePath('test\0file.jsonl', ['.jsonl']), /Null byte detected/);
+
+        // Path Traversal Unix style
+        assert.throws(() => assertSafePath('../../etc/passwd', ['.jsonl']), /Directory traversal/);
+        assert.throws(() => assertSafePath('chat/../../../boot.ini', ['.jsonl']), /Directory traversal/);
+
+        // Path Traversal Windows style
+        assert.throws(() => assertSafePath('..\\..\\Windows\\System32\\cmd.exe', ['.exe']), /Directory traversal/);
+
+        // Extension Whitelist violations
+        assert.throws(() => assertSafePath('valid_name.bat', ['.jsonl']), /Invalid file extension/);
+        assert.throws(() => assertSafePath('script.sh', ['.png', '.webp', '.json']), /Invalid file extension/);
+        assert.throws(() => assertSafePath('malicious.exe', ['.jsonl']), /Invalid file extension/);
+
+        // Valid Paths should resolve safely
+        const safeChat = assertSafePath('test_chat.jsonl', ['.jsonl']);
+        assert(path.isAbsolute(safeChat), 'Safe path must be absolute');
+        assert(safeChat.endsWith('.jsonl'), 'Safe path must preserve extension');
+
+        const safeCardPng = assertSafePath('avatar.png', ['.png', '.webp', '.json']);
+        assert(safeCardPng.endsWith('.png'));
+
+        const safeCardWebp = assertSafePath('avatar.webp', ['.png', '.webp', '.json']);
+        assert(safeCardWebp.endsWith('.webp'));
+
+        // 2. Kiểm tra Express Endpoint trả về HTTP 403 Forbidden khi có tấn công Path Traversal
+        const routes = {};
+        const mockApp = {
+            get(route, handler) { routes[`GET ${route}`] = handler; },
+            post(route, handler) { routes[`POST ${route}`] = handler; }
+        };
+
+        initServerPlugin(mockApp);
+
+        // Mock response helper
+        const createMockRes = () => {
+            const res = {
+                statusCode: 200,
+                jsonData: null,
+                status(code) {
+                    this.statusCode = code;
+                    return this;
+                },
+                json(data) {
+                    this.jsonData = data;
+                    return this;
+                }
+            };
+            return res;
+        };
+
+        // Attack 1: /append-chat with traversal
+        const appendHandler = routes['POST /append-chat'];
+        assert(typeof appendHandler === 'function', 'Endpoint POST /append-chat must be registered');
+
+        const mockRes1 = createMockRes();
+        appendHandler({ body: { chatPath: '../../evil.jsonl', messageJson: { text: 'hack' } } }, mockRes1);
+        assert.strictEqual(mockRes1.statusCode, 403, 'Append chat with traversal path must return HTTP 403');
+        assert(mockRes1.jsonData && mockRes1.jsonData.error, 'Must return error message in JSON');
+
+        // Attack 2: /extract-card with disallowed extension
+        const extractCardHandler = routes['POST /extract-card'];
+        assert(typeof extractCardHandler === 'function', 'Endpoint POST /extract-card must be registered');
+
+        const mockRes2 = createMockRes();
+        extractCardHandler({ body: { cardPath: 'payload.exe' } }, mockRes2);
+        assert.strictEqual(mockRes2.statusCode, 403, 'Extract card with bad extension must return HTTP 403');
+        assert(mockRes2.jsonData && mockRes2.jsonData.error, 'Must return error message in JSON');
+
+        console.log(`\n       - Đã xác minh assertSafePath chặn đứng 100% Null Bytes, Traversal (../, ..\\) và Extension sai.`);
+        console.log(`       - Các endpoint Server Plugin trả về HTTP 403 Forbidden thay vì 500 khi gặp yêu cầu vi phạm an ninh!`);
     });
 
     // =========================================================================

@@ -8,5 +8,5 @@
     "author": "Nukumizu & Tawa",
     "version": "2.0.1",
     "homePage": "https://github.com/furinamikuvn/st-rust-accelerator",
-    "description": "Bộ tối ưu hóa hiệu năng & bộ nhớ toàn diện SillyTavern v2.0 (6 Lá Chắn): Rust WASM LZ4 Vault, Network Interceptor, DOM Virtual Scroller, Iframe Lazy Mounter, CSS Compositor Guard & Canvas Motion Throttler. Triệt tiêu 4.2GB RAM rò rỉ, khóa cứng 60 FPS mượt mà cho 100% thẻ phức tạp."
+    "description": "Comprehensive SillyTavern performance & memory optimization suite (6-Layer Shield): Rust WASM LZ4 Vault, Network Interceptor, DOM Virtual Scroller, Iframe Lazy Mounter, CSS Compositor Guard & Canvas Motion Throttler. Eliminates 4.2GB RAM leaks, maintains 60 FPS for 100% of complex character cards."
 }
