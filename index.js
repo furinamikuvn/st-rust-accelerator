@@ -10,7 +10,9 @@
  * Provides an interactive UI Settings Drawer for real-time telemetry and A/B controls.
  */
 
-import { initWasm, isWasmReady, storeLine0InVault, getLine0FromVault, storeMessageInVault, getMessageFromVault, assembleContextFromVault, buildWorldbookMatcher, scanWorldbookFast, countTokens, trimContextBudget, hashXxh64Hex } from './wasm-bridge.js';
+import { initWasm, isWasmReady, storeLine0InVault, getLine0FromVault, storeMessageInVault, getMessageFromVault, assembleContextFromVault, countTokens, trimContextBudget, hashXxh64Hex } from './wasm-bridge.js';
+import { WorldbookFastScanner, worldbookFastScanner, buildWorldbookMatcher, scanWorldbookFast } from './worldbook-fast-scanner.js';
+import { TokenCacheGuard, tokenCacheGuard } from './token-cache-guard.js';
 import { VirtualScroller } from './dom-virtual-scroller.js';
 import { IframeLazyMounter } from './iframe-lazy-mounter.js';
 import { ProxyVariableGuard } from './proxy-variable-guard.js';
@@ -28,7 +30,7 @@ function debugLog(message, ...args) {
 let originalFetch = null;
 let wrappedFetchFn = null;
 let initExtensionPromise = null;
-let eventHooksInstalled = false;
+const hookedEventSources = new WeakSet();
 let pointerPrehydrateInstalled = false;
 
 let scrollerInstance = null;
@@ -201,20 +203,177 @@ function createJsonResponse(payloadObj, originalResponse) {
     });
 }
 
-async function ensureActiveCharacterHydrated(avatar) {
+let activeHydrationEpoch = 0;
+const inflightHydrations = new Map();
+
+function getActiveStContext() {
+    if (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) {
+        try {
+            const ctx = SillyTavern.getContext();
+            if (ctx) return ctx;
+        } catch (_) {}
+    }
+    if (typeof window !== 'undefined') {
+        if (window.SillyTavern && window.SillyTavern.getContext) {
+            try {
+                const ctx = window.SillyTavern.getContext();
+                if (ctx) return ctx;
+            } catch (_) {}
+        }
+        return window;
+    }
+    return null;
+}
+
+function hasStrippedColdSubtrees(charObj) {
+    if (!charObj || !charObj.data || typeof charObj.data !== 'object') return false;
+    const d = charObj.data;
+    return (
+        d.character_book === '__ST_RUST_STRIPPED__' ||
+        Boolean(d.extensions && (
+            d.extensions.tavern_helper === '__ST_RUST_STRIPPED__' ||
+            d.extensions.regex_scripts === '__ST_RUST_STRIPPED__'
+        ))
+    );
+}
+
+function findGroupByChatOrId(groupsList, chatOrGroupId, activeGroupId) {
+    if (!Array.isArray(groupsList)) return null;
+    for (let i = 0; i < groupsList.length; i++) {
+        const g = groupsList[i];
+        if (!g) continue;
+        if (activeGroupId !== undefined && activeGroupId !== null && activeGroupId !== '' && String(g.id) === String(activeGroupId)) {
+            return g;
+        }
+        if (chatOrGroupId && (String(g.id) === String(chatOrGroupId) || g.chat_id === chatOrGroupId || (Array.isArray(g.chats) && g.chats.includes(chatOrGroupId)))) {
+            return g;
+        }
+    }
+    return null;
+}
+
+function getActiveProtectedAvatars(overrideAvatar = null) {
+    const protectedSet = new Set();
+    if (overrideAvatar) protectedSet.add(String(overrideAvatar));
+
+    const ctx = getActiveStContext();
+    const chars = getActiveCharactersArray();
+    if (ctx && Array.isArray(chars)) {
+        if (ctx.groupId !== undefined && ctx.groupId !== null && ctx.groupId !== '') {
+            const group = findGroupByChatOrId(ctx.groups, ctx.chatId, ctx.groupId);
+            if (group && Array.isArray(group.members)) {
+                for (const member of group.members) {
+                    const mChar = chars.find(c => c && (c.avatar === member || c.name === member));
+                    const k = mChar ? rehydrationGuard.getCharacterKey(mChar) : '';
+                    if (k) protectedSet.add(k);
+                }
+            }
+        }
+        if (ctx.characterId !== undefined && ctx.characterId !== null && ctx.characterId !== '') {
+            const c = chars[Number(ctx.characterId)];
+            const k = c ? rehydrationGuard.getCharacterKey(c) : '';
+            if (k && !overrideAvatar) protectedSet.add(k);
+        }
+    }
+    return protectedSet;
+}
+
+async function ensureActiveCharacterHydrated(avatar, options = {}) {
     const key = String(avatar || '').trim();
     if (!key) return false;
+    const keepOthers = Boolean(options && options.keepOthers);
     const chars = getActiveCharactersArray();
     const target = Array.isArray(chars) ? chars.find(c => rehydrationGuard.getCharacterKey(c) === key) : null;
     if (!target) return false;
 
-    if (rehydrationGuard.activeHydratedAvatar && rehydrationGuard.activeHydratedAvatar !== key) {
-        const prev = chars.find(c => rehydrationGuard.getCharacterKey(c) === rehydrationGuard.activeHydratedAvatar);
-        if (prev) rehydrationGuard.reStripCharacterColdFields(prev);
+    const myEpoch = keepOthers ? activeHydrationEpoch : ++activeHydrationEpoch;
+
+    if (!keepOthers) {
+        const protectedSet = getActiveProtectedAvatars(key);
+        if (
+            rehydrationGuard.activeHydratedAvatar &&
+            rehydrationGuard.activeHydratedAvatar !== key &&
+            !protectedSet.has(rehydrationGuard.activeHydratedAvatar)
+        ) {
+            const prev = chars.find(c => rehydrationGuard.getCharacterKey(c) === rehydrationGuard.activeHydratedAvatar);
+            if (prev) rehydrationGuard.reStripCharacterColdFields(prev);
+        }
     }
-    const hydrated = await rehydrationGuard.hydrateCharacterColdFields(target, originalFetch);
-    rehydrationGuard.activeHydratedAvatar = key;
+
+    if (!hasStrippedColdSubtrees(target)) {
+        if (!keepOthers && myEpoch === activeHydrationEpoch) {
+            rehydrationGuard.activeHydratedAvatar = key;
+        }
+        return false;
+    }
+
+    let promise = inflightHydrations.get(key);
+    if (!promise) {
+        const fetchFn = originalFetch || (typeof window !== 'undefined' && typeof window.fetch === 'function' ? window.fetch.bind(window) : null);
+        promise = rehydrationGuard
+            .hydrateCharacterColdFields(target, fetchFn)
+            .finally(() => {
+                if (inflightHydrations.get(key) === promise) {
+                    inflightHydrations.delete(key);
+                }
+            });
+        inflightHydrations.set(key, promise);
+    }
+
+    const hydrated = await promise;
+
+    if (!keepOthers) {
+        if (myEpoch === activeHydrationEpoch) {
+            rehydrationGuard.activeHydratedAvatar = key;
+        } else if (rehydrationGuard.activeHydratedAvatar !== key) {
+            rehydrationGuard.reStripCharacterColdFields(target);
+        }
+    } else if (!rehydrationGuard.activeHydratedAvatar) {
+        rehydrationGuard.activeHydratedAvatar = key;
+    }
+
     return hydrated;
+}
+
+async function ensureGroupMembersHydrated(chatOrGroupId = null) {
+    const ctx = getActiveStContext();
+    const chars = getActiveCharactersArray();
+    if (!ctx || !Array.isArray(ctx.groups) || !Array.isArray(chars)) return false;
+
+    const group = findGroupByChatOrId(ctx.groups, chatOrGroupId || ctx.chatId, ctx.groupId);
+    if (!group || !Array.isArray(group.members) || group.members.length === 0) return false;
+
+    const myEpoch = ++activeHydrationEpoch;
+    const memberKeys = [];
+    for (const member of group.members) {
+        const mChar = chars.find(c => c && (c.avatar === member || c.name === member));
+        const k = mChar ? rehydrationGuard.getCharacterKey(mChar) : '';
+        if (k) memberKeys.push(k);
+    }
+    if (memberKeys.length === 0) return false;
+
+    const results = await Promise.all(
+        memberKeys.map(k => ensureActiveCharacterHydrated(k, { keepOthers: true }).catch(() => false))
+    );
+    if (myEpoch === activeHydrationEpoch && !rehydrationGuard.activeHydratedAvatar) {
+        rehydrationGuard.activeHydratedAvatar = memberKeys[0];
+    }
+    return results.some(Boolean);
+}
+
+async function ensureCurrentSelectionHydrated() {
+    const ctx = getActiveStContext();
+    if (!ctx) return false;
+    if (ctx.groupId !== undefined && ctx.groupId !== null && ctx.groupId !== '') {
+        return ensureGroupMembersHydrated(ctx.chatId || ctx.groupId);
+    }
+    if (ctx.characterId !== undefined && ctx.characterId !== null && ctx.characterId !== '') {
+        const chars = getActiveCharactersArray();
+        const curChar = Array.isArray(chars) ? chars[Number(ctx.characterId)] : null;
+        const av = curChar ? rehydrationGuard.getCharacterKey(curChar) : '';
+        if (av) return ensureActiveCharacterHydrated(av);
+    }
+    return false;
 }
 
 function getActiveChatArray() {
@@ -318,21 +477,8 @@ async function handleCharacterReadResponse(fetchCtx, args, init) {
     return response;
 }
 
-async function handleChatGetResponse(fetchCtx, args, init) {
-    const reqBody = tryParseJsonBody(init && init.body);
-    const avatarUrl = reqBody ? (reqBody.avatar_url || '') : '';
-    const chatKey = reqBody
-        ? `${reqBody.avatar_url || reqBody.ch_name || ''}::${reqBody.file_name || ''}`
-        : 'active_chat';
-
-    const hydrateCharPromise = avatarUrl
-        ? ensureActiveCharacterHydrated(avatarUrl).catch(() => false)
-        : Promise.resolve(false);
-
-    const response = await originalFetch.apply(fetchCtx, args);
-    await hydrateCharPromise;
-
-    if (!isResponseOk(response)) return response;
+async function processLoadedChatResponse(response, chatKey, { allowPrune = true } = {}) {
+    if (!allowPrune || !isResponseOk(response)) return response;
 
     if (vaultClient.isSupported() && response.body && typeof response.body.getReader === 'function') {
         try {
@@ -362,7 +508,7 @@ async function handleChatGetResponse(fetchCtx, args, init) {
                 }
             }
         } catch (err) {
-            debugLog('Worker streaming /api/chats/get failed before commit, using fallback:', err);
+            debugLog('Worker streaming chat response failed before commit, using fallback:', err);
         }
     }
 
@@ -405,6 +551,39 @@ async function handleChatGetResponse(fetchCtx, args, init) {
         console.warn('[ST-Rust] Error intercepting chat payload (pass-through active):', err);
     }
     return response;
+}
+
+async function handleChatGetResponse(fetchCtx, args, init) {
+    const reqBody = tryParseJsonBody(init && init.body);
+    const avatarUrl = reqBody ? (reqBody.avatar_url || '') : '';
+    const chatKey = reqBody
+        ? `${reqBody.avatar_url || reqBody.ch_name || ''}::${reqBody.file_name || ''}`
+        : 'active_chat';
+
+    const hydrateCharPromise = avatarUrl
+        ? ensureActiveCharacterHydrated(avatarUrl).catch(() => false)
+        : Promise.resolve(false);
+
+    const [response] = await Promise.all([
+        originalFetch.apply(fetchCtx, args),
+        hydrateCharPromise,
+    ]);
+
+    return processLoadedChatResponse(response, chatKey, { allowPrune: isInterceptorEnabled });
+}
+
+async function handleGroupChatGetResponse(fetchCtx, args, init) {
+    const reqBody = tryParseJsonBody(init && init.body);
+    const chatId = reqBody && reqBody.id ? String(reqBody.id) : '';
+    const chatKey = chatId ? `group::${chatId}` : 'active_chat';
+
+    const hydrateGroupPromise = ensureGroupMembersHydrated(chatId || null).catch(() => false);
+    const [response] = await Promise.all([
+        originalFetch.apply(fetchCtx, args),
+        hydrateGroupPromise,
+    ]);
+
+    return processLoadedChatResponse(response, chatKey, { allowPrune: isInterceptorEnabled });
 }
 
 async function handleCharacterEditRequest(fetchCtx, resource, init) {
@@ -482,16 +661,31 @@ function initNetworkInterceptor() {
             return originalFetch.call(fetchCtx, resource, init);
         }
 
+        if (url.includes('/api/tokenizers/') && isInterceptorEnabled) {
+            return tokenCacheGuard.handleFetch(fetchCtx, resource, init, originalFetch);
+        }
+
+        // Always keep character subtrees hydrated across chat switches even after toggleInterceptor(false)
+        if (url.includes('/api/chats/group/get')) {
+            if (isInterceptorEnabled || rehydrationGuard.hasTrackedStrippedCharacters()) {
+                return handleGroupChatGetResponse(fetchCtx, arguments, init);
+            }
+            return originalFetch.apply(fetchCtx, arguments);
+        }
+
+        if (url.includes('/api/chats/get')) {
+            if (isInterceptorEnabled || rehydrationGuard.hasTrackedStrippedCharacters()) {
+                return handleChatGetResponse(fetchCtx, arguments, init);
+            }
+            return originalFetch.apply(fetchCtx, arguments);
+        }
+
         if (!isInterceptorEnabled) {
             return originalFetch.apply(fetchCtx, arguments);
         }
 
         if (url.includes('/api/characters/get') || url.includes('/api/characters/all')) {
             return handleCharacterReadResponse(fetchCtx, arguments, init);
-        }
-
-        if (url.includes('/api/chats/get')) {
-            return handleChatGetResponse(fetchCtx, arguments, init);
         }
 
         return originalFetch.apply(fetchCtx, arguments);
@@ -501,7 +695,10 @@ function initNetworkInterceptor() {
     wrappedFetchFn = wrappedFetch;
     window.fetch = wrappedFetch;
 
-    debugLog('Network Fetch Interceptor registered synchronously.');
+    tokenCacheGuard.setEnabled(isInterceptorEnabled);
+    tokenCacheGuard.installJQueryHook();
+
+    debugLog('Network Fetch & Tokenizer Interceptor registered synchronously.');
 }
 
 /**
@@ -777,47 +974,69 @@ function protectActiveChatTail() {
     }
 }
 
-function installEventSourceHooks() {
-    if (eventHooksInstalled) return;
+function installEventSourceHooks(explicitEv = null) {
     installPointerPrehydrate();
+    tokenCacheGuard.installJQueryHook();
     try {
-        const ctx = (typeof SillyTavern !== 'undefined' && SillyTavern.getContext)
-            ? SillyTavern.getContext()
-            : (typeof window !== 'undefined' ? window : null);
-        const ev = ctx && (ctx.eventSource || (typeof window !== 'undefined' && window.eventSource));
-        if (!ev || typeof ev.on !== 'function') return;
+        const ctx = getActiveStContext();
+        const ev = explicitEv || (ctx && (ctx.eventSource || (typeof window !== 'undefined' && window.eventSource)));
+        if (!ev || typeof ev.on !== 'function' || hookedEventSources.has(ev)) return;
 
-        eventHooksInstalled = true;
-        ev.on('chatLoaded', () => {
-            protectActiveChatTail();
-            const curCtx = typeof SillyTavern !== 'undefined' && SillyTavern.getContext ? SillyTavern.getContext() : null;
-            if (curCtx && curCtx.characterId !== undefined) {
-                const chars = getActiveCharactersArray();
-                const curChar = chars && chars[Number(curCtx.characterId)];
-                if (curChar) {
-                    const av = rehydrationGuard.getCharacterKey(curChar);
-                    if (av) ensureActiveCharacterHydrated(av).catch(() => {});
-                }
+        hookedEventSources.add(ev);
+
+        const subscribeFirst = (eventName, listener) => {
+            if (typeof ev.makeFirst === 'function') {
+                ev.makeFirst(eventName, listener);
+            } else {
+                ev.on(eventName, listener);
             }
-            if (scrollerInstance) scrollerInstance.update();
-            pruneCharactersInMemory();
-            updateTelemetryUI();
+        };
+
+        const wiLoadedEvent = (ctx && ctx.eventTypes && ctx.eventTypes.WORLDINFO_ENTRIES_LOADED) || 'worldinfo_entries_loaded';
+        const chatChangedEvent = (ctx && ctx.eventTypes && ctx.eventTypes.CHAT_CHANGED) || 'chat_id_changed';
+        const chatLoadedEvent = (ctx && ctx.eventTypes && ctx.eventTypes.CHAT_LOADED) || 'chatLoaded';
+        const charEditorEvent = (ctx && ctx.eventTypes && ctx.eventTypes.CHARACTER_EDITOR_OPENED) || 'character_editor_opened';
+
+        subscribeFirst(wiLoadedEvent, async (payload) => {
+            await ensureCurrentSelectionHydrated();
+            worldbookFastScanner.warmFromLoadedEvent(payload);
         });
-        ev.on('chat_id_changed', () => {
+
+        subscribeFirst(chatChangedEvent, async () => {
+            await ensureCurrentSelectionHydrated();
             if (scrollerInstance) scrollerInstance.reset();
             pruneCharactersInMemory();
             updateTelemetryUI();
         });
+
+        subscribeFirst(chatLoadedEvent, async () => {
+            protectActiveChatTail();
+            await ensureCurrentSelectionHydrated();
+            if (scrollerInstance) scrollerInstance.update();
+            pruneCharactersInMemory();
+            updateTelemetryUI();
+        });
+
+        subscribeFirst(charEditorEvent, async (chid) => {
+            const chars = getActiveCharactersArray();
+            const targetChar = Array.isArray(chars) ? chars[Number(chid)] : null;
+            const av = targetChar ? rehydrationGuard.getCharacterKey(targetChar) : '';
+            if (av) {
+                await ensureActiveCharacterHydrated(av).catch(() => false);
+            } else {
+                await ensureCurrentSelectionHydrated();
+            }
+            rehydrationGuard.syncCharacterFormDom(chid, chars);
+        });
+
         ev.on('character_page_loaded', () => {
             pruneCharactersInMemory();
             updateTelemetryUI();
         });
         ev.on('app_ready', () => {
+            tokenCacheGuard.installJQueryHook();
             pruneCharactersInMemory();
             updateTelemetryUI();
-        });
-        ev.on('character_editor_opened', (chid) => {
-            rehydrationGuard.syncCharacterFormDom(chid, getActiveCharactersArray());
         });
         ev.on('character_edited', (payload) => {
             const chars = getActiveCharactersArray();
@@ -848,14 +1067,17 @@ async function initExtension() {
     initExtensionPromise = (async () => {
         debugLog('Initializing ST-Rust-Accelerator Suite...');
 
-        // Ensure network hook is active synchronously prior to awaiting WASM init.
+        // Ensure network & jQuery tokenizer hooks are active synchronously prior to awaiting WASM init.
         initNetworkInterceptor();
+        tokenCacheGuard.installJQueryHook();
         loadTelemetryStorage();
 
         await Promise.all([
             initWasm(),
             vaultClient.isSupported() ? vaultClient.start() : Promise.resolve(false),
         ]);
+
+        installEventSourceHooks();
 
         if (typeof document !== 'undefined') {
             scrollerInstance = new VirtualScroller('#chat', {
@@ -881,7 +1103,6 @@ async function initExtension() {
             canvasThrottlerInstance.init();
 
             installSettingsDrawer();
-            installEventSourceHooks();
 
             pruneCharactersInMemory();
             updateTelemetryUI();
@@ -897,7 +1118,12 @@ async function initExtension() {
                 proxyGuard: ProxyVariableGuard,
                 rehydrationGuard,
                 vaultClient,
+                worldbookScanner: worldbookFastScanner,
+                tokenCache: tokenCacheGuard,
                 ensureActiveCharacterHydrated,
+                ensureGroupMembersHydrated,
+                ensureCurrentSelectionHydrated,
+                installEventSourceHooks,
                 buildMatcher: buildWorldbookMatcher,
                 scanWorldbook: scanWorldbookFast,
                 countTokens: countTokens,
@@ -912,6 +1138,7 @@ async function initExtension() {
                 },
                 toggleInterceptor: (val) => {
                     isInterceptorEnabled = val;
+                    tokenCacheGuard.setEnabled(val);
                     updateTelemetryUI();
                 },
                 toggleLazyMounter: (val) => {
@@ -943,6 +1170,8 @@ async function initExtension() {
                     totalInterceptedChats,
                     vaultStats: vaultClient.getStats(),
                     rehydrationStats: rehydrationGuard.getStats(),
+                    worldbookScannerStats: worldbookFastScanner.getStats(),
+                    tokenCacheStats: tokenCacheGuard.getStats(),
                     scrollerStats: scrollerInstance ? scrollerInstance.getStats() : null,
                     lazyMounterStats: lazyMounterInstance ? lazyMounterInstance.getStats() : null,
                     compositorStats: compositorGuardInstance ? compositorGuardInstance.getStats() : null,
@@ -978,14 +1207,22 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 export {
     initExtension,
     initNetworkInterceptor,
+    installEventSourceHooks,
     installSettingsDrawer,
     pruneCharactersInMemory,
     loadTelemetryStorage,
     saveTelemetryStorage,
+    ensureActiveCharacterHydrated,
+    ensureGroupMembersHydrated,
+    ensureCurrentSelectionHydrated,
     rehydrationGuard,
     RehydrationGuard,
     vaultClient,
     VaultClient,
+    worldbookFastScanner,
+    WorldbookFastScanner,
+    tokenCacheGuard,
+    TokenCacheGuard,
     VirtualScroller,
     IframeLazyMounter,
     ProxyVariableGuard,

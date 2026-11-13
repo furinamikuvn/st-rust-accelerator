@@ -944,6 +944,7 @@ class RehydrationGuard {
         const keyCandidates = [
             `${payload.avatar_url || ''}::${payload.file_name || ''}`,
             `${payload.ch_name || ''}::${payload.file_name || ''}`,
+            payload.id ? `group::${payload.id}` : '',
             this.latestChatKey,
         ].filter(Boolean);
 
