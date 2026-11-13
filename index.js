@@ -325,7 +325,7 @@ async function ensureActiveCharacterHydrated(avatar, options = {}) {
     if (!keepOthers) {
         if (myEpoch === activeHydrationEpoch) {
             rehydrationGuard.activeHydratedAvatar = key;
-        } else if (rehydrationGuard.activeHydratedAvatar !== key) {
+        } else if (rehydrationGuard.activeHydratedAvatar !== key && !getActiveProtectedAvatars().has(key)) {
             rehydrationGuard.reStripCharacterColdFields(target);
         }
     } else if (!rehydrationGuard.activeHydratedAvatar) {

@@ -424,7 +424,13 @@ export class TokenCacheGuard {
         }
 
         this.stats.requests++;
-        const desc = this.buildRequestDescriptor(rawUrl, method, init && init.body);
+        let reqBody = init && init.body !== undefined ? init.body : undefined;
+        if (reqBody === undefined && resource && typeof resource === 'object' && typeof resource.clone === 'function') {
+            try {
+                reqBody = await resource.clone().text();
+            } catch (_) {}
+        }
+        const desc = this.buildRequestDescriptor(rawUrl, method, reqBody);
 
         const cached = this._getCached(desc);
         if (cached) {

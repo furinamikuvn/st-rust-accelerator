@@ -638,7 +638,140 @@ async function runTests() {
         console.log('PASS [4]: Token Cache LRU, Singleflight coalescing, cross-transport jQuery/fetch, clone safety, async:false, error resilience.');
     }
 
-    console.log('\nALL P12 WORLDBOOK AHO-CORASICK & TOKEN CACHE TESTS PASSED! (4/4)');
+    // =========================================================================
+    // TEST 5: P12 Edge Hardening (Solo->Group Race Protection, Request Object Body, Warm Cache Invalidation)
+    // =========================================================================
+    {
+        // 5a. Request object without init.body in fetch must NOT collide on empty body
+        const reqGuard = new TokenCacheGuard({ maxEntries: 16 });
+        let reqCalls = 0;
+        const reqUpstream = async (resource, init) => {
+            reqCalls++;
+            const bodyTxt = init && init.body !== undefined
+                ? String(init.body)
+                : await resource.text();
+            return new Response(JSON.stringify({ count: bodyTxt.length }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+            });
+        };
+        const reqA = new Request('http://localhost/api/tokenizers/llama/count', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: 'alpha' }),
+        });
+        const reqB = new Request('http://localhost/api/tokenizers/llama/count', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: 'beta_longer_text' }),
+        });
+        const resA1 = await (await reqGuard.handleFetch(globalThis, reqA, undefined, reqUpstream)).json();
+        const resB1 = await (await reqGuard.handleFetch(globalThis, reqB, undefined, reqUpstream)).json();
+        assert.notEqual(resA1.count, resB1.count, 'Request object bodies must produce distinct token cache keys');
+        assert.equal(reqCalls, 2);
+        // Repeat identical Request object -> must hit cache cleanly
+        const reqA2 = new Request('http://localhost/api/tokenizers/llama/count', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: 'alpha' }),
+        });
+        const resA2 = await (await reqGuard.handleFetch(globalThis, reqA2, undefined, reqUpstream)).json();
+        assert.equal(resA2.count, resA1.count);
+        assert.equal(reqCalls, 2, 'Identical Request object must hit TokenCacheGuard cache');
+
+        // 5b. warmFromLoadedEvent invalidates cleanly when keyword inside same worldbook changes
+        const warmScanner = new WorldbookFastScanner();
+        const evPayload1 = {
+            globalLore: [{ uid: 1, world: 'SharedWorld', key: ['old_keyword'], content: 'A' }],
+            characterLore: [], chatLore: [], personaLore: [],
+        };
+        const comp1 = warmScanner.warmFromLoadedEvent(evPayload1);
+        assert.equal(warmScanner.scanText('old_keyword', comp1).length, 1);
+
+        const evPayload2 = {
+            globalLore: [{ uid: 1, world: 'SharedWorld', key: ['new_keyword'], content: 'A' }],
+            characterLore: [], chatLore: [], personaLore: [],
+        };
+        const comp2 = warmScanner.warmFromLoadedEvent(evPayload2);
+        assert.equal(warmScanner.scanText('new_keyword', comp2).length, 1, 'Edited keyword in same worldbook must recompile instead of hitting stale cache');
+        assert.equal(warmScanner.scanText('old_keyword', comp2).length, 0);
+
+        // 5c. Rapid Solo Card A -> Group Chat containing Card A must NOT allow stale Solo A promise to re-strip Card A!
+        const mod = await import('./index.js');
+        const bookA = { name: 'A Book', entries: { 0: { uid: 0, key: ['Aria'], content: 'Lore A' } } };
+        const bookB = { name: 'B Book', entries: { 0: { uid: 0, key: ['Hoàng Thiên'], content: 'Lore B' } } };
+        const charA = {
+            name: 'CardA',
+            avatar: 'card_a.png',
+            json_data: '',
+            __st_rust_stripped: true,
+            data: { name: 'CardA', character_book: '__ST_RUST_STRIPPED__', extensions: {} },
+        };
+        const charB = {
+            name: 'CardB',
+            avatar: 'card_b.png',
+            json_data: '',
+            __st_rust_stripped: true,
+            data: { name: 'CardB', character_book: '__ST_RUST_STRIPPED__', extensions: {} },
+        };
+        const grp = { id: 'grp_race', name: 'Grp', chat_id: 'grp_c', chats: ['grp_c'], members: ['card_a.png', 'card_b.png'] };
+        let curChid = 0;
+        let curGrpId = null;
+
+        const origVaultClient = mod.rehydrationGuard.vaultClient;
+        const origReStrip = mod.rehydrationGuard.reStripCharacterColdFields.bind(mod.rehydrationGuard);
+        const reStripTargets = [];
+        mod.rehydrationGuard.reStripCharacterColdFields = (c) => {
+            reStripTargets.push(c && c.avatar);
+            return origReStrip(c);
+        };
+        mod.rehydrationGuard.vaultClient = {
+            isReady: () => true,
+            hydrateCharacter: async (av) => {
+                if (av === 'card_a.png') {
+                    await new Promise(r => setTimeout(r, 40));
+                    return { fields: { 'data.character_book': bookA } };
+                }
+                if (av === 'card_b.png') {
+                    await new Promise(r => setTimeout(r, 5));
+                    return { fields: { 'data.character_book': bookB } };
+                }
+                return { fields: {} };
+            },
+        };
+
+        try {
+            globalThis.SillyTavern = {
+                getContext: () => ({
+                    characters: [charA, charB],
+                    groups: [grp],
+                    characterId: curChid,
+                    groupId: curGrpId,
+                    chatId: curGrpId ? 'grp_c' : 'solo_a',
+                    chat: [],
+                    getRequestHeaders: () => ({ 'Content-Type': 'application/json' }),
+                }),
+            };
+            mod.rehydrationGuard.registerKnownStrippedAvatars(['card_a.png', 'card_b.png'], true);
+
+            // Start slow Solo hydration for Card A (40ms), then immediately switch to Group Chat (containing Card A & Card B)
+            const pSoloA = mod.ensureActiveCharacterHydrated('card_a.png');
+            await new Promise(r => setTimeout(r, 2));
+            curGrpId = 'grp_race';
+            await mod.ensureActiveCharacterHydrated('card_b.png'); // Bumps activeHydrationEpoch & sets activeHydratedAvatar = card_b.png
+            await pSoloA;
+
+            assert.equal(reStripTargets.includes('card_a.png'), false, 'Protected group member card_a.png must NOT be passed to reStripCharacterColdFields');
+            assert.deepEqual(charA.data.character_book, bookA, 'Protected group member Card A must stay hydrated even if late solo A promise settles');
+        } finally {
+            mod.rehydrationGuard.vaultClient = origVaultClient;
+            mod.rehydrationGuard.reStripCharacterColdFields = origReStrip;
+        }
+
+        console.log('PASS [5]: P12 edge hardening (Request object cache key, warm cache fingerprint invalidation, Solo->Group race protection).');
+    }
+
+    console.log('\nALL P12 WORLDBOOK AHO-CORASICK & TOKEN CACHE TESTS PASSED! (5/5)');
 }
 
 runTests().catch((err) => {

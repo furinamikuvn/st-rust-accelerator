@@ -625,7 +625,30 @@ export class WorldbookFastScanner {
             ...(Array.isArray(eventPayload.characterLore) ? eventPayload.characterLore : []),
         ];
         if (all.length === 0) return null;
-        const cacheKey = `loaded:${all.length}:${all[0]?.world || ''}:${all[all.length - 1]?.uid ?? ''}`;
+
+        let fp = 0x811c9dc5 ^ all.length;
+        let totalKeyChars = 0;
+        let disabledCount = 0;
+        const mixStr = (s) => {
+            if (!s) return;
+            totalKeyChars += s.length;
+            for (let j = 0; j < s.length; j++) {
+                fp = Math.imul(fp ^ s.charCodeAt(j), 0x01000193);
+            }
+        };
+        for (let i = 0; i < all.length; i++) {
+            const e = all[i];
+            if (!e) continue;
+            const dis = (e.disable || e.enabled === false) ? 1 : 0;
+            if (dis) disabledCount++;
+            fp = Math.imul(fp ^ ((dis << 4) | (e.constant ? 8 : 0) | (e.selectiveLogic ?? 0)), 0x01000193);
+            const ks = Array.isArray(e.key) ? e.key : (Array.isArray(e.keys) ? e.keys : []);
+            const sks = Array.isArray(e.keysecondary) ? e.keysecondary : (Array.isArray(e.secondary_keys) ? e.secondary_keys : []);
+            for (let k = 0; k < ks.length; k++) mixStr(ks[k]);
+            for (let k = 0; k < sks.length; k++) mixStr(sks[k]);
+        }
+
+        const cacheKey = `loaded:${all.length}:${disabledCount}:${totalKeyChars}:${(fp >>> 0).toString(36)}:${all[0]?.world || ''}:${all[all.length - 1]?.uid ?? ''}`;
         return this.compile(all, { ...options, cacheKey });
     }
 
