@@ -647,20 +647,163 @@ async function runTests() {
     }
 
     // -------------------------------------------------------------------------
-    // TEST 5: index.js Top-Level Fetch Hook Integration (Worker Stream + Degraded Fallback)
+    // TEST 5: Hardening Guard (Plain-Text Markers, Chat Fail-Closed & Per-Avatar Strip Isolation)
     // -------------------------------------------------------------------------
     {
-        for (const mode of ['index-worker-ok', 'index-worker-degraded']) {
+        const opfsRoot = createMockOpfsRoot();
+        const runtime = createVaultWorkerRuntime({ opfsRootOverride: opfsRoot });
+        const client = new VaultClient({ workerFactory: () => createMockWorkerBridge(runtime) });
+        const guard = new RehydrationGuard({ vaultClient: client });
+        assert.strictEqual(await client.ensureReady(), true);
+
+        // 5A: Line 0 __st_rust_vault_ref + normal message literally mentioning marker substrings -> SHA-256 100% + no dropped bytes
+        const chatWithLiteralMarkerText = [
+            {
+                user_name: 'Sensei',
+                character_name: 'TawaGuard',
+                chat_metadata: {
+                    multiverse_hypervisor: { state: 'M'.repeat(8192), turn: 77 },
+                },
+            },
+            {
+                name: 'TawaGuard',
+                mes: 'Dialogue mentioning "__st_rust_stripped", "__ST_RUST_STRIPPED__", and "__st_rust_vault_ref" must never cause worker bytes to be dropped!',
+                is_user: false,
+            },
+        ];
+        const streamedChatResp = await client.streamResponse(
+            createReadableJsonResponse(JSON.stringify(chatWithLiteralMarkerText), {}, 193),
+            { mode: 'CHAT_LOAD', coldThresholdBytes: 4096, keepLastMessages: 1, expectedTotalMessages: 0, chatKey: 'Hardening::literal' },
+            () => guard.markStrippedChat('Hardening::literal')
+        );
+        const scrubbedArr = await streamedChatResp.json();
+        assert(scrubbedArr[0].chat_metadata.multiverse_hypervisor.__st_rust_vault_ref, 'Line 0 must be scrubbed to __st_rust_vault_ref');
+
+        const saveInit = {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ch_name: 'TawaGuard', file_name: 'literal', chat: scrubbedArr }),
+        };
+        const saveRes = await guard.guardChatSaveInit(saveInit);
+        assert.strictEqual(saveRes.modified, true, 'guardChatSaveInit MUST retain workerRes.bytes when literal marker text is in mes');
+        const savedPayload = JSON.parse(new TextDecoder().decode(saveInit.body));
+        assert.strictEqual(
+            sha256(JSON.stringify(savedPayload.chat)),
+            sha256(JSON.stringify(chatWithLiteralMarkerText)),
+            'Chat save with literal marker strings in mes must preserve 100% SHA-256 parity'
+        );
+
+        // Fail-Closed check: when referenced vault blob is completely missing (Worker + local), abort save & throw!
+        await client.evictChat('Hardening::literal');
+        const isolatedGuard = new RehydrationGuard({ vaultClient: client });
+        const brokenPayloadObj = {
+            ch_name: 'TawaGuard',
+            file_name: 'broken',
+            chat: [
+                {
+                    user_name: 'Sensei',
+                    chat_metadata: {
+                        multiverse_hypervisor: { __st_rust_vault_ref: 'deadbeef00001111' },
+                    },
+                },
+                { name: 'TawaGuard', mes: 'ok' },
+            ],
+        };
+        const brokenInit = {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(brokenPayloadObj),
+        };
+        await assert.rejects(
+            () => isolatedGuard.guardChatSaveInit(brokenInit),
+            /Fail-closed data-loss protection.*chats\/save/i,
+            'Unresolved __st_rust_vault_ref in chat payload must fail closed rather than overwriting .jsonl'
+        );
+        assert.strictEqual(isolatedGuard.getStats().failClosedChatSaveBlocks, 1, 'failClosedChatSaveBlocks counter must increment');
+
+        // Also ensure innocent chat WITHOUT actual vault objects (only marker words inside mes) passes through cleanly!
+        const benignInit = {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                ch_name: 'Benign',
+                file_name: 'benign',
+                chat: [
+                    { user_name: 'U', chat_metadata: { note: 'clean' } },
+                    { name: 'A', mes: 'Talking about __st_rust_stripped and __ST_RUST_STRIPPED__ and __st_rust_vault_ref' },
+                ],
+            }),
+        };
+        const benignRes = await isolatedGuard.guardChatSaveInit(benignInit);
+        assert.strictEqual(benignRes.modified, false, 'Benign chat mentioning markers only in mes text must pass without throwing');
+
+        // 5B: Small cards (< 512B) following a large card in /api/characters/all MUST NOT leak into strippedAvatars / knownStrippedAvatars
+        let observedStrippedAvatars = [];
+        const mixedCards = [
+            {
+                name: 'BigFirst',
+                data: {
+                    name: 'BigFirst',
+                    character_book: { entries: Array.from({ length: 20 }, (_, i) => ({ keys: [`k${i}`], content: 'X'.repeat(80) })) },
+                },
+                avatar: 'BigFirst.png',
+                json_data: JSON.stringify({ data: { name: 'BigFirst', bio: 'Y'.repeat(2000) } }),
+            },
+            {
+                name: 'TinyAfter',
+                data: { name: 'TinyAfter', character_book: { entries: [] } },
+                avatar: 'TinyAfter.png',
+                json_data: '{"spec":"chara_card_v2","data":{"name":"TinyAfter"}}',
+            },
+            {
+                name: 'BigSecond',
+                avatar: 'BigSecond.png',
+                data: { name: 'BigSecond' },
+                json_data: JSON.stringify({ data: { name: 'BigSecond', bio: 'Z'.repeat(2000) } }),
+            },
+            {
+                name: 'TinyLast',
+                avatar: 'TinyLast.png',
+                data: { name: 'TinyLast' },
+                json_data: '',
+            },
+        ];
+        const mixedResp = await client.streamResponse(
+            createReadableJsonResponse(JSON.stringify(mixedCards), {}, 137),
+            { mode: 'CHAR_LIST', scrubFlags: 1 | 2 | 256, coldThresholdBytes: 512 },
+            (stats) => {
+                observedStrippedAvatars = stats.strippedAvatars || [];
+                guard.registerKnownStrippedAvatars(observedStrippedAvatars, true);
+            }
+        );
+        const mixedOut = await mixedResp.json();
+        assert.strictEqual(mixedOut.length, 4);
+        assert(observedStrippedAvatars.includes('BigFirst.png'), 'BigFirst must be tracked in strippedAvatars');
+        assert(observedStrippedAvatars.includes('BigSecond.png'), 'BigSecond must be tracked in strippedAvatars');
+        assert.strictEqual(observedStrippedAvatars.includes('TinyAfter.png'), false, 'TinyAfter (<512B) after BigFirst MUST NOT leak into strippedAvatars');
+        assert.strictEqual(observedStrippedAvatars.includes('TinyLast.png'), false, 'TinyLast (<512B) after BigSecond MUST NOT leak into strippedAvatars');
+        assert.strictEqual(guard.knownStrippedAvatars.has('TinyAfter.png'), false, 'TinyAfter MUST NOT enter knownStrippedAvatars');
+        assert.strictEqual(guard.knownStrippedAvatars.has('TinyLast.png'), false, 'TinyLast MUST NOT enter knownStrippedAvatars');
+
+        await client.shutdown();
+        console.log('[PASS] Test 5: Hardening chat-save guard (literal markers + fail-closed) & per-avatar strip tracking');
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST 6: index.js Top-Level Fetch Hook Integration (Worker Stream, Toggle-Off Guard & Degraded Fallback)
+    // -------------------------------------------------------------------------
+    {
+        for (const mode of ['index-worker-ok', 'index-worker-degraded', 'index-toggle-off']) {
             execFileSync(process.execPath, ['--expose-gc', __filename], {
                 env: { ...process.env, P11_SUBTEST: mode },
                 stdio: 'inherit',
             });
         }
-        console.log('[PASS] Test 5: index.js fetch interceptor (Worker streaming + degraded fallback)');
+        console.log('[PASS] Test 6: index.js fetch interceptor (Worker streaming, mid-session toggle-off safety & degraded fallback)');
     }
 
     console.log('\n=============================================================');
-    console.log('KẾT QUẢ KIỂM THỬ PHASE P11: 5/5 BÀI TEST PASS 100%!');
+    console.log('KẾT QUẢ KIỂM THỬ PHASE P11: 6/6 BÀI TEST PASS 100%!');
     console.log('=============================================================');
 }
 
@@ -674,14 +817,16 @@ async function runIndexSubtest(subMode) {
 
     const heroBook = { name: 'HeroLore', entries: Array.from({ length: 40 }, (_, i) => ({ keys: [`k${i}`], content: 'Hero '.repeat(25) })) };
     const heroJson = JSON.stringify({ spec: 'chara_card_v2', data: { name: 'IdxHero', character_book: heroBook } });
+    const tinyJson = '{"spec":"chara_card_v2","data":{"name":"IdxTiny"}}';
     const charsDb = [
         { name: 'IdxHero', avatar: 'IdxHero.png', json_data: heroJson, data: { name: 'IdxHero', character_book: heroBook } },
+        { name: 'IdxTiny', avatar: 'IdxTiny.png', json_data: tinyJson, data: { name: 'IdxTiny' } },
     ];
     const origChat = [
         { user_name: 'U', chat_metadata: { multiverse_hypervisor: { state: 'M'.repeat(6000) } } },
         ...Array.from({ length: 18 }, (_, i) => ({
             name: 'IdxHero',
-            mes: `msg ${i + 1}`,
+            mes: i === 17 ? 'Literal __st_rust_stripped and __ST_RUST_STRIPPED__ and __st_rust_vault_ref in chat' : `msg ${i + 1}`,
             variables: { turn: i + 1, blob: 'V'.repeat(5000) },
         })),
     ];
@@ -696,6 +841,9 @@ async function runIndexSubtest(subMode) {
         }
         if (url === '/api/characters/edit') {
             savedEditJson = opts.body && typeof opts.body.get === 'function' ? String(opts.body.get('json_data') || '') : '';
+            return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+        }
+        if (url === '/api/characters/merge-attributes' || url === '/api/characters/delete') {
             return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
         }
         if (url === '/api/chats/get') {
@@ -746,7 +894,7 @@ async function runIndexSubtest(subMode) {
     };
     global.SillyTavern = { getContext: () => stContext };
 
-    if (subMode === 'index-worker-ok') {
+    if (subMode === 'index-worker-ok' || subMode === 'index-toggle-off') {
         const opfsRoot = createMockOpfsRoot();
         const runtime = createVaultWorkerRuntime({ opfsRootOverride: opfsRoot });
         global.Worker = class MockOkWorker {
@@ -764,7 +912,7 @@ async function runIndexSubtest(subMode) {
 
     const idxMod = await import('./index.js');
 
-    if (subMode === 'index-worker-ok') {
+    if (subMode === 'index-worker-ok' || subMode === 'index-toggle-off') {
         const ready = await idxMod.vaultClient.ensureReady();
         assert.strictEqual(ready, true, 'index.js VaultClient must initialize mock Worker');
 
@@ -773,6 +921,28 @@ async function runIndexSubtest(subMode) {
         assert.strictEqual(charsOut[0].json_data, '');
         assert.strictEqual(charsOut[0].data.character_book, STRIPPED_SENTINEL);
         assert.strictEqual(idxMod.rehydrationGuard.workerBackedAvatars.has('IdxHero.png'), true);
+        assert.strictEqual(idxMod.rehydrationGuard.knownStrippedAvatars.has('IdxTiny.png'), false, 'Tiny card after IdxHero must not enter knownStrippedAvatars');
+
+        const chatResp = await window.fetch('/api/chats/get', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ch_name: 'IdxHero', file_name: 'c1' }),
+        });
+        const chatOut = await chatResp.json();
+        assert(chatOut[0].chat_metadata.multiverse_hypervisor.__st_rust_vault_ref);
+        assert(chatOut[1].variables.__st_rust_vault_ref);
+        assert.strictEqual(chatOut[18].variables.__st_rust_vault_ref, undefined, 'Last tail msg must stay hydrated');
+
+        if (subMode === 'index-toggle-off') {
+            await idxMod.initExtension();
+            window.__ST_RUST_ACCELERATOR.toggleInterceptor(false);
+            assert.strictEqual(window.__ST_RUST_ACCELERATOR.getStats().isInterceptorEnabled, false);
+
+            // Read endpoints MUST skip stripping once interceptor is disabled
+            const unstrippedResp = await window.fetch('/api/characters/all');
+            const unstrippedChars = await unstrippedResp.json();
+            assert.strictEqual(sha256(unstrippedChars[0].json_data), sha256(heroJson), 'Disabled interceptor must skip stripping on /api/characters/all');
+        }
 
         const fd = new FormData();
         fd.set('avatar_url', 'IdxHero.png');
@@ -785,16 +955,6 @@ async function runIndexSubtest(subMode) {
         assert.strictEqual(serverGetCalls, 0, 'index.js edit must rehydrate from OPFS Worker with 0 server fetches');
         assert.strictEqual(sha256(savedEditJson), sha256(heroJson), 'index.js edit SHA-256 mismatch');
 
-        const chatResp = await window.fetch('/api/chats/get', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ch_name: 'IdxHero', file_name: 'c1' }),
-        });
-        const chatOut = await chatResp.json();
-        assert(chatOut[0].chat_metadata.multiverse_hypervisor.__st_rust_vault_ref);
-        assert(chatOut[1].variables.__st_rust_vault_ref);
-        assert.strictEqual(chatOut[18].variables.__st_rust_vault_ref, undefined, 'Last tail msg must stay hydrated');
-
         await window.fetch('/api/chats/save', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -802,6 +962,15 @@ async function runIndexSubtest(subMode) {
         });
         const savedChatObj = JSON.parse(savedChatBody);
         assert.strictEqual(sha256(JSON.stringify(savedChatObj.chat)), sha256(JSON.stringify(origChat)), 'index.js chat save SHA-256 mismatch');
+
+        if (subMode === 'index-toggle-off') {
+            await window.fetch('/api/characters/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ avatar_url: 'IdxHero.png' }),
+            });
+            assert.strictEqual(idxMod.rehydrationGuard.knownStrippedAvatars.has('IdxHero.png'), false, 'Disabled interceptor must still invalidate deleted stripped card');
+        }
 
         await idxMod.vaultClient.shutdown();
     } else {

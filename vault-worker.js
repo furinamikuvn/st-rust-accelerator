@@ -1224,7 +1224,7 @@ export function createVaultWorkerRuntime(overrides = {}) {
                                         }
                                         stream.pendingCharFields.delete(elemIdx);
                                     }
-                                    if (stream.touchedHashes.size > 0 || pending) {
+                                    if (pending || (manifest.chars[avatar] && Object.keys(manifest.chars[avatar]).length > 0)) {
                                         stream.strippedAvatars.add(avatar);
                                     }
                                 });

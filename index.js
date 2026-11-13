@@ -449,6 +449,39 @@ function initNetworkInterceptor() {
         const fetchCtx = (this && this !== wrappedFetch) ? this : (typeof window !== 'undefined' ? window : globalThis);
         const url = resolveFetchUrl(resource);
 
+        if (url.includes('/api/characters/edit')) {
+            if (isInterceptorEnabled || rehydrationGuard.hasTrackedStrippedCharacters()) {
+                return handleCharacterEditRequest(fetchCtx, resource, init);
+            }
+            return originalFetch.apply(fetchCtx, arguments);
+        }
+
+        if (url.includes('/api/characters/merge-attributes')) {
+            if (isInterceptorEnabled || rehydrationGuard.hasTrackedStrippedCharacters()) {
+                return handleCharacterMergeAttributes(fetchCtx, resource, init);
+            }
+            return originalFetch.apply(fetchCtx, arguments);
+        }
+
+        if (url.includes('/api/characters/delete') || url.includes('/api/characters/rename')) {
+            if (isInterceptorEnabled || rehydrationGuard.hasTrackedStrippedCharacters()) {
+                const reqObj = tryParseJsonBody(init && init.body);
+                const response = await originalFetch.apply(fetchCtx, arguments);
+                if (isResponseOk(response) && reqObj) {
+                    rehydrationGuard.invalidateCharacter(reqObj.avatar_url || reqObj.avatar);
+                }
+                return response;
+            }
+            return originalFetch.apply(fetchCtx, arguments);
+        }
+
+        if (url.includes('/api/chats/save') || url.includes('/api/chats/group/save')) {
+            if (isInterceptorEnabled || rehydrationGuard.hasTrackedStrippedChats()) {
+                await rehydrationGuard.guardChatSaveInit(init);
+            }
+            return originalFetch.call(fetchCtx, resource, init);
+        }
+
         if (!isInterceptorEnabled) {
             return originalFetch.apply(fetchCtx, arguments);
         }
@@ -457,30 +490,8 @@ function initNetworkInterceptor() {
             return handleCharacterReadResponse(fetchCtx, arguments, init);
         }
 
-        if (url.includes('/api/characters/edit')) {
-            return handleCharacterEditRequest(fetchCtx, resource, init);
-        }
-
-        if (url.includes('/api/characters/merge-attributes')) {
-            return handleCharacterMergeAttributes(fetchCtx, resource, init);
-        }
-
-        if (url.includes('/api/characters/delete') || url.includes('/api/characters/rename')) {
-            const reqObj = tryParseJsonBody(init && init.body);
-            const response = await originalFetch.apply(fetchCtx, arguments);
-            if (isResponseOk(response) && reqObj) {
-                rehydrationGuard.invalidateCharacter(reqObj.avatar_url || reqObj.avatar);
-            }
-            return response;
-        }
-
         if (url.includes('/api/chats/get')) {
             return handleChatGetResponse(fetchCtx, arguments, init);
-        }
-
-        if (url.includes('/api/chats/save') || url.includes('/api/chats/group/save')) {
-            await rehydrationGuard.guardChatSaveInit(init);
-            return originalFetch.call(fetchCtx, resource, init);
         }
 
         return originalFetch.apply(fetchCtx, arguments);

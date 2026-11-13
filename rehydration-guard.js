@@ -73,6 +73,38 @@ function sanitizeMergePayload(mergePayload) {
 }
 
 /**
+ * Checks whether an object or any nested key carries actual ST-Rust strip/vault markers
+ * (`__st_rust_stripped`, `__st_rust_vault_ref !== undefined`, or non-`mes` `STRIPPED_SENTINEL`).
+ * Ignores raw occurrences inside plain message text strings (such as `mes`).
+ *
+ * @param {any} value
+ * @returns {boolean}
+ */
+function hasVaultPlaceholders(value, seen = new WeakSet()) {
+    if (!value || typeof value !== 'object') return false;
+    if (seen.has(value)) return false;
+    seen.add(value);
+
+    if (value.__st_rust_stripped || value.__st_rust_vault_ref !== undefined) {
+        return true;
+    }
+    if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) {
+            if (hasVaultPlaceholders(value[i], seen)) return true;
+        }
+        return false;
+    }
+    for (const key of Object.keys(value)) {
+        const child = value[key];
+        if (key !== 'mes' && child === STRIPPED_SENTINEL) {
+            return true;
+        }
+        if (hasVaultPlaceholders(child, seen)) return true;
+    }
+    return false;
+}
+
+/**
  * Checks whether an object or any nested key carries ST-Rust strip/vault markers or CoW proxies.
  *
  * @param {any} value
@@ -94,7 +126,11 @@ function hasStrippedOrProxyState(value, seen = new WeakSet()) {
         return false;
     }
     for (const key of Object.keys(value)) {
-        if (hasStrippedOrProxyState(value[key], seen)) return true;
+        const child = value[key];
+        if (key !== 'mes' && child === STRIPPED_SENTINEL) {
+            return true;
+        }
+        if (hasStrippedOrProxyState(child, seen)) return true;
     }
     return false;
 }
@@ -153,6 +189,7 @@ class RehydrationGuard {
             workerVaultChatHydrations: 0,
             activeCardSubtreeRehydrations: 0,
             failClosedEditBlocks: 0,
+            failClosedChatSaveBlocks: 0,
             mergeAttributePatches: 0,
             invalidations: 0,
             chatsCaptured: 0,
@@ -863,6 +900,22 @@ class RehydrationGuard {
     }
 
     /**
+     * Checks whether any character cards have been stripped/cached and require write-back guarding.
+     *
+     * @returns {boolean}
+     */
+    hasTrackedStrippedCharacters() {
+        if (this.knownStrippedAvatars.size > 0 || this.workerBackedAvatars.size > 0 || this.characterCache.size > 0) {
+            return true;
+        }
+        if (this.vaultClient && typeof this.vaultClient.getStats === 'function') {
+            const st = this.vaultClient.getStats();
+            if (st && st.charEntries > 0) return true;
+        }
+        return false;
+    }
+
+    /**
      * Checks whether any active chat has CoW proxies or stripped vault data requiring save inspection.
      *
      * @returns {boolean}
@@ -907,9 +960,10 @@ class RehydrationGuard {
         // 1. Rehydrate Line 0 chatHeader if stripped or proxied.
         let header = payload.chat[0];
         if (hasStrippedOrProxyState(header)) {
+            const headerWasProxied = ProxyVariableGuard.isCoWProxy(header) || (header.chat_metadata && ProxyVariableGuard.isCoWProxy(header.chat_metadata));
             header = ProxyVariableGuard.unwrap(header);
             payload.chat[0] = header;
-            modified = true;
+            const headerHadPlaceholders = hasVaultPlaceholders(header);
 
             let vaultMeta = null;
             if (snapshotEntry && snapshotEntry.line0MetadataSnapshot) {
@@ -939,9 +993,14 @@ class RehydrationGuard {
                     }
                 }
                 header.chat_metadata = mergedMeta;
+                cleanInternalMarkers(header);
+                modified = true;
+            } else if (!headerHadPlaceholders) {
+                cleanInternalMarkers(header);
+                if (headerWasProxied) {
+                    modified = true;
+                }
             }
-
-            cleanInternalMarkers(header);
         }
 
         // 2. Unwrap CoW proxies and rehydrate stripped messages in payload.chat[1..N].
@@ -952,10 +1011,12 @@ class RehydrationGuard {
             const needsUnwrapOrRestore = hasStrippedOrProxyState(msg);
             if (!needsUnwrapOrRestore) continue;
 
+            const msgHadProxy = ProxyVariableGuard.isCoWProxy(msg) || ProxyVariableGuard.isCoWProxy(msg.variables);
             const plainMsg = ProxyVariableGuard.unwrap(msg);
             if (ProxyVariableGuard.isCoWProxy(msg.variables)) {
                 this.stats.proxiesUnwrapped++;
             }
+            const msgHadPlaceholders = hasVaultPlaceholders(plainMsg);
 
             if (plainMsg.__st_rust_stripped || plainMsg.__st_rust_vault_ref !== undefined) {
                 const backedMsg =
@@ -974,15 +1035,22 @@ class RehydrationGuard {
                         }
                     }
                     payload.chat[i] = restored;
+                    cleanInternalMarkers(payload.chat[i]);
+                    modified = true;
                 } else {
                     payload.chat[i] = plainMsg;
                 }
             } else {
                 payload.chat[i] = plainMsg;
+                if (!msgHadPlaceholders) {
+                    cleanInternalMarkers(payload.chat[i]);
+                    if (msgHadProxy) {
+                        modified = true;
+                    }
+                } else if (msgHadProxy) {
+                    modified = true;
+                }
             }
-
-            cleanInternalMarkers(payload.chat[i]);
-            modified = true;
         }
 
         if (modified) {
@@ -993,6 +1061,8 @@ class RehydrationGuard {
 
     /**
      * Guards `POST /api/chats/save` requests (both plain JSON string and gzip-compressed payloads).
+     * Enforces structural verification via `hasStrippedOrProxyState()` and fails closed if any
+     * stripped placeholder/vault ref remains unresolved after Worker + local recovery.
      *
      * @param {RequestInit} init
      * @returns {Promise<{ modified: boolean }>}
@@ -1027,31 +1097,16 @@ class RehydrationGuard {
             jsonText.includes(STRIPPED_SENTINEL) ||
             jsonText.includes('__st_rust_stripped');
 
+        let workerHydrated = false;
+        let workerBytes = null;
+
         if (hasVaultMarkers && this.vaultClient && this.vaultClient.isReady()) {
             try {
                 const workerRes = await this.vaultClient.hydrateChatForSave(jsonText, this.latestChatKey || '');
                 if (workerRes && workerRes.bytes && (workerRes.hydratedCount > 0 || !workerRes.missingRefs.length)) {
                     const outTextCheck = new TextDecoder().decode(workerRes.bytes);
-                    const stillHasMarkers =
-                        outTextCheck.includes('__st_rust_vault_ref') ||
-                        outTextCheck.includes(STRIPPED_SENTINEL) ||
-                        outTextCheck.includes('__st_rust_stripped');
-
-                    if (!stillHasMarkers) {
-                        if (workerRes.hydratedCount > 0) {
-                            this.stats.workerVaultChatHydrations++;
-                            this.stats.chatsRehydrated++;
-                        }
-                        if (wasGzipped && typeof CompressionStream !== 'undefined') {
-                            init.body = await this._compressGzipText(workerRes.bytes);
-                        } else {
-                            init.body = workerRes.bytes;
-                            this._removeHeader(init.headers, 'content-encoding');
-                            this._setHeader(init.headers, 'Content-Type', 'application/json');
-                        }
-                        debugLog(`Worker OPFS Vault hydrated /api/chats/save (${workerRes.bytes.byteLength} bytes, ${workerRes.hydratedCount} refs).`);
-                        return { modified: true };
-                    }
+                    workerHydrated = workerRes.hydratedCount > 0;
+                    workerBytes = workerRes.bytes;
                     jsonText = outTextCheck;
                 }
             } catch (err) {
@@ -1063,24 +1118,53 @@ class RehydrationGuard {
         try {
             payload = JSON.parse(jsonText);
         } catch (_) {
+            if (workerHydrated && workerBytes) {
+                this.stats.workerVaultChatHydrations++;
+                this.stats.chatsRehydrated++;
+                if (wasGzipped && typeof CompressionStream !== 'undefined') {
+                    init.body = await this._compressGzipText(workerBytes);
+                } else {
+                    init.body = workerBytes;
+                    this._removeHeader(init.headers, 'content-encoding');
+                    this._setHeader(init.headers, 'Content-Type', 'application/json');
+                }
+                return { modified: true };
+            }
             return { modified: false };
         }
 
-        const modified = this.rehydrateChatPayload(payload);
-        if (!modified) {
+        const localModified = this.rehydrateChatPayload(payload);
+
+        // Fail-Closed Chat Save Guard: abort rather than overwrite .jsonl with unresolved vault markers.
+        if (hasStrippedOrProxyState(payload.chat || payload)) {
+            this.stats.failClosedChatSaveBlocks++;
+            throw new Error(
+                `[ST-Rust] Fail-closed data-loss protection: aborted POST /api/chats/save (${payload.file_name || payload.ch_name || 'chat'}) because stripped vault placeholders remain unresolved.`
+            );
+        }
+
+        if (!localModified && !workerHydrated) {
             return { modified: false };
         }
 
-        const nextJsonText = JSON.stringify(payload);
+        if (workerHydrated) {
+            this.stats.workerVaultChatHydrations++;
+            if (!localModified) {
+                this.stats.chatsRehydrated++;
+            }
+        }
+
+        const nextBodyPayload = localModified ? JSON.stringify(payload) : (workerBytes || jsonText);
         if (wasGzipped && typeof CompressionStream !== 'undefined') {
-            init.body = await this._compressGzipText(nextJsonText);
+            init.body = await this._compressGzipText(nextBodyPayload);
         } else {
-            init.body = nextJsonText;
+            init.body = nextBodyPayload;
             this._removeHeader(init.headers, 'content-encoding');
             this._setHeader(init.headers, 'Content-Type', 'application/json');
         }
 
-        debugLog(`Rehydrated /api/chats/save payload (${nextJsonText.length} bytes).`);
+        const nextByteLen = typeof nextBodyPayload === 'string' ? nextBodyPayload.length : nextBodyPayload.byteLength;
+        debugLog(`Rehydrated /api/chats/save payload (${nextByteLen} bytes).`);
         return { modified: true };
     }
 
