@@ -18,7 +18,8 @@ import { IframeLazyMounter } from './iframe-lazy-mounter.js';
 import { ProxyVariableGuard } from './proxy-variable-guard.js';
 import { CssCompositorGuard } from './css-compositor-guard.js';
 import { CanvasThrottler } from './canvas-throttler.js';
-import { RehydrationGuard } from './rehydration-guard.js';
+import { IframeAssetHoister } from './iframe-asset-hoister.js';
+import { RehydrationGuard, extractVaultRefHex } from './rehydration-guard.js';
 import { VaultClient } from './vault-client.js';
 
 function debugLog(message, ...args) {
@@ -35,6 +36,7 @@ let pointerPrehydrateInstalled = false;
 
 let scrollerInstance = null;
 let lazyMounterInstance = null;
+let assetHoisterInstance = null;
 let compositorGuardInstance = null;
 let canvasThrottlerInstance = null;
 
@@ -50,6 +52,7 @@ const rehydrationGuard = new RehydrationGuard({
 let isInterceptorEnabled = true;
 let isScrollerEnabled = true;
 let isLazyMounterEnabled = true;
+let isAssetHoisterEnabled = true;
 let isCompositorGuardEnabled = true;
 let isCanvasThrottlerEnabled = true;
 
@@ -377,11 +380,9 @@ async function ensureCurrentSelectionHydrated() {
 }
 
 function getActiveChatArray() {
-    if (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) {
-        try {
-            const ctx = SillyTavern.getContext();
-            if (ctx && Array.isArray(ctx.chat)) return ctx.chat;
-        } catch (_) {}
+    const ctx = getActiveStContext();
+    if (ctx && Array.isArray(ctx.chat)) {
+        return ctx.chat;
     }
     if (typeof window !== 'undefined' && Array.isArray(window.chat)) {
         return window.chat;
@@ -974,8 +975,75 @@ function protectActiveChatTail() {
     }
 }
 
+async function warmActiveChatColdReads() {
+    const activeChat = getActiveChatArray();
+    const ctx = getActiveStContext();
+    const targetChat = Array.isArray(activeChat) && activeChat.length > 0
+        ? activeChat
+        : (ctx && ctx.chatMetadata ? [{ chat_metadata: ctx.chatMetadata }] : null);
+
+    if (!targetChat) return { warmed: false, bytes: 0 };
+
+    const res = await rehydrationGuard.hydrateWarmChatVariables(
+        targetChat,
+        rehydrationGuard.latestChatKey || ''
+    );
+    if (res.warmed && ctx && ctx.chatMetadata && targetChat[0] && targetChat[0].chat_metadata) {
+        if (ctx.chatMetadata !== targetChat[0].chat_metadata) {
+            ctx.chatMetadata.variables = targetChat[0].chat_metadata.variables;
+        }
+    }
+    return res;
+}
+
+function installExtensionReadHooks() {
+    if (typeof window === 'undefined' || !window.TavernHelper) return;
+    const th = window.TavernHelper;
+    const bindHost = th._bind && typeof th._bind.getVariables === 'function' ? th._bind : null;
+    const targets = [
+        typeof th.getVariables === 'function' ? { obj: th, key: 'getVariables' } : null,
+        bindHost ? { obj: bindHost, key: 'getVariables' } : null,
+    ].filter(Boolean);
+
+    for (const target of targets) {
+        const orig = target.obj[target.key];
+        if (!orig || orig.__stRustReadGuarded) continue;
+
+        const wrapped = function stRustGuardedGetVariables(option = {}) {
+            const res = orig.apply(this, arguments);
+            const refHex = extractVaultRefHex(res);
+            if (!refHex) return res;
+
+            rehydrationGuard.stats.coldReadVaultRefsDetected++;
+            const activeChat = getActiveChatArray();
+            const ctx = getActiveStContext();
+            const chatKey = rehydrationGuard.latestChatKey || '';
+            const type = option && option.type;
+
+            if (type === 'message' && Array.isArray(activeChat)) {
+                const msgId = Number(option.message_id);
+                if (Number.isInteger(msgId) && msgId >= 0) {
+                    rehydrationGuard.hydrateColdMessage(activeChat, msgId, chatKey).catch(() => {});
+                }
+            } else if (type === 'chat' && ctx && ctx.chatMetadata) {
+                rehydrationGuard.hydrateColdField(ctx.chatMetadata, 'variables', chatKey).catch(() => {});
+            }
+
+            const cached = rehydrationGuard.warmReadCache.get(`${chatKey}::${refHex}`);
+            if (cached && cached.value && typeof cached.value === 'object') {
+                rehydrationGuard.stats.warmReadCacheHits++;
+                return cached.value;
+            }
+            return {};
+        };
+        wrapped.__stRustReadGuarded = true;
+        target.obj[target.key] = wrapped;
+    }
+}
+
 function installEventSourceHooks(explicitEv = null) {
     installPointerPrehydrate();
+    installExtensionReadHooks();
     tokenCacheGuard.installJQueryHook();
     try {
         const ctx = getActiveStContext();
@@ -1003,15 +1071,23 @@ function installEventSourceHooks(explicitEv = null) {
         });
 
         subscribeFirst(chatChangedEvent, async () => {
-            await ensureCurrentSelectionHydrated();
+            installExtensionReadHooks();
+            await Promise.all([
+                ensureCurrentSelectionHydrated(),
+                warmActiveChatColdReads().catch(() => false),
+            ]);
             if (scrollerInstance) scrollerInstance.reset();
             pruneCharactersInMemory();
             updateTelemetryUI();
         });
 
         subscribeFirst(chatLoadedEvent, async () => {
+            installExtensionReadHooks();
             protectActiveChatTail();
-            await ensureCurrentSelectionHydrated();
+            await Promise.all([
+                ensureCurrentSelectionHydrated(),
+                warmActiveChatColdReads().catch(() => false),
+            ]);
             if (scrollerInstance) scrollerInstance.update();
             pruneCharactersInMemory();
             updateTelemetryUI();
@@ -1089,6 +1165,13 @@ async function initExtension() {
             lazyMounterInstance = new IframeLazyMounter();
             lazyMounterInstance.init();
 
+            assetHoisterInstance = new IframeAssetHoister({
+                chatSelector: '#chat',
+                minStyleBytes: 256,
+                minDataUriBytes: 1024,
+            });
+            assetHoisterInstance.init();
+
             compositorGuardInstance = new CssCompositorGuard({
                 chatSelector: '#chat',
                 maxBlurPx: 8
@@ -1113,6 +1196,7 @@ async function initExtension() {
                 isReady: isWasmReady,
                 scroller: scrollerInstance,
                 lazyMounter: lazyMounterInstance,
+                assetHoister: assetHoisterInstance,
                 compositorGuard: compositorGuardInstance,
                 canvasThrottler: canvasThrottlerInstance,
                 proxyGuard: ProxyVariableGuard,
@@ -1123,6 +1207,8 @@ async function initExtension() {
                 ensureActiveCharacterHydrated,
                 ensureGroupMembersHydrated,
                 ensureCurrentSelectionHydrated,
+                warmActiveChatColdReads,
+                installExtensionReadHooks,
                 installEventSourceHooks,
                 buildMatcher: buildWorldbookMatcher,
                 scanWorldbook: scanWorldbookFast,
@@ -1146,6 +1232,11 @@ async function initExtension() {
                     if (lazyMounterInstance) lazyMounterInstance.setEnabled(val);
                     updateTelemetryUI();
                 },
+                toggleAssetHoister: (val) => {
+                    isAssetHoisterEnabled = val;
+                    if (assetHoisterInstance) assetHoisterInstance.setEnabled(val);
+                    updateTelemetryUI();
+                },
                 toggleCompositor: (val) => {
                     isCompositorGuardEnabled = val;
                     if (compositorGuardInstance) compositorGuardInstance.setEnabled(val);
@@ -1162,6 +1253,7 @@ async function initExtension() {
                     isScrollerEnabled,
                     isInterceptorEnabled,
                     isLazyMounterEnabled,
+                    isAssetHoisterEnabled,
                     isCompositorGuardEnabled,
                     isCanvasThrottlerEnabled,
                     totalStrippedBytes,
@@ -1174,6 +1266,7 @@ async function initExtension() {
                     tokenCacheStats: tokenCacheGuard.getStats(),
                     scrollerStats: scrollerInstance ? scrollerInstance.getStats() : null,
                     lazyMounterStats: lazyMounterInstance ? lazyMounterInstance.getStats() : null,
+                    assetHoisterStats: assetHoisterInstance ? assetHoisterInstance.getStats() : null,
                     compositorStats: compositorGuardInstance ? compositorGuardInstance.getStats() : null,
                     canvasStats: canvasThrottlerInstance ? canvasThrottlerInstance.getStats() : null,
                 })
@@ -1225,9 +1318,12 @@ export {
     TokenCacheGuard,
     VirtualScroller,
     IframeLazyMounter,
+    IframeAssetHoister,
     ProxyVariableGuard,
     CssCompositorGuard,
     CanvasThrottler,
+    warmActiveChatColdReads,
+    installExtensionReadHooks,
     getOriginalFetch,
     getStrippedStats
 };

@@ -150,11 +150,19 @@ function cleanInternalMarkers(obj) {
     }
 }
 
+function extractVaultRefHex(value) {
+    if (value && typeof value === 'object' && typeof value.__st_rust_vault_ref === 'string') {
+        return value.__st_rust_vault_ref;
+    }
+    return null;
+}
+
 class RehydrationGuard {
     /**
      * @param {Object} [options={}]
      * @param {number} [options.maxCacheBytes=67108864] - LRU cap for in-memory character json_data safety cache
      * @param {number} [options.maxChatSnapshots=5] - Bounded LRU count for chat Line 0 / stripped backups
+     * @param {number} [options.maxWarmReadBytes=8388608] - Bounded LRU cap for warm cold-chat read cache
      * @param {Function} [options.getOriginalFetch] - Returns un-intercepted native fetch function
      * @param {Function} [options.getLine0FromVault] - Optional WASM vault Line 0 getter
      * @param {Function} [options.getMessageFromVault] - Optional WASM vault message getter
@@ -162,6 +170,7 @@ class RehydrationGuard {
     constructor(options = {}) {
         this.maxCacheBytes = options.maxCacheBytes ?? DEFAULT_MAX_CACHE_BYTES;
         this.maxChatSnapshots = options.maxChatSnapshots ?? DEFAULT_MAX_CHATS;
+        this.maxWarmReadBytes = options.maxWarmReadBytes ?? 8 * 1024 * 1024;
         this.getOriginalFetch = options.getOriginalFetch || (() => (typeof window !== 'undefined' ? window.fetch : null));
         this.getRequestHeaders = options.getRequestHeaders || null;
         this.getLine0FromVault = options.getLine0FromVault || (() => null);
@@ -178,6 +187,8 @@ class RehydrationGuard {
 
         this.chatCache = new Map();
         this.latestChatKey = null;
+        this.warmReadCache = new Map();
+        this.warmReadCacheBytes = 0;
 
         this.stats = {
             charactersCaptured: 0,
@@ -195,6 +206,10 @@ class RehydrationGuard {
             chatsCaptured: 0,
             chatsRehydrated: 0,
             proxiesUnwrapped: 0,
+            coldReadVaultRefsDetected: 0,
+            warmReadHydrations: 0,
+            warmReadCacheHits: 0,
+            warmChatVariablesHydrated: 0,
         };
     }
 
@@ -1244,6 +1259,165 @@ class RehydrationGuard {
         return await this._readAllStreamBytes(stream);
     }
 
+    /**
+     * Fetches and decodes a single cold vault reference (`__st_rust_vault_ref`) from Worker Cold Vault,
+     * with bounded LRU caching (`maxWarmReadBytes`) so large 40MB+ objects do not pin V8 Heap permanently.
+     *
+     * @param {string} refHex
+     * @param {string} [chatKey]
+     * @param {Object} [opts={}]
+     * @param {number} [opts.maxBytes] - Optional byte cap; payloads larger than this are still returned if cacheAllowed=false or fail with `oversized` flag when capped
+     * @returns {Promise<{ found: boolean, value: any, bytes: number, oversized?: boolean }>}
+     */
+    async hydrateVaultRef(refHex, chatKey = this.latestChatKey || '', opts = {}) {
+        if (!refHex || typeof refHex !== 'string') {
+            return { found: false, value: null, bytes: 0 };
+        }
+
+        const cacheKey = `${chatKey}::${refHex}`;
+        const cached = this.warmReadCache.get(cacheKey);
+        if (cached) {
+            this.stats.warmReadCacheHits++;
+            this.warmReadCache.delete(cacheKey);
+            this.warmReadCache.set(cacheKey, cached);
+            if (opts.maxBytes && cached.bytes > opts.maxBytes) {
+                return { found: false, value: null, bytes: cached.bytes, oversized: true };
+            }
+            return { found: true, value: cached.value, bytes: cached.bytes };
+        }
+
+        if (!this.vaultClient || !this.vaultClient.isReady()) {
+            return { found: false, value: null, bytes: 0 };
+        }
+
+        const entries = await this.vaultClient.hydrateMessages(chatKey, [refHex]);
+        if (!Array.isArray(entries) || entries.length === 0 || !entries[0] || !entries[0].data) {
+            return { found: false, value: null, bytes: 0 };
+        }
+
+        const rawBytes = entries[0].data;
+        const byteLen = rawBytes.byteLength || rawBytes.length || 0;
+        if (opts.maxBytes && byteLen > opts.maxBytes) {
+            return { found: false, value: null, bytes: byteLen, oversized: true };
+        }
+
+        let parsed;
+        try {
+            const text = new TextDecoder('utf-8', { fatal: false }).decode(rawBytes);
+            parsed = JSON.parse(text);
+        } catch (err) {
+            debugLog(`Failed parsing cold vault ref ${refHex}:`, err);
+            return { found: false, value: null, bytes: byteLen };
+        }
+
+        this.stats.warmReadHydrations++;
+
+        if (byteLen <= this.maxWarmReadBytes) {
+            this.warmReadCache.set(cacheKey, { value: parsed, bytes: byteLen });
+            this.warmReadCacheBytes += byteLen;
+            while (this.warmReadCacheBytes > this.maxWarmReadBytes && this.warmReadCache.size > 0) {
+                const oldestKey = this.warmReadCache.keys().next().value;
+                const oldEntry = this.warmReadCache.get(oldestKey);
+                this.warmReadCache.delete(oldestKey);
+                if (oldEntry) {
+                    this.warmReadCacheBytes = Math.max(0, this.warmReadCacheBytes - oldEntry.bytes);
+                }
+            }
+        }
+
+        return { found: true, value: parsed, bytes: byteLen };
+    }
+
+    /**
+     * Hydrates a stripped/cold field on an object (e.g., `chatMetadata.multiverse_hypervisor`
+     * or `chatMetadata.variables`) in-place from Worker Cold Vault.
+     *
+     * @param {Object} container
+     * @param {string} key
+     * @param {string} [chatKey]
+     * @param {Object} [opts={}]
+     * @returns {Promise<{ hydrated: boolean, refHex: string|null, bytes: number, oversized?: boolean }>}
+     */
+    async hydrateColdField(container, key, chatKey = this.latestChatKey || '', opts = {}) {
+        if (!container || typeof container !== 'object' || !key) {
+            return { hydrated: false, refHex: null, bytes: 0 };
+        }
+        const refHex = extractVaultRefHex(container[key]);
+        if (!refHex) {
+            return { hydrated: false, refHex: null, bytes: 0 };
+        }
+        this.stats.coldReadVaultRefsDetected++;
+        const res = await this.hydrateVaultRef(refHex, chatKey, opts);
+        if (res.found) {
+            container[key] = res.value;
+            return { hydrated: true, refHex, bytes: res.bytes };
+        }
+        return { hydrated: false, refHex, bytes: res.bytes, oversized: res.oversized };
+    }
+
+    /**
+     * Hydrates cold fields (`variables`, `swipes`, `extra.*`) on a single message `chatArray[index]`.
+     *
+     * @param {Array} chatArray
+     * @param {number} index
+     * @param {string} [chatKey]
+     * @returns {Promise<{ hydrated: boolean, fields: string[] }>}
+     */
+    async hydrateColdMessage(chatArray, index, chatKey = this.latestChatKey || '') {
+        if (!Array.isArray(chatArray) || !chatArray[index] || typeof chatArray[index] !== 'object') {
+            return { hydrated: false, fields: [] };
+        }
+        const msg = chatArray[index];
+        const hydratedFields = [];
+
+        for (const field of ['variables', 'swipes']) {
+            const res = await this.hydrateColdField(msg, field, chatKey);
+            if (res.hydrated) hydratedFields.push(field);
+        }
+
+        if (msg.extra && typeof msg.extra === 'object') {
+            for (const extraKey of ['world_backstage', 'world_backstage_v1', 'reasoning']) {
+                const res = await this.hydrateColdField(msg.extra, extraKey, chatKey);
+                if (res.hydrated) hydratedFields.push(`extra.${extraKey}`);
+            }
+        }
+
+        return { hydrated: hydratedFields.length > 0, fields: hydratedFields };
+    }
+
+    /**
+     * Selectively pre-warms lightweight `chat_metadata.variables` (`<= maxWarmVariableBytes`, default 2 MiB)
+     * so synchronous HUD readers such as `JS-Slash-Runner` `getVariables({ type: 'chat' })`
+     * work seamlessly while multi-megabyte blobs (e.g. `44 MB` `multiverse_hypervisor`) remain cold in OPFS/IDB.
+     *
+     * @param {Array} chatArray
+     * @param {string} [chatKey]
+     * @param {Object} [options={}]
+     * @returns {Promise<{ warmed: boolean, bytes: number, skippedReason?: string }>}
+     */
+    async hydrateWarmChatVariables(chatArray, chatKey = this.latestChatKey || '', options = {}) {
+        const header = Array.isArray(chatArray) && chatArray[0] ? chatArray[0] : null;
+        const meta = header && header.chat_metadata && typeof header.chat_metadata === 'object'
+            ? header.chat_metadata
+            : null;
+        if (!meta) return { warmed: false, bytes: 0, skippedReason: 'no_chat_metadata' };
+
+        const refHex = extractVaultRefHex(meta.variables);
+        if (!refHex) return { warmed: false, bytes: 0, skippedReason: 'not_cold_ref' };
+
+        const maxWarmVariableBytes = options.maxWarmVariableBytes ?? 2 * 1024 * 1024;
+        const res = await this.hydrateColdField(meta, 'variables', chatKey, { maxBytes: maxWarmVariableBytes });
+        if (res.hydrated) {
+            this.stats.warmChatVariablesHydrated++;
+            return { warmed: true, bytes: res.bytes };
+        }
+        return {
+            warmed: false,
+            bytes: res.bytes,
+            skippedReason: res.oversized ? 'exceeds_warm_cap' : 'not_found_in_vault',
+        };
+    }
+
     getStats() {
         return {
             ...this.stats,
@@ -1251,8 +1425,9 @@ class RehydrationGuard {
             hotCacheBytes: this.currentCacheBytes,
             knownStrippedCount: this.knownStrippedAvatars.size,
             trackedChats: this.chatCache.size,
+            warmReadCacheBytes: this.warmReadCacheBytes,
         };
     }
 }
 
-export { RehydrationGuard, STRIPPED_SENTINEL };
+export { RehydrationGuard, STRIPPED_SENTINEL, extractVaultRefHex };
