@@ -189,17 +189,67 @@ class ProxyVariableGuard {
     }
 
     /**
-     * Protects a message object by wrapping its variables dictionary in a CoW proxy.
+     * Protects a message object by wrapping its `variables` and `swipes` containers in CoW proxies.
      *
      * @param {Object} msg - The chat message object
-     * @returns {Object} Message with protected variables
+     * @returns {Object} Message with CoW-protected state containers
      */
     static protectMessage(msg) {
         if (!msg || typeof msg !== 'object') return msg;
-        if (msg.variables && typeof msg.variables === 'object') {
+        if (msg.variables && typeof msg.variables === 'object' && msg.variables.__st_rust_vault_ref === undefined) {
             msg.variables = ProxyVariableGuard.createCoWProxy(msg.variables);
         }
+        if (msg.swipes && typeof msg.swipes === 'object' && msg.swipes.__st_rust_vault_ref === undefined) {
+            msg.swipes = ProxyVariableGuard.createCoWProxy(msg.swipes);
+        }
         return msg;
+    }
+
+    /**
+     * Deduplicates identical hot-tail `variables` / `swipes` objects via content hash in RAM,
+     * wrapping each message in an isolated CoW Proxy so writes remain strictly per-message.
+     *
+     * @param {Array<Object>} messages
+     * @param {Function} hashFn - `(str: string) => string` (e.g. WASM xxHash64 hex)
+     * @returns {{ dedupHits: number, savedBytes: number }}
+     */
+    static deduplicateAndProtectMessages(messages, hashFn) {
+        const result = { dedupHits: 0, savedBytes: 0 };
+        if (!Array.isArray(messages) || typeof hashFn !== 'function') return result;
+
+        const basePool = new Map();
+        const tryDedupField = (msg, field) => {
+            const val = msg && msg[field];
+            if (!val || typeof val !== 'object' || val.__st_rust_vault_ref !== undefined) return;
+            const plain = ProxyVariableGuard.isCoWProxy(val) ? ProxyVariableGuard.unwrap(val) : val;
+            let json;
+            try {
+                json = JSON.stringify(plain);
+            } catch (_) {
+                return;
+            }
+            if (!json || json.length < 64) return;
+            const key = `${field}:${hashFn(json)}`;
+            const existing = basePool.get(key);
+            if (existing && existing.json === json) {
+                msg[field] = ProxyVariableGuard.createCoWProxy(existing.plain);
+                result.dedupHits++;
+                result.savedBytes += json.length;
+            } else {
+                if (!existing) {
+                    basePool.set(key, { plain, json });
+                }
+                msg[field] = ProxyVariableGuard.createCoWProxy(plain);
+            }
+        };
+
+        for (let i = 0; i < messages.length; i++) {
+            const msg = messages[i];
+            if (!msg || typeof msg !== 'object') continue;
+            tryDedupField(msg, 'variables');
+            tryDedupField(msg, 'swipes');
+        }
+        return result;
     }
 
     /**

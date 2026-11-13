@@ -130,9 +130,14 @@ class RehydrationGuard {
         this.getRequestHeaders = options.getRequestHeaders || null;
         this.getLine0FromVault = options.getLine0FromVault || (() => null);
         this.getMessageFromVault = options.getMessageFromVault || (() => null);
+        this.vaultClient = options.vaultClient || null;
 
         this.characterCache = new Map();
         this.knownStrippedAvatars = new Set();
+        this.workerBackedAvatars = new Set();
+        this.hydratedColdPathsByAvatar = new Map();
+        this.knownStrippedChats = new Set();
+        this.activeHydratedAvatar = null;
         this.currentCacheBytes = 0;
 
         this.chatCache = new Map();
@@ -144,6 +149,9 @@ class RehydrationGuard {
             charactersRehydrated: 0,
             characterFormSyncs: 0,
             cacheMissRecoveries: 0,
+            workerVaultCharHits: 0,
+            workerVaultChatHydrations: 0,
+            activeCardSubtreeRehydrations: 0,
             failClosedEditBlocks: 0,
             mergeAttributePatches: 0,
             invalidations: 0,
@@ -151,6 +159,28 @@ class RehydrationGuard {
             chatsRehydrated: 0,
             proxiesUnwrapped: 0,
         };
+    }
+
+    setVaultClient(client) {
+        this.vaultClient = client || null;
+    }
+
+    registerKnownStrippedAvatars(avatars = [], fromWorker = true) {
+        if (!Array.isArray(avatars)) return;
+        for (let i = 0; i < avatars.length; i++) {
+            const key = String(avatars[i] || '').trim();
+            if (!key) continue;
+            this.knownStrippedAvatars.add(key);
+            if (fromWorker) {
+                this.workerBackedAvatars.add(key);
+            }
+        }
+    }
+
+    markStrippedChat(chatKey) {
+        const key = String(chatKey || 'active_chat');
+        this.knownStrippedChats.add(key);
+        this.latestChatKey = key;
     }
 
     /**
@@ -200,8 +230,8 @@ class RehydrationGuard {
         this.knownStrippedAvatars.add(key);
 
         if (raw.length > this.maxCacheBytes) {
-            // Too large for local LRU; drop previous copy if present and rely on disk /api/characters/get fallback.
-            this.invalidateCharacter(key, { keepKnownFlag: true });
+            // Too large for local LRU; drop previous RAM copy only and rely on Worker Vault / disk /api/characters/get fallback.
+            this.invalidateCharacter(key, { keepKnownFlag: true, keepWorker: true });
             this.stats.charactersCaptured++;
             this.stats.charactersEvictedToServerFallback++;
             return true;
@@ -259,6 +289,13 @@ class RehydrationGuard {
         if (!options.keepKnownFlag) {
             this.knownStrippedAvatars.delete(key);
         }
+        if (!options.keepWorker) {
+            this.workerBackedAvatars.delete(key);
+            this.hydratedColdPathsByAvatar.delete(key);
+            if (this.vaultClient && typeof this.vaultClient.invalidateCharacters === 'function') {
+                this.vaultClient.invalidateCharacters({ avatar: key }).catch(() => {});
+            }
+        }
         this.stats.invalidations++;
     }
 
@@ -274,6 +311,12 @@ class RehydrationGuard {
         this.currentCacheBytes = 0;
         if (options.keepKnownFlag === false) {
             this.knownStrippedAvatars.clear();
+        }
+        if (!options.keepWorker) {
+            this.workerBackedAvatars.clear();
+            if (this.vaultClient && typeof this.vaultClient.invalidateCharacters === 'function') {
+                this.vaultClient.invalidateCharacters({ clearAll: true }).catch(() => {});
+            }
         }
         this.stats.invalidations += clearedCount || 1;
     }
@@ -421,6 +464,19 @@ class RehydrationGuard {
         const cached = this.getCachedCharacterJson(key);
         if (cached) return cached;
 
+        if (this.vaultClient && typeof this.vaultClient.hydrateCharacter === 'function') {
+            try {
+                const res = await this.vaultClient.hydrateCharacter(key, ['json_data']);
+                if (res && res.found && typeof res.jsonData === 'string' && res.jsonData.length > 0) {
+                    this.stats.workerVaultCharHits++;
+                    this.captureCharacter({ avatar: key, json_data: res.jsonData });
+                    return res.jsonData;
+                }
+            } catch (err) {
+                debugLog(`Worker OPFS vault char lookup failed for "${key}":`, err);
+            }
+        }
+
         const upstreamFetch = fetchFn || this.getOriginalFetch();
         if (typeof upstreamFetch !== 'function') return null;
 
@@ -447,6 +503,152 @@ class RehydrationGuard {
             debugLog(`Cache-miss server recovery failed for "${key}":`, err);
         }
         return null;
+    }
+
+    /**
+     * Rehydrates cold character subtrees (`character_book`, `tavern_helper`, `regex_scripts`)
+     * on the active card prior to character editor opening or script execution.
+     */
+    async hydrateCharacterColdFields(charObj, fetchFn = null, extraHeaders = null) {
+        if (!charObj || typeof charObj !== 'object') return false;
+        const avatar = this.getCharacterKey(charObj);
+        if (!avatar) return false;
+
+        const dataObj = charObj.data && typeof charObj.data === 'object' ? charObj.data : null;
+        if (!dataObj) return false;
+
+        const needed = [];
+        if (dataObj.character_book === STRIPPED_SENTINEL) needed.push('data.character_book');
+        if (dataObj.extensions && dataObj.extensions.tavern_helper === STRIPPED_SENTINEL) {
+            needed.push('data.extensions.tavern_helper');
+        }
+        if (dataObj.extensions && dataObj.extensions.regex_scripts === STRIPPED_SENTINEL) {
+            needed.push('data.extensions.regex_scripts');
+        }
+        if (needed.length === 0) return false;
+
+        let hydratedAny = false;
+        let trackedSet = this.hydratedColdPathsByAvatar.get(avatar);
+        const markHydratedPath = (fieldPath) => {
+            hydratedAny = true;
+            if (!trackedSet) {
+                trackedSet = new Set();
+                this.hydratedColdPathsByAvatar.set(avatar, trackedSet);
+            }
+            trackedSet.add(fieldPath);
+        };
+
+        if (this.vaultClient && typeof this.vaultClient.hydrateCharacter === 'function') {
+            try {
+                const res = await this.vaultClient.hydrateCharacter(avatar, needed);
+                if (res && res.fields) {
+                    if (res.fields['data.character_book'] !== undefined) {
+                        dataObj.character_book = res.fields['data.character_book'];
+                        markHydratedPath('data.character_book');
+                    }
+                    if (res.fields['data.extensions.tavern_helper'] !== undefined && dataObj.extensions) {
+                        dataObj.extensions.tavern_helper = res.fields['data.extensions.tavern_helper'];
+                        markHydratedPath('data.extensions.tavern_helper');
+                    }
+                    if (res.fields['data.extensions.regex_scripts'] !== undefined && dataObj.extensions) {
+                        dataObj.extensions.regex_scripts = res.fields['data.extensions.regex_scripts'];
+                        markHydratedPath('data.extensions.regex_scripts');
+                    }
+                }
+            } catch (err) {
+                debugLog(`Worker subtree hydration failed for "${avatar}":`, err);
+            }
+        }
+
+        // Fallback to server if any requested subtree remains a sentinel
+        const stillMissing =
+            dataObj.character_book === STRIPPED_SENTINEL ||
+            dataObj.extensions?.tavern_helper === STRIPPED_SENTINEL ||
+            dataObj.extensions?.regex_scripts === STRIPPED_SENTINEL;
+
+        if (stillMissing) {
+            const upstreamFetch = fetchFn || this.getOriginalFetch();
+            if (typeof upstreamFetch === 'function') {
+                try {
+                    const res = await upstreamFetch('/api/characters/get', {
+                        method: 'POST',
+                        headers: this._buildJsonHeaders(extraHeaders),
+                        body: JSON.stringify({ avatar_url: avatar }),
+                    });
+                    if (res && res.ok) {
+                        const payload = await res.json();
+                        const fullChar = payload && payload.character ? payload.character : payload;
+                        if (fullChar && fullChar.data) {
+                            if (dataObj.character_book === STRIPPED_SENTINEL && fullChar.data.character_book !== undefined) {
+                                dataObj.character_book = fullChar.data.character_book;
+                                markHydratedPath('data.character_book');
+                            }
+                            if (dataObj.extensions?.tavern_helper === STRIPPED_SENTINEL && fullChar.data.extensions?.tavern_helper !== undefined) {
+                                dataObj.extensions.tavern_helper = fullChar.data.extensions.tavern_helper;
+                                markHydratedPath('data.extensions.tavern_helper');
+                            }
+                            if (dataObj.extensions?.regex_scripts === STRIPPED_SENTINEL && fullChar.data.extensions?.regex_scripts !== undefined) {
+                                dataObj.extensions.regex_scripts = fullChar.data.extensions.regex_scripts;
+                                markHydratedPath('data.extensions.regex_scripts');
+                            }
+                        }
+                    }
+                } catch (_) {}
+            }
+        }
+
+        if (hydratedAny) {
+            this.stats.activeCardSubtreeRehydrations++;
+        }
+        return hydratedAny;
+    }
+
+    /**
+     * Releases cold subtrees back to sentinels when switching away from a previously active character
+     * whose intact copy is safely backed in the Worker OPFS/IDB Cold Vault.
+     */
+    reStripCharacterColdFields(charObj) {
+        if (!charObj || typeof charObj !== 'object') return false;
+        const avatar = this.getCharacterKey(charObj);
+        if (!avatar || !this.workerBackedAvatars.has(avatar) || !this.vaultClient?.isReady()) {
+            return false;
+        }
+        const trackedPaths = this.hydratedColdPathsByAvatar.get(avatar);
+        let changed = false;
+        if (typeof charObj.json_data === 'string' && charObj.json_data.length > 1000) {
+            charObj.json_data = '';
+            charObj.__st_rust_stripped = true;
+            changed = true;
+        }
+        if (trackedPaths && charObj.data && typeof charObj.data === 'object') {
+            if (
+                trackedPaths.has('data.character_book') &&
+                charObj.data.character_book &&
+                typeof charObj.data.character_book === 'object'
+            ) {
+                charObj.data.character_book = STRIPPED_SENTINEL;
+                changed = true;
+            }
+            if (charObj.data.extensions && typeof charObj.data.extensions === 'object') {
+                if (
+                    trackedPaths.has('data.extensions.tavern_helper') &&
+                    charObj.data.extensions.tavern_helper &&
+                    typeof charObj.data.extensions.tavern_helper === 'object'
+                ) {
+                    charObj.data.extensions.tavern_helper = STRIPPED_SENTINEL;
+                    changed = true;
+                }
+                if (
+                    trackedPaths.has('data.extensions.regex_scripts') &&
+                    charObj.data.extensions.regex_scripts &&
+                    typeof charObj.data.extensions.regex_scripts === 'object'
+                ) {
+                    charObj.data.extensions.regex_scripts = STRIPPED_SENTINEL;
+                    changed = true;
+                }
+            }
+        }
+        return changed;
     }
 
     /**
@@ -481,6 +683,14 @@ class RehydrationGuard {
         const charObj = Number.isInteger(idx) ? charactersList[idx] : null;
         if (!charObj) return false;
 
+        const key = this.getCharacterKey(charObj);
+        if (key && this.activeHydratedAvatar && this.activeHydratedAvatar !== key) {
+            const prev = charactersList.find(c => this.getCharacterKey(c) === this.activeHydratedAvatar);
+            if (prev) this.reStripCharacterColdFields(prev);
+        }
+        await this.hydrateCharacterColdFields(charObj);
+        if (key) this.activeHydratedAvatar = key;
+
         const formJsonEl = doc.querySelector('#character_json_data');
         if (!formJsonEl) return false;
 
@@ -489,7 +699,6 @@ class RehydrationGuard {
             return false;
         }
 
-        const key = this.getCharacterKey(charObj);
         if (!key) return false;
         if (!charObj.__st_rust_stripped && !this.knownStrippedAvatars.has(key) && !this.characterCache.has(key)) {
             return false;
@@ -659,6 +868,11 @@ class RehydrationGuard {
      * @returns {boolean}
      */
     hasTrackedStrippedChats() {
+        if (this.knownStrippedChats.size > 0) return true;
+        if (this.vaultClient && typeof this.vaultClient.getStats === 'function') {
+            const st = this.vaultClient.getStats();
+            if (st && st.chatEntries > 0) return true;
+        }
         for (const entry of this.chatCache.values()) {
             if (entry.hasStrippedOrProxied) return true;
         }
@@ -806,6 +1020,43 @@ class RehydrationGuard {
 
         if (!jsonText || !jsonText.trim().startsWith('{')) {
             return { modified: false };
+        }
+
+        const hasVaultMarkers =
+            jsonText.includes('__st_rust_vault_ref') ||
+            jsonText.includes(STRIPPED_SENTINEL) ||
+            jsonText.includes('__st_rust_stripped');
+
+        if (hasVaultMarkers && this.vaultClient && this.vaultClient.isReady()) {
+            try {
+                const workerRes = await this.vaultClient.hydrateChatForSave(jsonText, this.latestChatKey || '');
+                if (workerRes && workerRes.bytes && (workerRes.hydratedCount > 0 || !workerRes.missingRefs.length)) {
+                    const outTextCheck = new TextDecoder().decode(workerRes.bytes);
+                    const stillHasMarkers =
+                        outTextCheck.includes('__st_rust_vault_ref') ||
+                        outTextCheck.includes(STRIPPED_SENTINEL) ||
+                        outTextCheck.includes('__st_rust_stripped');
+
+                    if (!stillHasMarkers) {
+                        if (workerRes.hydratedCount > 0) {
+                            this.stats.workerVaultChatHydrations++;
+                            this.stats.chatsRehydrated++;
+                        }
+                        if (wasGzipped && typeof CompressionStream !== 'undefined') {
+                            init.body = await this._compressGzipText(workerRes.bytes);
+                        } else {
+                            init.body = workerRes.bytes;
+                            this._removeHeader(init.headers, 'content-encoding');
+                            this._setHeader(init.headers, 'Content-Type', 'application/json');
+                        }
+                        debugLog(`Worker OPFS Vault hydrated /api/chats/save (${workerRes.bytes.byteLength} bytes, ${workerRes.hydratedCount} refs).`);
+                        return { modified: true };
+                    }
+                    jsonText = outTextCheck;
+                }
+            } catch (err) {
+                debugLog('Worker OPFS Vault chat hydration failed, falling back to local cache:', err);
+            }
         }
 
         let payload;

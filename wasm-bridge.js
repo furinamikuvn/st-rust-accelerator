@@ -87,11 +87,24 @@ async function initWasm(options = {}) {
 
     initPromise = (async () => {
         try {
-            if (typeof window !== 'undefined' && typeof window.document !== 'undefined') {
+            const isWorkerScope =
+                typeof WorkerGlobalScope !== 'undefined' &&
+                typeof self !== 'undefined' &&
+                self instanceof WorkerGlobalScope;
+            const isBrowserRuntime =
+                isWorkerScope ||
+                (typeof window !== 'undefined' && typeof window.document !== 'undefined');
+
+            if (isBrowserRuntime) {
                 const wasmUrl = resolveWasmUrl(options);
                 wasmInstance = await instantiateBrowserWasm(wasmUrl);
                 isReady = true;
-                window.__ST_RUST_READY = true;
+                if (typeof window !== 'undefined') {
+                    window.__ST_RUST_READY = true;
+                }
+                if (typeof globalThis !== 'undefined') {
+                    globalThis.__ST_RUST_READY = true;
+                }
                 debugLog(`Rust WASM Core v${wasmInstance.get_wasm_core_version()} initialized successfully.`);
                 return true;
             } else {
@@ -559,9 +572,17 @@ function stv3InspectHeader(blob) {
     return wasmInstance.stv3_inspect_header(headerSlice);
 }
 
+const _p10TextEncoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+function toUtf8Bytes(data) {
+    if (data instanceof Uint8Array) return data;
+    if (typeof data === 'string') return _p10TextEncoder ? _p10TextEncoder.encode(data) : new Uint8Array(0);
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    return new Uint8Array(data);
+}
+
 function hashXxh64Hex(data) {
     assertP10Ready();
-    const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+    const u8 = toUtf8Bytes(data);
     if (u8.byteLength <= 16384) {
         return wasmInstance.hash_xxh64_hex(u8);
     }
@@ -572,7 +593,7 @@ function hashXxh64Hex(data) {
 
 function hashBlake3Hex(data) {
     assertP10Ready();
-    const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+    const u8 = toUtf8Bytes(data);
     if (u8.byteLength <= 16384) {
         return wasmInstance.hash_blake3_hex(u8);
     }
@@ -589,7 +610,7 @@ function createStreamingHasher() {
     const inCap = wasmInstance.wasm_in_cap();
     return {
         update(chunk) {
-            const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+            const u8 = toUtf8Bytes(chunk);
             for (let off = 0; off < u8.byteLength; off += inCap) {
                 const slice = u8.subarray(off, Math.min(off + inCap, u8.byteLength));
                 new Uint8Array(mem.buffer, inPtr, slice.byteLength).set(slice);

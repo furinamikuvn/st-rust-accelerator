@@ -10,13 +10,14 @@
  * Provides an interactive UI Settings Drawer for real-time telemetry and A/B controls.
  */
 
-import { initWasm, isWasmReady, storeLine0InVault, getLine0FromVault, storeMessageInVault, getMessageFromVault, assembleContextFromVault, buildWorldbookMatcher, scanWorldbookFast, countTokens, trimContextBudget } from './wasm-bridge.js';
+import { initWasm, isWasmReady, storeLine0InVault, getLine0FromVault, storeMessageInVault, getMessageFromVault, assembleContextFromVault, buildWorldbookMatcher, scanWorldbookFast, countTokens, trimContextBudget, hashXxh64Hex } from './wasm-bridge.js';
 import { VirtualScroller } from './dom-virtual-scroller.js';
 import { IframeLazyMounter } from './iframe-lazy-mounter.js';
 import { ProxyVariableGuard } from './proxy-variable-guard.js';
 import { CssCompositorGuard } from './css-compositor-guard.js';
 import { CanvasThrottler } from './canvas-throttler.js';
 import { RehydrationGuard } from './rehydration-guard.js';
+import { VaultClient } from './vault-client.js';
 
 function debugLog(message, ...args) {
     if (typeof window !== 'undefined' && window.__ST_RUST_DEBUG) {
@@ -28,16 +29,20 @@ let originalFetch = null;
 let wrappedFetchFn = null;
 let initExtensionPromise = null;
 let eventHooksInstalled = false;
+let pointerPrehydrateInstalled = false;
 
 let scrollerInstance = null;
 let lazyMounterInstance = null;
 let compositorGuardInstance = null;
 let canvasThrottlerInstance = null;
 
+const vaultClient = new VaultClient();
+
 const rehydrationGuard = new RehydrationGuard({
     getOriginalFetch: () => originalFetch,
     getLine0FromVault,
     getMessageFromVault,
+    vaultClient,
 });
 
 let isInterceptorEnabled = true;
@@ -150,6 +155,13 @@ function pruneCharactersInMemory() {
     }
 }
 
+function isResponseOk(res) {
+    if (!res) return false;
+    if (typeof res.ok === 'boolean') return res.ok;
+    const st = Number(res.status);
+    return Number.isFinite(st) ? st >= 200 && st < 300 : true;
+}
+
 function resolveFetchUrl(resource) {
     if (typeof resource === 'string') return resource;
     if (resource && typeof resource.url === 'string') return resource.url;
@@ -189,8 +201,85 @@ function createJsonResponse(payloadObj, originalResponse) {
     });
 }
 
-async function handleCharacterReadResponse(fetchCtx, args) {
+async function ensureActiveCharacterHydrated(avatar) {
+    const key = String(avatar || '').trim();
+    if (!key) return false;
+    const chars = getActiveCharactersArray();
+    const target = Array.isArray(chars) ? chars.find(c => rehydrationGuard.getCharacterKey(c) === key) : null;
+    if (!target) return false;
+
+    if (rehydrationGuard.activeHydratedAvatar && rehydrationGuard.activeHydratedAvatar !== key) {
+        const prev = chars.find(c => rehydrationGuard.getCharacterKey(c) === rehydrationGuard.activeHydratedAvatar);
+        if (prev) rehydrationGuard.reStripCharacterColdFields(prev);
+    }
+    const hydrated = await rehydrationGuard.hydrateCharacterColdFields(target, originalFetch);
+    rehydrationGuard.activeHydratedAvatar = key;
+    return hydrated;
+}
+
+function getActiveChatArray() {
+    if (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) {
+        try {
+            const ctx = SillyTavern.getContext();
+            if (ctx && Array.isArray(ctx.chat)) return ctx.chat;
+        } catch (_) {}
+    }
+    if (typeof window !== 'undefined' && Array.isArray(window.chat)) {
+        return window.chat;
+    }
+    return null;
+}
+
+async function handleCharacterReadResponse(fetchCtx, args, init) {
     const response = await originalFetch.apply(fetchCtx, args);
+    if (!isResponseOk(response)) return response;
+
+    const url = resolveFetchUrl(args && args[0]);
+    const isSingleChar = url.includes('/api/characters/get');
+    const reqBody = tryParseJsonBody(init && init.body);
+    const reqAvatar = reqBody ? (reqBody.avatar_url || reqBody.avatar || '') : '';
+
+    if (vaultClient.isSupported() && response.body && typeof response.body.getReader === 'function') {
+        try {
+            const workerReady = await vaultClient.ensureReady();
+            if (workerReady) {
+                const scrubFlags = isSingleChar
+                    ? (1 | 256) // Strip only duplicated json_data on active card unshallow; keep active card subtrees ready
+                    : (1 | 2 | 256); // Strip json_data + cold subtrees (character_book/tavern_helper/regex_scripts) across full gallery
+                const streamed = await vaultClient.streamResponse(
+                    response,
+                    {
+                        mode: 'CHAR_LIST',
+                        scrubFlags,
+                        coldThresholdBytes: 512,
+                        avatar: reqAvatar,
+                    },
+                    (stats) => {
+                        if (stats) {
+                            totalStrippedBytes += stats.deltaStrippedBytes || 0;
+                            const count = Array.isArray(stats.strippedAvatars) && stats.strippedAvatars.length > 0
+                                ? stats.strippedAvatars.length
+                                : (stats.strippedBlobs > 0 ? 1 : 0);
+                            totalInterceptedCards += count;
+                            if (Array.isArray(stats.strippedAvatars)) {
+                                rehydrationGuard.registerKnownStrippedAvatars(stats.strippedAvatars, true);
+                            } else if (reqAvatar && stats.strippedBlobs > 0) {
+                                rehydrationGuard.registerKnownStrippedAvatars([reqAvatar], true);
+                            }
+                            saveTelemetryStorage();
+                            updateTelemetryUI();
+                        }
+                    }
+                );
+                if (streamed) {
+                    return streamed;
+                }
+            }
+        } catch (err) {
+            debugLog('Worker streaming /api/characters failed before commit, using fallback:', err);
+        }
+    }
+
     try {
         const cloned = response.clone();
         const data = await cloned.json();
@@ -230,7 +319,53 @@ async function handleCharacterReadResponse(fetchCtx, args) {
 }
 
 async function handleChatGetResponse(fetchCtx, args, init) {
+    const reqBody = tryParseJsonBody(init && init.body);
+    const avatarUrl = reqBody ? (reqBody.avatar_url || '') : '';
+    const chatKey = reqBody
+        ? `${reqBody.avatar_url || reqBody.ch_name || ''}::${reqBody.file_name || ''}`
+        : 'active_chat';
+
+    const hydrateCharPromise = avatarUrl
+        ? ensureActiveCharacterHydrated(avatarUrl).catch(() => false)
+        : Promise.resolve(false);
+
     const response = await originalFetch.apply(fetchCtx, args);
+    await hydrateCharPromise;
+
+    if (!isResponseOk(response)) return response;
+
+    if (vaultClient.isSupported() && response.body && typeof response.body.getReader === 'function') {
+        try {
+            const workerReady = await vaultClient.ensureReady();
+            if (workerReady) {
+                const streamed = await vaultClient.streamResponse(
+                    response,
+                    {
+                        mode: 'CHAT_LOAD',
+                        coldThresholdBytes: 4096,
+                        keepLastMessages: 15,
+                        expectedTotalMessages: 0,
+                        chatKey,
+                    },
+                    (stats) => {
+                        totalInterceptedChats++;
+                        if (stats && stats.deltaStrippedBytes) {
+                            totalStrippedBytes += stats.deltaStrippedBytes;
+                        }
+                        rehydrationGuard.markStrippedChat(chatKey);
+                        saveTelemetryStorage();
+                        updateTelemetryUI();
+                    }
+                );
+                if (streamed) {
+                    return streamed;
+                }
+            }
+        } catch (err) {
+            debugLog('Worker streaming /api/chats/get failed before commit, using fallback:', err);
+        }
+    }
+
     try {
         const cloned = response.clone();
         const chatArray = await cloned.json();
@@ -249,11 +384,6 @@ async function handleChatGetResponse(fetchCtx, args, init) {
                     }
                 }
             }
-
-            const reqBody = tryParseJsonBody(init && init.body);
-            const chatKey = reqBody
-                ? `${reqBody.avatar_url || reqBody.ch_name || ''}::${reqBody.file_name || ''}`
-                : 'active_chat';
 
             let hasProxied = false;
             for (let i = 0; i < chatArray.length; i++) {
@@ -280,7 +410,7 @@ async function handleChatGetResponse(fetchCtx, args, init) {
 async function handleCharacterEditRequest(fetchCtx, resource, init) {
     const guardResult = await rehydrationGuard.guardCharacterEditInit(init, originalFetch);
     const response = await originalFetch.call(fetchCtx, resource, init);
-    if (response && response.ok && guardResult.avatar) {
+    if (isResponseOk(response) && guardResult.avatar) {
         rehydrationGuard.invalidateCharacter(guardResult.avatar, { keepKnownFlag: true });
     }
     return response;
@@ -289,7 +419,7 @@ async function handleCharacterEditRequest(fetchCtx, resource, init) {
 async function handleCharacterMergeAttributes(fetchCtx, resource, init) {
     const reqObj = tryParseJsonBody(init && init.body);
     const response = await originalFetch.call(fetchCtx, resource, init);
-    if (response && response.ok && reqObj) {
+    if (isResponseOk(response) && reqObj) {
         if (Array.isArray(reqObj.avatars)) {
             if (reqObj.avatars.length === 0) {
                 rehydrationGuard.clearCharacterCache({ keepKnownFlag: true });
@@ -324,7 +454,7 @@ function initNetworkInterceptor() {
         }
 
         if (url.includes('/api/characters/get') || url.includes('/api/characters/all')) {
-            return handleCharacterReadResponse(fetchCtx, arguments);
+            return handleCharacterReadResponse(fetchCtx, arguments, init);
         }
 
         if (url.includes('/api/characters/edit')) {
@@ -338,7 +468,7 @@ function initNetworkInterceptor() {
         if (url.includes('/api/characters/delete') || url.includes('/api/characters/rename')) {
             const reqObj = tryParseJsonBody(init && init.body);
             const response = await originalFetch.apply(fetchCtx, arguments);
-            if (response && response.ok && reqObj) {
+            if (isResponseOk(response) && reqObj) {
                 rehydrationGuard.invalidateCharacter(reqObj.avatar_url || reqObj.avatar);
             }
             return response;
@@ -599,8 +729,46 @@ async function checkServerStatus() {
     desc.innerHTML = 'Server SillyTavern chưa nạp Plugin. Khởi động lại ST với cờ <code>SILLYTAVERN_ENABLESERVERPLUGINS=true</code> để kích hoạt lõi ghi đĩa 0.05ms.';
 }
 
+function installPointerPrehydrate() {
+    if (pointerPrehydrateInstalled || typeof document === 'undefined' || typeof document.addEventListener !== 'function') {
+        return;
+    }
+    pointerPrehydrateInstalled = true;
+    document.addEventListener(
+        'pointerdown',
+        (event) => {
+            const target = event && event.target && typeof event.target.closest === 'function'
+                ? event.target.closest('.character_select[chid], [data-chid]')
+                : null;
+            if (!target || typeof target.getAttribute !== 'function') return;
+            const rawChid = target.getAttribute('chid') ?? target.getAttribute('data-chid');
+            if (rawChid === null || rawChid === '') return;
+            const chars = getActiveCharactersArray();
+            const charObj = Array.isArray(chars) ? chars[Number(rawChid)] : null;
+            if (charObj) {
+                const av = rehydrationGuard.getCharacterKey(charObj);
+                if (av) ensureActiveCharacterHydrated(av).catch(() => {});
+            }
+        },
+        true
+    );
+}
+
+function protectActiveChatTail() {
+    const activeChat = getActiveChatArray();
+    if (!Array.isArray(activeChat) || activeChat.length === 0) return;
+    if (isWasmReady()) {
+        ProxyVariableGuard.deduplicateAndProtectMessages(activeChat, hashXxh64Hex);
+    } else {
+        for (let i = 0; i < activeChat.length; i++) {
+            if (activeChat[i]) ProxyVariableGuard.protectMessage(activeChat[i]);
+        }
+    }
+}
+
 function installEventSourceHooks() {
     if (eventHooksInstalled) return;
+    installPointerPrehydrate();
     try {
         const ctx = (typeof SillyTavern !== 'undefined' && SillyTavern.getContext)
             ? SillyTavern.getContext()
@@ -610,6 +778,16 @@ function installEventSourceHooks() {
 
         eventHooksInstalled = true;
         ev.on('chatLoaded', () => {
+            protectActiveChatTail();
+            const curCtx = typeof SillyTavern !== 'undefined' && SillyTavern.getContext ? SillyTavern.getContext() : null;
+            if (curCtx && curCtx.characterId !== undefined) {
+                const chars = getActiveCharactersArray();
+                const curChar = chars && chars[Number(curCtx.characterId)];
+                if (curChar) {
+                    const av = rehydrationGuard.getCharacterKey(curChar);
+                    if (av) ensureActiveCharacterHydrated(av).catch(() => {});
+                }
+            }
             if (scrollerInstance) scrollerInstance.update();
             pruneCharactersInMemory();
             updateTelemetryUI();
@@ -663,7 +841,10 @@ async function initExtension() {
         initNetworkInterceptor();
         loadTelemetryStorage();
 
-        await initWasm();
+        await Promise.all([
+            initWasm(),
+            vaultClient.isSupported() ? vaultClient.start() : Promise.resolve(false),
+        ]);
 
         if (typeof document !== 'undefined') {
             scrollerInstance = new VirtualScroller('#chat', {
@@ -704,6 +885,8 @@ async function initExtension() {
                 canvasThrottler: canvasThrottlerInstance,
                 proxyGuard: ProxyVariableGuard,
                 rehydrationGuard,
+                vaultClient,
+                ensureActiveCharacterHydrated,
                 buildMatcher: buildWorldbookMatcher,
                 scanWorldbook: scanWorldbookFast,
                 countTokens: countTokens,
@@ -747,6 +930,7 @@ async function initExtension() {
                     totalStrippedMb: (totalStrippedBytes / (1024 * 1024)).toFixed(2),
                     totalInterceptedCards,
                     totalInterceptedChats,
+                    vaultStats: vaultClient.getStats(),
                     rehydrationStats: rehydrationGuard.getStats(),
                     scrollerStats: scrollerInstance ? scrollerInstance.getStats() : null,
                     lazyMounterStats: lazyMounterInstance ? lazyMounterInstance.getStats() : null,
@@ -767,6 +951,9 @@ async function initExtension() {
 // Guarantees interception of early SillyTavern startup calls such as /api/characters/all (script.js:757).
 if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
     initNetworkInterceptor();
+    if (vaultClient.isSupported()) {
+        vaultClient.start();
+    }
 }
 
 if (typeof window !== 'undefined' && typeof document !== 'undefined') {
@@ -786,6 +973,8 @@ export {
     saveTelemetryStorage,
     rehydrationGuard,
     RehydrationGuard,
+    vaultClient,
+    VaultClient,
     VirtualScroller,
     IframeLazyMounter,
     ProxyVariableGuard,
