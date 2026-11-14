@@ -318,6 +318,7 @@ class IframeAssetHoister {
         this.fetchingScriptUrls = new Set();
         this.tailwindSheetCache = new Map();    // twSig -> CSSStyleSheet
         this.pendingTailwindWaiters = new Map();// twSig -> Set<HTMLIFrameElement>
+        this.tailwindReadyListeners = new Set(); // fn(twSig, sheetKey)
         this.iframePlans = new WeakMap();       // iframe -> { sheetKeys, tailwindSig, isTailwindProducer, styleHashesRemoved }
         this.processedDocs = new WeakSet();
         this.loadListeners = new WeakMap();     // iframe -> handler
@@ -707,7 +708,26 @@ class IframeAssetHoister {
             return false;
         }
 
-        const plan = this.iframePlans.get(iframe);
+        let plan = this.iframePlans.get(iframe);
+        if (!plan && typeof doc.querySelectorAll === 'function') {
+            const recoveredKeys = [];
+            const styleMetas = doc.querySelectorAll('meta[name="st-hoisted-style"][data-st-sheet]');
+            for (const m of styleMetas) {
+                const k = m.getAttribute('data-st-sheet');
+                if (k) recoveredKeys.push(k);
+            }
+            const twMeta = doc.querySelector('meta[data-st-tw-sig]');
+            const twSig = twMeta ? twMeta.getAttribute('data-st-tw-sig') : null;
+            if (recoveredKeys.length > 0 || twSig) {
+                plan = {
+                    sheetKeys: recoveredKeys,
+                    tailwindSig: twSig || null,
+                    isTailwindProducer: false,
+                    knownStylesAtSrcdoc: new Set(),
+                };
+                this.iframePlans.set(iframe, plan);
+            }
+        }
         const sheetKeysToAttach = [];
 
         if (plan && Array.isArray(plan.sheetKeys)) {
@@ -862,13 +882,58 @@ class IframeAssetHoister {
     _flushTailwindWaiters(twSig, sheetKey) {
         const waiters = this.pendingTailwindWaiters.get(twSig);
         this.pendingTailwindWaiters.delete(twSig);
-        if (!waiters || !sheetKey) return;
-        for (const waiterFrame of waiters) {
-            const waiterDoc = getAccessibleContentDocument(waiterFrame);
-            if (waiterDoc && 'adoptedStyleSheets' in waiterDoc) {
-                this._appendAdoptedSheetKeys(waiterDoc, [sheetKey]);
+        if (sheetKey && waiters) {
+            for (const waiterFrame of waiters) {
+                const waiterDoc = getAccessibleContentDocument(waiterFrame);
+                if (waiterDoc && 'adoptedStyleSheets' in waiterDoc) {
+                    this._appendAdoptedSheetKeys(waiterDoc, [sheetKey]);
+                }
             }
         }
+        if (sheetKey && this.tailwindReadyListeners.size > 0) {
+            for (const listener of this.tailwindReadyListeners) {
+                try {
+                    listener(twSig, sheetKey);
+                } catch (_) {}
+            }
+        }
+    }
+
+    /**
+     * Returns deduplicated sheet keys currently associated with an iframe (both static
+     * hoisted `<style>` keys and compiled Tailwind sheet key if ready).
+     *
+     * @param {HTMLIFrameElement} iframe
+     * @returns {{ sheetKeys: string[], tailwindSig: string|null }}
+     */
+    getFrameAssetKeys(iframe) {
+        const plan = iframe ? this.iframePlans.get(iframe) : null;
+        const keys = [];
+        if (plan && Array.isArray(plan.sheetKeys)) {
+            for (const k of plan.sheetKeys) {
+                if (k && !keys.includes(k)) keys.push(k);
+            }
+        }
+        if (plan && plan.tailwindSig) {
+            const twKey = this.tailwindSheetCache.get(plan.tailwindSig);
+            if (twKey && !keys.includes(twKey)) keys.push(twKey);
+        }
+        return {
+            sheetKeys: keys,
+            tailwindSig: plan ? plan.tailwindSig : null,
+        };
+    }
+
+    /**
+     * Subscribes to Tailwind JIT sheet readiness notifications (used by Shadow DOM Pool).
+     *
+     * @param {(twSig: string, sheetKey: string) => void} listener
+     * @returns {() => void}
+     */
+    onTailwindReady(listener) {
+        if (typeof listener !== 'function') return () => {};
+        this.tailwindReadyListeners.add(listener);
+        return () => this.tailwindReadyListeners.delete(listener);
     }
 
     _watchProducerHeadForTailwind(doc, plan) {

@@ -117,6 +117,11 @@ class VirtualScroller {
      * Clears tracked message Maps and spacer state (used on chat switches / clearChat()).
      */
     reset() {
+        for (const node of this.detachedNodes) {
+            if (node && typeof node.removeAttribute === 'function') {
+                node.removeAttribute('data-st-virtual-detached');
+            }
+        }
         this.messageNodes.clear();
         this.heightCache.clear();
         this.detachedNodes.clear();
@@ -240,6 +245,9 @@ class VirtualScroller {
             if (!isNaN(mesId)) {
                 this.messageNodes.set(mesId, node);
                 this.detachedNodes.delete(node);
+                if (typeof node.removeAttribute === 'function') {
+                    node.removeAttribute('data-st-virtual-detached');
+                }
                 const h = node.getBoundingClientRect().height;
                 if (h > 0) this.heightCache.set(mesId, h);
             }
@@ -339,6 +347,9 @@ class VirtualScroller {
 
                 if (isVisible && !isInDom) {
                     this.detachedNodes.delete(node);
+                    if (typeof node.removeAttribute === 'function') {
+                        node.removeAttribute('data-st-virtual-detached');
+                    }
                     this.container.insertBefore(node, nextMountedRef);
                     nextMountedRef = node;
                 } else if (!isVisible && isInDom) {
@@ -348,6 +359,9 @@ class VirtualScroller {
                         nextMountedRef = node;
                     } else {
                         this.detachedNodes.add(node);
+                        if (typeof node.setAttribute === 'function') {
+                            node.setAttribute('data-st-virtual-detached', '1');
+                        }
                         node.remove();
                         if (i < startIndex) topSpacerHeight += heights[i] || this.estimatedItemHeight;
                         else if (i > endIndex) bottomSpacerHeight += heights[i] || this.estimatedItemHeight;
@@ -391,6 +405,9 @@ class VirtualScroller {
                         if (!node) continue;
                         if (node.parentNode !== this.container) {
                             this.detachedNodes.delete(node);
+                            if (typeof node.removeAttribute === 'function') {
+                                node.removeAttribute('data-st-virtual-detached');
+                            }
                             this.container.insertBefore(node, nextMountedRef);
                         }
                         nextMountedRef = node;

@@ -19,6 +19,7 @@ import { ProxyVariableGuard } from './proxy-variable-guard.js';
 import { CssCompositorGuard } from './css-compositor-guard.js';
 import { CanvasThrottler } from './canvas-throttler.js';
 import { IframeAssetHoister } from './iframe-asset-hoister.js';
+import { IframePoolManager, clampPoolSlots } from './iframe-pool-manager.js';
 import { RehydrationGuard, extractVaultRefHex } from './rehydration-guard.js';
 import { VaultClient } from './vault-client.js';
 
@@ -39,6 +40,7 @@ let lazyMounterInstance = null;
 let assetHoisterInstance = null;
 let compositorGuardInstance = null;
 let canvasThrottlerInstance = null;
+let iframePoolInstance = null;
 
 const vaultClient = new VaultClient();
 
@@ -55,6 +57,7 @@ let isLazyMounterEnabled = true;
 let isAssetHoisterEnabled = true;
 let isCompositorGuardEnabled = true;
 let isCanvasThrottlerEnabled = true;
+let isIframePoolEnabled = true;
 
 let totalStrippedBytes = 0;
 let totalInterceptedChats = 0;
@@ -1228,6 +1231,7 @@ function installEventSourceHooks(explicitEv = null) {
                 warmActiveChatColdReads().catch(() => false),
             ]);
             if (scrollerInstance) scrollerInstance.reset();
+            if (iframePoolInstance) iframePoolInstance.clearSnapshots();
             pruneCharactersInMemory();
             updateTelemetryUI();
         });
@@ -1337,6 +1341,24 @@ async function initExtension() {
             });
             canvasThrottlerInstance.init();
 
+            const ctxForPool = getActiveStContext();
+            const thRenderDepth = ctxForPool && ctxForPool.extensionSettings && ctxForPool.extensionSettings.tavern_helper &&
+                ctxForPool.extensionSettings.tavern_helper.render && ctxForPool.extensionSettings.tavern_helper.render.depth;
+            const configuredPoolSlots = Number.isFinite(Number(thRenderDepth)) && Number(thRenderDepth) >= 1
+                ? clampPoolSlots(thRenderDepth)
+                : 2;
+
+            iframePoolInstance = new IframePoolManager({
+                chatSelector: '#chat',
+                maxActiveSlots: configuredPoolSlots,
+                pinnedCooldownMs: 5000,
+                rehydrateTargetMs: 50,
+                hoister: assetHoisterInstance,
+                compositorGuard: compositorGuardInstance,
+                canvasThrottler: canvasThrottlerInstance,
+            });
+            iframePoolInstance.init();
+
             installSettingsDrawer();
 
             pruneCharactersInMemory();
@@ -1351,6 +1373,7 @@ async function initExtension() {
                 assetHoister: assetHoisterInstance,
                 compositorGuard: compositorGuardInstance,
                 canvasThrottler: canvasThrottlerInstance,
+                iframePool: iframePoolInstance,
                 proxyGuard: ProxyVariableGuard,
                 rehydrationGuard,
                 vaultClient,
@@ -1399,6 +1422,16 @@ async function initExtension() {
                     if (canvasThrottlerInstance) canvasThrottlerInstance.setEnabled(val);
                     updateTelemetryUI();
                 },
+                toggleIframePool: (val) => {
+                    isIframePoolEnabled = val;
+                    if (iframePoolInstance) iframePoolInstance.setEnabled(val);
+                    updateTelemetryUI();
+                },
+                setIframePoolMaxSlots: (n) => {
+                    const next = iframePoolInstance ? iframePoolInstance.setMaxActiveSlots(n) : clampPoolSlots(n);
+                    updateTelemetryUI();
+                    return next;
+                },
                 checkServer: checkServerStatus,
                 getStats: () => ({
                     wasmReady: isWasmReady(),
@@ -1408,6 +1441,7 @@ async function initExtension() {
                     isAssetHoisterEnabled,
                     isCompositorGuardEnabled,
                     isCanvasThrottlerEnabled,
+                    isIframePoolEnabled,
                     totalStrippedBytes,
                     totalStrippedMb: (totalStrippedBytes / (1024 * 1024)).toFixed(2),
                     totalInterceptedCards,
@@ -1421,6 +1455,7 @@ async function initExtension() {
                     assetHoisterStats: assetHoisterInstance ? assetHoisterInstance.getStats() : null,
                     compositorStats: compositorGuardInstance ? compositorGuardInstance.getStats() : null,
                     canvasStats: canvasThrottlerInstance ? canvasThrottlerInstance.getStats() : null,
+                    iframePoolStats: iframePoolInstance ? iframePoolInstance.getStats() : null,
                 })
             };
         }
@@ -1471,6 +1506,7 @@ export {
     VirtualScroller,
     IframeLazyMounter,
     IframeAssetHoister,
+    IframePoolManager,
     ProxyVariableGuard,
     CssCompositorGuard,
     CanvasThrottler,
