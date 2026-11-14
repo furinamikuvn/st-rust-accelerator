@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 
 import {
@@ -10,9 +11,13 @@ import {
 } from './worldbook-fast-scanner.js';
 import { TokenCacheGuard } from './token-cache-guard.js';
 
+const require = createRequire(import.meta.url);
+const { resolveGenshinCardFixture } = require('./test-helpers/genshin-fixture.js');
+const GENSHIN_FIXTURE = resolveGenshinCardFixture();
+
 const GENSHIN_WORLD_PATH = 'D:/ST/SillyTavern/data/default-user/worlds/Genshin Impact.json';
 const HTH_WORLD_PATH = 'D:/ST/SillyTavern/data/default-user/worlds/Hoàng Thiên Hậu Thổ.json';
-const TEYVAT_CHAT_PATH = 'D:/ST/SillyTavern/data/default-user/chats/Genshin Impact · Teyvat3/Genshin Impact · Teyvat - 2026-11-09@10h51m04s595ms.jsonl';
+const TEYVAT_CHAT_PATH = GENSHIN_FIXTURE.chatPath;
 const HTH_CHAT_DIR = 'D:/ST/SillyTavern/data/default-user/chats/【Mira】Hoàng Thiên Hậu Thổ';
 
 function escapeRegexST(string) {

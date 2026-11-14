@@ -12,6 +12,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveHeavyChatWithMvh } from './test-helpers/genshin-fixture.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -546,33 +547,36 @@ async function runTests() {
             );
         }
 
-        // Test 3B: Real Teyvat3 chat (45.34 MB, Line 0 = 44.69 MB multiverse_hypervisor) -> Full Save SHA-256 Parity + Gzip + Evict!
-        const teyvatPath = 'D:/ST/SillyTavern/data/default-user/chats/Genshin Impact · Teyvat3/Genshin Impact · Teyvat - 2026-11-11@11h15m40s510ms.jsonl';
-        if (fs.existsSync(teyvatPath)) {
+        // Test 3B: Real Heavy MVH Chat (Line 0 > 4 MiB multiverse_hypervisor) -> Full Save SHA-256 Parity + Gzip + Evict!
+        const heavyMvhFix = resolveHeavyChatWithMvh();
+        const teyvatPath = heavyMvhFix.found ? heavyMvhFix.chatPath : '';
+        if (teyvatPath && fs.existsSync(teyvatPath)) {
             const teyvatRawLines = fs.readFileSync(teyvatPath, 'utf8').split(/\r?\n/).filter(Boolean);
             const teyvatOrig = teyvatRawLines.map(JSON.parse);
             const origTeyvatChatStr = JSON.stringify(teyvatOrig);
 
             const streamedTeyvat = await client.streamResponse(
                 createReadableJsonResponse(origTeyvatChatStr, {}, 262144),
-                { mode: 'CHAT_LOAD', coldThresholdBytes: 4096, keepLastMessages: 15, expectedTotalMessages: 0, chatKey: 'Teyvat3::heavy' },
-                () => guard.markStrippedChat('Teyvat3::heavy')
+                { mode: 'CHAT_LOAD', coldThresholdBytes: 4096, keepLastMessages: 15, expectedTotalMessages: 0, chatKey: 'HeavyMVH::heavy' },
+                () => guard.markStrippedChat('HeavyMVH::heavy')
             );
             const scrubbedTeyvatText = await streamedTeyvat.text();
             assert(
                 scrubbedTeyvatText.length < 2 * 1024 * 1024,
-                `Scrubbed Teyvat3 HTTP body must shrink from 45MB to <2MB (got ${(scrubbedTeyvatText.length / 1048576).toFixed(2)} MB)`
+                `Scrubbed HeavyMVH HTTP body must shrink to <2MB (got ${(scrubbedTeyvatText.length / 1048576).toFixed(2)} MB)`
             );
             const scrubbedTeyvatArr = JSON.parse(scrubbedTeyvatText);
             assert(scrubbedTeyvatArr[0].chat_metadata.multiverse_hypervisor.__st_rust_vault_ref);
-            // Single message (in tail <= 15): variables intact!
-            assert.strictEqual(scrubbedTeyvatArr[1].variables.__st_rust_vault_ref, undefined);
+            // Tail message (<= 15) preserves inline fields if present!
+            if (scrubbedTeyvatArr[1] && scrubbedTeyvatArr[1].variables) {
+                assert.strictEqual(scrubbedTeyvatArr[1].variables.__st_rust_vault_ref, undefined);
+            }
 
             const postStats = await client.refreshStats();
-            assert(postStats.linearMemoryBytes <= 8 * 1024 * 1024, `Teyvat3 45MB WASM linear mem exceeded 8 MiB: ${postStats.linearMemoryBytes}`);
+            assert(postStats.linearMemoryBytes <= 8 * 1024 * 1024, `HeavyMVH WASM linear mem exceeded 8 MiB: ${postStats.linearMemoryBytes}`);
 
             // Test Save (with Gzip CompressionStream round-trip!)
-            const rawSavePayload = JSON.stringify({ ch_name: 'Teyvat3', file_name: 'heavy', chat: scrubbedTeyvatArr });
+            const rawSavePayload = JSON.stringify({ ch_name: 'HeavyMVH', file_name: 'heavy', chat: scrubbedTeyvatArr });
             const gzBytes = await guard._compressGzipText(rawSavePayload);
             const gzInit = {
                 method: 'POST',
@@ -587,13 +591,13 @@ async function runTests() {
             assert.strictEqual(
                 sha256(JSON.stringify(restoredChat)),
                 sha256(origTeyvatChatStr),
-                'Teyvat3 45.34 MB gzipped POST /api/chats/save MUST achieve 100% SHA-256 byte parity!'
+                'HeavyMVH gzipped POST /api/chats/save MUST achieve 100% SHA-256 byte parity!'
             );
 
             // Test EVICT_CHAT removes OPFS blobs cleanly
-            const evRes = await client.evictChat('Teyvat3::heavy');
+            const evRes = await client.evictChat('HeavyMVH::heavy');
             assert.strictEqual(evRes.evicted, true);
-            assert(evRes.freedBytes > 1024 * 1024, `Expected >1MB freed compressed blobs on Teyvat3 evict, got ${evRes.freedBytes}`);
+            assert(evRes.freedBytes > 256 * 1024, `Expected >256KB freed compressed blobs on HeavyMVH evict, got ${evRes.freedBytes}`);
         }
 
         await client.shutdown();
@@ -996,7 +1000,13 @@ async function runIndexSubtest(subMode) {
         { name: 'IdxTiny', avatar: 'IdxTiny.png', json_data: tinyJson, data: { name: 'IdxTiny' } },
     ];
     const origChat = [
-        { user_name: 'U', chat_metadata: { multiverse_hypervisor: { state: 'M'.repeat(6000) } } },
+        {
+            user_name: 'U',
+            chat_metadata: {
+                custom_plugin_state: { pad: 'C'.repeat(6000) },
+                multiverse_hypervisor: { state: 'M'.repeat(4 * 1024 * 1024 + 8192) },
+            },
+        },
         ...Array.from({ length: 18 }, (_, i) => ({
             name: 'IdxHero',
             mes: i === 17 ? 'Literal __st_rust_stripped and __ST_RUST_STRIPPED__ and __st_rust_vault_ref in chat' : `msg ${i + 1}`,
@@ -1106,7 +1116,8 @@ async function runIndexSubtest(subMode) {
             body: JSON.stringify({ ch_name: 'IdxHero', file_name: 'c1' }),
         });
         const chatOut = await chatResp.json();
-        assert(chatOut[0].chat_metadata.multiverse_hypervisor.__st_rust_vault_ref);
+        assert.strictEqual(chatOut[0].chat_metadata.custom_plugin_state.__st_rust_vault_ref, undefined, 'Line 0 field <= 4 MiB must stay warm');
+        assert(chatOut[0].chat_metadata.multiverse_hypervisor.__st_rust_vault_ref, 'Line 0 field > 4 MiB must stay cold');
         assert(chatOut[1].variables.__st_rust_vault_ref);
         assert.strictEqual(chatOut[18].variables.__st_rust_vault_ref, undefined, 'Last tail msg must stay hydrated');
 

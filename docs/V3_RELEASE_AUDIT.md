@@ -64,3 +64,17 @@
 - **Third-Party Noise Verification (Baseline vs Optimized)**:
   - `about:srcdoc:83:36 TypeError` (1x in `teyvat3-open`) and `updateTableConfigs` (2x in `teyvat3-open`) occur identically in **Baseline (v3 disabled)** and **Optimized (v3 enabled)**, proving 0 correlation with v3 hydration (`relevantConsoleErrorCount = 0`, `relevantPageExceptionCount = 0`).
 - **Compatibility Verification**: Hybrid 22-msg chat (`world_backstage_v1`, `2.52 MB` `variables`, `44.69 MB` `multiverse_hypervisor`, `.mv-hud-viewport` sibling tab protection, old-message `.mes_edit` `pointerdown` pre-hydration, live `Zstd <-> LZ4` toggle, disk `.jsonl` SHA-256 parity PASS).
+
+---
+
+## 5. Phase P15.1 Post-Release Hardening & New Genshin Card Verification
+
+- **Active Genshin Deck Audited**: `69` PNG cards (`332.39 MB` JSON), active card `Genshin Impact · Teyvat.png` (`50,175,781` bytes, `SHA-256 = d809346219595835e23139d3cc8b0b0046ba58fc8ec4264f64492de71982913a`, `961` worldbook entries, `16` tavern_helper scripts, `11` regex_scripts), MVH fixture `Thương Huyền Giới - 2026-11-12@13h34m02s131ms.jsonl` (`7.09 MB`, `mvhBytes = 6,828,507`).
+- **7 Hardening Fixes Verified (`test_p15_redteam_e2e.js` Test 5 + full suite `16/16` PASS)**:
+  - **CDP Temp Cleanup**: Removed `23` orphaned `%TEMP%` folders (`~3.68 GB`) + added `benchmarks/cdp-cleanup.mjs`; post-run `%TEMP%` `st-*` dir count = **`0`**.
+  - **Instant OPFS Eviction**: `CHAR_LIST` `STREAM_END` reconciliation + `/api/characters/import`, `/api/chats/delete`, `/api/chats/group/delete`, `/api/chats/rename` interception.
+  - **Line 0 `<= 4 MiB` Policy & `GENERATION_STARTED`**: Size-threshold auto-warm keeps custom fields warm while leaving `> 4 MiB` super-blobs cold; pre-hydrates active context on `GENERATION_STARTED`.
+  - **Fast-Boot `CODEC_LZ4` + Background `Zstd`**: Reduced Live ST cold boot overhead from `+48.5%` to **`+27.3%`** while background worker compacts/recompresses to Zstd.
+  - **Shadow DOM `uiState` & Memory Cap**: Preserved `input`/`<details open>`/nested `scrollTop` across Shadow Snapshot -> Click-to-Rehydrate; lowered `memory` fallback cap from `180 MiB` to **`48 MiB`**.
+- **Gate G3 Chrome v157 CDP (`benchmarks/p15_chrome_cdp.mjs` Post-P15.1)**: `opfs-sync/ZSTD` (`201.54 -> 78.49 MB`, `78` blobs, `161` dedup), `JSHeapUsed = 52.81 MB`, `Docs = 3`, `Frames = 3`, `totalPrivate = 505.27 MB`, `tabRenderer = 349.84 MB`, `Shadow uiState` preserved & rehydrated (`36.3 ms` incl. `30 ms` settle), `0` console/page errors.
+- **Live SillyTavern A/B (`benchmarks/live_st_cdp.mjs` Post-P15.1)**: Boot `13,453.4 -> 17,131.4 ms` (`+27.3%`), Boot `PrivateMB 787.72 -> 339.88 MB` (`-56.9%`), Boot `JSHeap 561.54 -> 78.63 MB` (`-86.0%`), Genshin Open `PrivateMB -22.7%` / `JSHeap -55.2%`, Final `PrivateMB 1706.95 -> 1261.73 MB` (`-26.1%`), Final `JSHeap 723.42 -> 510.45 MB` (`-29.4%`), `Docs 24 -> 19` (`-20.8%`), `Frames 23 -> 18` (`-21.7%`), `DOM Nodes 192,457 -> 100,584` (`-47.7%`), `0` relevant errors, 100% SHA-256 restore verified.

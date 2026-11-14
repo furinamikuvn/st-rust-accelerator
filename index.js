@@ -438,6 +438,8 @@ async function handleCharacterReadResponse(fetchCtx, args, init) {
                         scrubFlags,
                         coldThresholdBytes: 512,
                         dedupCharSubtrees: !isSingleChar,
+                        isFullGallery: !isSingleChar,
+                        bootFastLz4: !isSingleChar,
                         avatar: reqAvatar,
                     },
                     (stats) => {
@@ -519,8 +521,7 @@ async function processLoadedChatResponse(response, chatKey, { allowPrune = true 
                         keepLastMessages: 15,
                         expectedTotalMessages: 0,
                         chatKey,
-                        hydrateLine0Keys: ['variables', 'world_backstage_v1', 'world_backstage', 'sheets'],
-                        hydrateLine0MaxBytes: 32 * 1024 * 1024,
+                        hydrateLine0MaxBytes: 4 * 1024 * 1024,
                     },
                     (stats) => {
                         totalInterceptedChats++;
@@ -583,6 +584,9 @@ async function processLoadedChatResponse(response, chatKey, { allowPrune = true 
 }
 
 async function handleChatGetResponse(fetchCtx, args, init) {
+    if (scrollerInstance) scrollerInstance.beginChatLoad();
+    if (iframePoolInstance) iframePoolInstance.clearSnapshots();
+
     const reqBody = tryParseJsonBody(init && init.body);
     const avatarUrl = reqBody ? (reqBody.avatar_url || '') : '';
     const chatKey = reqBody
@@ -602,6 +606,9 @@ async function handleChatGetResponse(fetchCtx, args, init) {
 }
 
 async function handleGroupChatGetResponse(fetchCtx, args, init) {
+    if (scrollerInstance) scrollerInstance.beginChatLoad();
+    if (iframePoolInstance) iframePoolInstance.clearSnapshots();
+
     const reqBody = tryParseJsonBody(init && init.body);
     const chatId = reqBody && reqBody.id ? String(reqBody.id) : '';
     const chatKey = chatId ? `group::${chatId}` : 'active_chat';
@@ -685,6 +692,55 @@ function initNetworkInterceptor() {
                 const response = await originalFetch.apply(fetchCtx, arguments);
                 if (isResponseOk(response) && reqObj) {
                     rehydrationGuard.invalidateCharacter(reqObj.avatar_url || reqObj.avatar);
+                }
+                return response;
+            }
+            return originalFetch.apply(fetchCtx, arguments);
+        }
+
+        if (url.includes('/api/characters/import')) {
+            if (isInterceptorEnabled || rehydrationGuard.hasTrackedStrippedCharacters()) {
+                let preservedAvatar = '';
+                if (typeof FormData !== 'undefined' && init && init.body instanceof FormData) {
+                    const pName = String(init.body.get('preserved_name') || '').trim();
+                    if (pName) {
+                        preservedAvatar = pName.endsWith('.png') ? pName : `${pName}.png`;
+                    }
+                }
+                const response = await originalFetch.apply(fetchCtx, arguments);
+                if (isResponseOk(response)) {
+                    try {
+                        const data = await response.clone().json();
+                        if (data && data.file_name) {
+                            const fName = String(data.file_name).trim();
+                            const importedAvatar = fName.endsWith('.png') ? fName : `${fName}.png`;
+                            rehydrationGuard.invalidateCharacter(importedAvatar);
+                        }
+                    } catch (_) {}
+                    if (preservedAvatar) {
+                        rehydrationGuard.invalidateCharacter(preservedAvatar);
+                    }
+                    updateTelemetryUI();
+                }
+                return response;
+            }
+            return originalFetch.apply(fetchCtx, arguments);
+        }
+
+        if (url.includes('/api/chats/delete') || url.includes('/api/chats/group/delete') || url.includes('/api/chats/rename')) {
+            if (isInterceptorEnabled || rehydrationGuard.hasTrackedStrippedChats()) {
+                const reqObj = tryParseJsonBody(init && init.body);
+                const response = await originalFetch.apply(fetchCtx, arguments);
+                if (isResponseOk(response) && reqObj) {
+                    if (url.includes('/api/chats/group/delete')) {
+                        await rehydrationGuard.evictChatByFile('group', reqObj.id || '');
+                    } else if (url.includes('/api/chats/rename')) {
+                        const scope = reqObj.is_group ? 'group' : (reqObj.avatar_url || '');
+                        await rehydrationGuard.evictChatByFile(scope, reqObj.original_file || '');
+                    } else {
+                        await rehydrationGuard.evictChatByFile(reqObj.avatar_url || '', reqObj.chatfile || '');
+                    }
+                    updateTelemetryUI();
                 }
                 return response;
             }
@@ -996,12 +1052,13 @@ function updateTelemetryUI() {
 
     if (elVault) {
         const backendName = vStats.storageBackend || (vStats.degraded ? 'degraded' : 'initializing');
+        const capTag = (backendName === 'memory' || vStats.memoryFallbackCapped) ? ' [cap 48 MiB]' : '';
         const codecLabel = String(vStats.codecPreference || vaultClient.codecPreference || 'zstd').toUpperCase();
         const rawMb = ((vStats.totalRawBytes || 0) / (1024 * 1024)).toFixed(2);
         const compMb = ((vStats.totalCompressedBytes || 0) / (1024 * 1024)).toFixed(2);
         const blobs = vStats.blobsStored || 0;
         const dedup = vStats.dedupHits || 0;
-        elVault.textContent = `${backendName}/${codecLabel} | ${rawMb} MB -> ${compMb} MB | ${blobs} blobs (${dedup} dedup)`;
+        elVault.textContent = `${backendName}${capTag}/${codecLabel} | ${rawMb} MB -> ${compMb} MB | ${blobs} blobs (${dedup} dedup)`;
     }
 
     if (elRehydration) {
@@ -1190,36 +1247,50 @@ async function warmActiveChatColdReads() {
     const isMvhActive = typeof window !== 'undefined' && Boolean(window.MultiverseHypervisor);
     const res = await rehydrationGuard.hydrateWarmChatVariables(targetChat, chatKey, {
         chatMetadata: ctx && ctx.chatMetadata ? ctx.chatMetadata : undefined,
+        autoWarmMaxFieldBytes: 4 * 1024 * 1024,
         hydrateMultiverseHypervisor: isMvhActive,
         hydrateWorldBackstage: true,
         hydrateSheets: true,
-        maxWarmVariableBytes: 32 * 1024 * 1024,
     });
 
     if (ctx && ctx.chatMetadata) {
         const line0Meta = targetChat[0] && targetChat[0].chat_metadata;
         if (line0Meta && ctx.chatMetadata !== line0Meta) {
-            if (!extractVaultRefHex(line0Meta.variables) && line0Meta.variables !== undefined) {
-                ctx.chatMetadata.variables = line0Meta.variables;
-            }
-            if (!extractVaultRefHex(line0Meta.world_backstage_v1) && line0Meta.world_backstage_v1 !== undefined) {
-                ctx.chatMetadata.world_backstage_v1 = line0Meta.world_backstage_v1;
-            }
-            if (res.mvhHydrated && !extractVaultRefHex(line0Meta.multiverse_hypervisor)) {
-                ctx.chatMetadata.multiverse_hypervisor = line0Meta.multiverse_hypervisor;
+            const fieldsToSync = Array.isArray(res.hydratedFields) && res.hydratedFields.length > 0
+                ? res.hydratedFields
+                : ['variables', 'world_backstage_v1', 'sheets', ...(res.mvhHydrated ? ['multiverse_hypervisor'] : [])];
+            for (const fk of fieldsToSync) {
+                if (!extractVaultRefHex(line0Meta[fk]) && line0Meta[fk] !== undefined) {
+                    ctx.chatMetadata[fk] = line0Meta[fk];
+                }
             }
         }
-        // Fallback if ctx.chatMetadata still independently holds a cold ref
-        if (extractVaultRefHex(ctx.chatMetadata.world_backstage_v1)) {
-            await rehydrationGuard.hydrateColdField(ctx.chatMetadata, 'world_backstage_v1', chatKey);
-        }
-        if (extractVaultRefHex(ctx.chatMetadata.variables)) {
-            await rehydrationGuard.hydrateColdField(ctx.chatMetadata, 'variables', chatKey, {
-                maxBytes: 32 * 1024 * 1024,
-            });
+        // Fallback if ctx.chatMetadata independently holds any cold ref <= 4 MiB
+        for (const fk of Object.keys(ctx.chatMetadata)) {
+            if (!extractVaultRefHex(ctx.chatMetadata[fk])) continue;
+            const cap = fk === 'multiverse_hypervisor' && isMvhActive ? 64 * 1024 * 1024 : 4 * 1024 * 1024;
+            await rehydrationGuard.hydrateColdField(ctx.chatMetadata, fk, chatKey, { maxBytes: cap });
         }
     }
     return res;
+}
+
+async function prehydrateGenerationContext() {
+    const activeChat = getActiveChatArray();
+    const ctx = getActiveStContext();
+    const targetChat = Array.isArray(activeChat) && activeChat.length > 0
+        ? activeChat
+        : (ctx && ctx.chatMetadata ? [{ chat_metadata: ctx.chatMetadata }] : null);
+    if (!targetChat) return { hydratedMessages: 0, hydratedFields: 0, bytes: 0 };
+
+    const chatKey = rehydrationGuard.latestChatKey || '';
+    const isMvhActive = typeof window !== 'undefined' && Boolean(window.MultiverseHypervisor);
+    return rehydrationGuard.prehydrateGenerationMessages(targetChat, chatKey, {
+        maxFieldBytes: 4 * 1024 * 1024,
+        maxTotalBytes: 8 * 1024 * 1024,
+        lookbackMessages: 32,
+        hydrateMultiverseHypervisor: isMvhActive,
+    });
 }
 
 function resolveMessageIndexForOption(activeChat, rawMsgId) {
@@ -1434,20 +1505,37 @@ function installEventSourceHooks(explicitEv = null) {
         const chatChangedEvent = (ctx && ctx.eventTypes && ctx.eventTypes.CHAT_CHANGED) || 'chat_id_changed';
         const chatLoadedEvent = (ctx && ctx.eventTypes && ctx.eventTypes.CHAT_LOADED) || 'chatLoaded';
         const charEditorEvent = (ctx && ctx.eventTypes && ctx.eventTypes.CHARACTER_EDITOR_OPENED) || 'character_editor_opened';
+        const generationStartedEvent = (ctx && ctx.eventTypes && ctx.eventTypes.GENERATION_STARTED) || 'generation_started';
 
         subscribeFirst(wiLoadedEvent, async (payload) => {
             await ensureCurrentSelectionHydrated();
             worldbookFastScanner.warmFromLoadedEvent(payload);
         });
 
+        subscribeFirst(generationStartedEvent, async () => {
+            await prehydrateGenerationContext().catch(() => false);
+        });
+
+        const syncScrollerAfterChatEvent = () => {
+            const latestCtx = getActiveStContext();
+            const autoScroll = !(latestCtx && latestCtx.powerUserSettings && latestCtx.powerUserSettings.auto_scroll_chat_to_bottom === false);
+            if (scrollerInstance) {
+                scrollerInstance.update();
+                scrollerInstance.syncScrollToBottomIfPending({ autoScroll });
+            }
+            if (iframePoolInstance && iframePoolInstance.isEnabled) {
+                iframePoolInstance.reconcilePool();
+            }
+        };
+
         subscribeFirst(chatChangedEvent, async () => {
             installExtensionReadHooks();
+            protectActiveChatTail();
             await Promise.all([
                 ensureCurrentSelectionHydrated(),
                 warmActiveChatColdReads().catch(() => false),
             ]);
-            if (scrollerInstance) scrollerInstance.reset();
-            if (iframePoolInstance) iframePoolInstance.clearSnapshots();
+            syncScrollerAfterChatEvent();
             pruneCharactersInMemory();
             updateTelemetryUI();
         });
@@ -1459,7 +1547,7 @@ function installEventSourceHooks(explicitEv = null) {
                 ensureCurrentSelectionHydrated(),
                 warmActiveChatColdReads().catch(() => false),
             ]);
-            if (scrollerInstance) scrollerInstance.update();
+            syncScrollerAfterChatEvent();
             pruneCharactersInMemory();
             updateTelemetryUI();
         });
@@ -1530,7 +1618,10 @@ async function initExtension() {
         if (typeof document !== 'undefined') {
             scrollerInstance = new VirtualScroller('#chat', {
                 maxVisibleItems: 18,
-                estimatedItemHeight: 120
+                estimatedItemHeight: 120,
+                onChatCleared: () => {
+                    if (iframePoolInstance) iframePoolInstance.clearSnapshots();
+                },
             });
             scrollerInstance.init();
 

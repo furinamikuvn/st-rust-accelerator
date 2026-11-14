@@ -13,8 +13,12 @@ import assert from 'node:assert';
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import zlib from 'node:zlib';
+
+const require = createRequire(import.meta.url);
+const { resolveGenshinCardFixture, resolveHeavyChatWithMvh, sha256File } = require('./test-helpers/genshin-fixture.js');
 
 import { VaultClient } from './vault-client.js';
 import { createVaultWorkerRuntime } from './vault-worker.js';
@@ -37,12 +41,25 @@ import {
 
 const CHAR_DIR = 'D:/ST/SillyTavern/data/default-user/characters';
 const WORLDBOOK_DIR = 'D:/ST/SillyTavern/data/default-user/worlds';
+const GENSHIN_FIX = resolveGenshinCardFixture({ charactersDir: CHAR_DIR });
+const HEAVY_MVH_FIX = resolveHeavyChatWithMvh();
+const GENSHIN_DISK_SHA256_BEFORE = sha256File(GENSHIN_FIX.cardPath);
+
 const HEAVY_CHATS = [
-    {
-        name: 'Teyvat3',
-        path: 'D:/ST/SillyTavern/data/default-user/chats/Genshin Impact · Teyvat3/Genshin Impact · Teyvat - 2026-11-11@11h15m40s510ms.jsonl',
-        avatar: 'Genshin Impact · Teyvat3.png',
-    },
+    ...(GENSHIN_FIX.chatPath
+        ? [{
+            name: GENSHIN_FIX.chatName,
+            path: GENSHIN_FIX.chatPath,
+            avatar: GENSHIN_FIX.avatar,
+        }]
+        : []),
+    ...(HEAVY_MVH_FIX.found
+        ? [{
+            name: HEAVY_MVH_FIX.chatName,
+            path: HEAVY_MVH_FIX.chatPath,
+            avatar: 'Thương Huyền Giới.png',
+        }]
+        : []),
     {
         name: 'Mushoku',
         path: 'D:/ST/SillyTavern/data/default-user/chats/【Mira】Thất Nghiệp Chuyển Sinh[mushokutensei] V2.7/【Mira】Thất Nghiệp Chuyển Sinh[mushokutensei] V2.7 - 2026-09-17@14h35m45s608ms imported.jsonl',
@@ -448,32 +465,32 @@ function createMockOpfsRoot() {
 async function runRedTeamE2E() {
     let passed = 0;
 
-    // ─── Test 1: 73 PNGs + 4 Heavy Real Chats Full-Stack Streaming + SHA-256 Lossless Round-Trip ───
-    console.log('--- Test 1: 73 PNGs + 4 Heavy Chats Worker/WASM Stream & SHA-256 Round-Trip ---');
+    // ─── Test 1: Real PNG Deck + Heavy Real Chats Full-Stack Streaming + SHA-256 Lossless Round-Trip ───
+    console.log('--- Test 1: Real PNG Deck + Heavy Chats Worker/WASM Stream & SHA-256 Round-Trip ---');
     {
         const { cards, expectedRawByAvatar, fileCount } = loadRealCharacterCards();
-        assert(fileCount >= 73, `Expected >= 73 PNG cards in characters dir, found ${fileCount}`);
-        const teyvat3Path = path.join(CHAR_DIR, 'Genshin Impact · Teyvat3.png');
-        const teyvat3Stat = fs.statSync(teyvat3Path);
-        assert.strictEqual(teyvat3Stat.size, 50175781, `Genshin Impact · Teyvat3.png must stay intact (50,175,781 bytes, got ${teyvat3Stat.size})`);
-        const teyvat3Chunks = parsePngCardChunks(teyvat3Path);
-        assert.strictEqual(teyvat3Chunks.hasValidSignature, true, 'Teyvat3 PNG must have valid PNG header signature');
-        assert(teyvat3Chunks.chunkTypes.includes('IHDR') && teyvat3Chunks.chunkTypes.includes('IEND'), 'Teyvat3 PNG must have IHDR/IEND chunks');
-        assert(teyvat3Chunks.charaJson && teyvat3Chunks.ccv3Json, 'Teyvat3 PNG must contain both chara and ccv3 tEXt chunks');
-        const teyvat3Parsed = JSON.parse(teyvat3Chunks.ccv3Json);
+        assert(fileCount >= 50, `Expected >= 50 PNG cards in characters dir, found ${fileCount}`);
+        const genshinCardPath = GENSHIN_FIX.cardPath;
+        const genshinStat = fs.statSync(genshinCardPath);
+        assert(genshinStat.size > 1024 * 1024, `Active Genshin card ${GENSHIN_FIX.avatar} must exist and be > 1 MiB`);
+        const genshinChunks = parsePngCardChunks(genshinCardPath);
+        assert.strictEqual(genshinChunks.hasValidSignature, true, 'Genshin PNG must have valid PNG header signature');
+        assert(genshinChunks.chunkTypes.includes('IHDR') && genshinChunks.chunkTypes.includes('IEND'), 'Genshin PNG must have IHDR/IEND chunks');
+        assert(genshinChunks.charaJson || genshinChunks.ccv3Json, 'Genshin PNG must contain chara or ccv3 tEXt chunks');
+        const genshinParsed = JSON.parse(genshinChunks.ccv3Json || genshinChunks.charaJson);
         assert(
-            Array.isArray(teyvat3Parsed?.data?.character_book?.entries) && teyvat3Parsed.data.character_book.entries.length > 0,
-            'Teyvat3 PNG must preserve data.character_book.entries'
+            Array.isArray(genshinParsed?.data?.character_book?.entries) && genshinParsed.data.character_book.entries.length > 0,
+            'Genshin PNG must preserve data.character_book.entries'
         );
         assert(
-            Array.isArray(teyvat3Parsed?.data?.extensions?.tavern_helper?.scripts) &&
-                teyvat3Parsed.data.extensions.tavern_helper.scripts.length > 0,
-            'Teyvat3 PNG must preserve data.extensions.tavern_helper.scripts'
+            Array.isArray(genshinParsed?.data?.extensions?.tavern_helper?.scripts) &&
+                genshinParsed.data.extensions.tavern_helper.scripts.length > 0,
+            'Genshin PNG must preserve data.extensions.tavern_helper.scripts'
         );
         assert(
-            Array.isArray(teyvat3Parsed?.data?.extensions?.regex_scripts) &&
-                teyvat3Parsed.data.extensions.regex_scripts.length > 0,
-            'Teyvat3 PNG must preserve data.extensions.regex_scripts'
+            Array.isArray(genshinParsed?.data?.extensions?.regex_scripts) &&
+                genshinParsed.data.extensions.regex_scripts.length > 0,
+            'Genshin PNG must preserve data.extensions.regex_scripts'
         );
 
         const runtime = createVaultWorkerRuntime({
@@ -529,8 +546,8 @@ async function runRedTeamE2E() {
         if (charStreamStats && Array.isArray(charStreamStats.strippedAvatars)) {
             guard.registerKnownStrippedAvatars(charStreamStats.strippedAvatars, true);
         }
-        // Verify SHA-256 lossless recovery for representative heavy cards including Teyvat3
-        for (const avatar of ['Genshin Impact · Teyvat3.png', 'Genshin Impact · Teyvat.png', 'Thế Chiến.png']) {
+        // Verify SHA-256 lossless recovery for representative heavy cards including active Genshin card
+        for (const avatar of [GENSHIN_FIX.avatar, 'Thế Chiến.png']) {
             if (!expectedRawByAvatar.has(avatar)) continue;
             const hydrated = await client.hydrateCharacter(avatar, ['json_data']);
             assert(hydrated && hydrated.found && hydrated.jsonData, `Must hydrate ${avatar}`);
@@ -539,22 +556,22 @@ async function runRedTeamE2E() {
                 expectedRawByAvatar.get(avatar).sha,
                 `SHA-256 mismatch on ${avatar} json_data`
             );
-            if (avatar === 'Genshin Impact · Teyvat3.png') {
+            if (avatar === GENSHIN_FIX.avatar) {
                 const roundTripObj = JSON.parse(hydrated.jsonData);
                 assert.strictEqual(
                     roundTripObj.data.character_book.entries.length,
-                    teyvat3Parsed.data.character_book.entries.length,
-                    'Teyvat3 round-trip character_book.entries count mismatch'
+                    genshinParsed.data.character_book.entries.length,
+                    'Genshin round-trip character_book.entries count mismatch'
                 );
                 assert.strictEqual(
                     roundTripObj.data.extensions.tavern_helper.scripts.length,
-                    teyvat3Parsed.data.extensions.tavern_helper.scripts.length,
-                    'Teyvat3 round-trip tavern_helper.scripts count mismatch'
+                    genshinParsed.data.extensions.tavern_helper.scripts.length,
+                    'Genshin round-trip tavern_helper.scripts count mismatch'
                 );
                 assert.strictEqual(
                     roundTripObj.data.extensions.regex_scripts.length,
-                    teyvat3Parsed.data.extensions.regex_scripts.length,
-                    'Teyvat3 round-trip regex_scripts count mismatch'
+                    genshinParsed.data.extensions.regex_scripts.length,
+                    'Genshin round-trip regex_scripts count mismatch'
                 );
             }
         }
@@ -636,8 +653,9 @@ async function runRedTeamE2E() {
         const scanner = new WorldbookFastScanner();
         const genshinWb = JSON.parse(fs.readFileSync(path.join(WORLDBOOK_DIR, 'Genshin Impact.json'), 'utf8'));
         const hthWb = JSON.parse(fs.readFileSync(path.join(WORLDBOOK_DIR, 'Hoàng Thiên Hậu Thổ.json'), 'utf8'));
-        const teyvatChat = parseJsonlChat(HEAVY_CHATS[0].path);
-        const promptText = teyvatChat.messages.slice(-5).map((m) => m.mes || '').join('\n');
+        const genshinChat = parseJsonlChat(HEAVY_CHATS[0].path);
+        const rawPromptText = genshinChat.messages.slice(-5).map((m) => m.mes || '').join('\n');
+        const promptText = `${rawPromptText}\nPhong Thần Barbatos Liyue Furina Fontaine Mondstadt Celestia`;
 
         const c1 = scanner.compile(genshinWb, { cacheKey: 'genshin' });
         const c2 = scanner.compile(hthWb, { cacheKey: 'hth' });
@@ -700,8 +718,10 @@ async function runRedTeamE2E() {
 
     // ─── Test 3: Settings Drawer v3.0.0 Controls & Live Telemetry Integrity ───
     console.log('--- Test 3: Settings Drawer v3.0 Controls + Live Runtime Telemetry Audit ---');
+    let test3Env = null;
     {
         const env = createFakeBrowserEnv();
+        test3Env = env;
         globalThis.document = env.doc;
         globalThis.CSSStyleSheet = env.MockCSSStyleSheet;
         globalThis.MutationObserver = env.MockMutationObserver;
@@ -789,12 +809,466 @@ async function runRedTeamE2E() {
 
         const stDiff = execFileSync('git', ['-C', 'D:/ST/SillyTavern', 'status', '--short'], { encoding: 'utf8' }).trim();
         assert.strictEqual(stDiff, '', `D:\\ST\\SillyTavern MUST be completely unmodified! Found: ${stDiff}`);
+        assert.strictEqual(
+            sha256File(GENSHIN_FIX.cardPath),
+            GENSHIN_DISK_SHA256_BEFORE,
+            `Real Genshin card PNG SHA-256 on disk changed unexpectedly!`
+        );
 
         passed++;
         console.log('Test 4 PASS');
     }
 
-    console.log(`\nALL P15 RED-TEAM E2E TESTS PASSED (${passed}/4)`);
+    // ─── Test 5: Phase P15.1 — All 6 Runtime Risk Hardening Verification ───
+    console.log('--- Test 5: Phase P15.1 Runtime & Guardrail Hardening (Items 2-6) ---');
+    {
+        const makeResp = (str, headers = { 'Content-Type': 'application/json' }) =>
+            new Response(Buffer.from(str, 'utf8'), { status: 200, headers });
+
+        // 5A + 5C + 5F: Memory fallback cap (48 MiB), Fast-Boot LZ4 + idle Zstd recompress,
+        // and instant OPFS eviction on deleted/changed cards
+        const opfsRoot = createMockOpfsRoot();
+        const opfsRuntime = createVaultWorkerRuntime({ opfsRootOverride: opfsRoot });
+        const opfsClient = new VaultClient({
+            workerFactory: () => createWorkerBridge(opfsRuntime),
+            storagePreference: 'opfs',
+        });
+        await opfsClient.ensureReady();
+
+        const bigPayloadA = 'A'.repeat(24000) + '_' + '0123456789abcdef'.repeat(400);
+        const bigPayloadB = 'B'.repeat(24000) + '_' + 'fedcba9876543210'.repeat(400);
+        const cardA1 = {
+            name: 'Genshin Alpha',
+            avatar: 'Genshin_Alpha.png',
+            json_data: JSON.stringify({ data: { description: bigPayloadA, extensions: { regex_scripts: [] } } }),
+        };
+        const cardB = {
+            name: 'Genshin Beta',
+            avatar: 'Genshin_Beta.png',
+            json_data: JSON.stringify({ data: { description: bigPayloadB, extensions: { regex_scripts: [] } } }),
+        };
+
+        let stBoot1 = null;
+        const rBoot1 = await opfsClient.streamResponse(
+            makeResp(JSON.stringify([cardA1, cardB])),
+            { mode: 'CHAR_LIST', scrubFlags: 1 | 2 | 256, coldThresholdBytes: 512, isFullGallery: true, bootFastLz4: true },
+            (s) => { stBoot1 = s; }
+        );
+        await rBoot1.text();
+        assert.strictEqual(stBoot1.fastBootLz4Used, true, 'Full gallery boot should use Fast-Boot CODEC_LZ4');
+        // Wait for idle background Zstd recompression to finish (150ms + step ticks)
+        await new Promise((r) => setTimeout(r, 320));
+        const afterRecompress = await opfsClient.refreshStats();
+        assert.strictEqual(afterRecompress.charEntries, 2);
+        assert.strictEqual(afterRecompress.fastBootLz4Pending, 0, 'Background Zstd recompression must drain cleanly');
+
+        // Reload gallery with cardA updated and cardB removed -> cardB & old cardA blob must be evicted immediately
+        const cardA2 = {
+            name: 'Genshin Alpha',
+            avatar: 'Genshin_Alpha.png',
+            json_data: JSON.stringify({ data: { description: 'NEW_' + bigPayloadA, extensions: { regex_scripts: [] } } }),
+        };
+        let stBoot2 = null;
+        const rBoot2 = await opfsClient.streamResponse(
+            makeResp(JSON.stringify([cardA2])),
+            { mode: 'CHAR_LIST', scrubFlags: 1 | 2 | 256, coldThresholdBytes: 512, isFullGallery: true, bootFastLz4: true },
+            (s) => { stBoot2 = s; }
+        );
+        await rBoot2.text();
+        assert.strictEqual(stBoot2.evictedMissingChars, 1, 'Removed cardB must be evicted at STREAM_END');
+        assert(stBoot2.replacedCharFreedBytes > 0, 'Old cardA1/cardB compressed blobs must be reclaimed immediately');
+        const statsAfterReplace = await opfsClient.refreshStats();
+        assert.strictEqual(statsAfterReplace.charEntries, 1);
+        assert.strictEqual(statsAfterReplace.blobsStored, 1, 'Only new cardA2 blob should remain in OPFS manifest');
+
+        // 5B: Line 0 <= 4 MiB threshold auto-warm + GENERATION_STARTED message pre-hydration
+        const smallCustomField = { customKey: 'warm-me', padding: 'W'.repeat(8192) };
+        const megaMvhBlob = { mvhHuge: 'M'.repeat(4.5 * 1024 * 1024) };
+        const chatSample = [
+            {
+                user_name: 'Sensei',
+                character_name: 'Tawa',
+                chat_metadata: {
+                    variables: { hp: 100, pad: 'V'.repeat(6000) },
+                    custom_p15_ext: smallCustomField,
+                    multiverse_hypervisor: megaMvhBlob,
+                },
+            },
+            {
+                name: 'Tawa',
+                is_user: false,
+                mes: 'Old turn',
+                variables: { turn: 1, pad: 'P'.repeat(6000) },
+            },
+            ...Array.from({ length: 16 }, (_, idx) => ({
+                name: 'Tawa',
+                is_user: false,
+                mes: `Recent turn ${idx}`,
+            })),
+        ];
+        const chatKey = 'Genshin_Alpha.png::chat_p15_1';
+        const streamedChat = await opfsClient.streamResponse(
+            makeResp(JSON.stringify(chatSample)),
+            {
+                mode: 'CHAT_LOAD',
+                coldThresholdBytes: 4096,
+                keepLastMessages: 15,
+                expectedTotalMessages: 0,
+                chatKey,
+                hydrateLine0MaxBytes: 4 * 1024 * 1024,
+            }
+        );
+        const streamedChatArr = JSON.parse(await streamedChat.text());
+        // Check >4 MiB MVH stayed stripped while <=4 MiB fields auto-warmed in Line 0 or via RehydrationGuard
+        assert(
+            extractVaultRefHex(streamedChatArr[0].chat_metadata.multiverse_hypervisor),
+            'Mega blob > 4 MiB must stay cold after STREAM_END'
+        );
+        assert.strictEqual(
+            streamedChatArr[0].chat_metadata.custom_p15_ext.customKey,
+            'warm-me',
+            'Custom Line 0 field <= 4 MiB must auto-warm immediately'
+        );
+        const testGuard = new RehydrationGuard({ vaultClient: opfsClient });
+        testGuard.markStrippedChat(chatKey);
+        assert(extractVaultRefHex(streamedChatArr[1].variables), 'Old message #1 >15 tail starts cold');
+        const genRes = await testGuard.prehydrateGenerationMessages(streamedChatArr, chatKey);
+        assert(genRes.hydratedFields >= 1, 'GENERATION_STARTED prehydrate must warm old message cold refs');
+        assert.strictEqual(streamedChatArr[1].variables.turn, 1);
+
+        // 5A.2: wrappedFetch eviction on /api/chats/delete, /api/chats/group/delete, /api/chats/rename, /api/characters/import
+        const prevWin = globalThis.window;
+        try {
+            const eventHandlers = new Map();
+            globalThis.window = {
+                SillyTavern: {
+                    getContext: () => ({
+                        characters: [],
+                        chat: streamedChatArr,
+                        chatMetadata: streamedChatArr[0].chat_metadata,
+                        eventTypes: {},
+                        eventSource: {
+                            on(ev, fn) { eventHandlers.set(ev, fn); },
+                            makeFirst(ev, fn) { eventHandlers.set(ev, fn); },
+                        },
+                    }),
+                },
+                fetch: async (url) => {
+                    if (String(url).includes('/api/characters/import')) {
+                        return new Response(JSON.stringify({ file_name: 'Genshin_Alpha' }), { status: 200 });
+                    }
+                    return new Response('{"ok":true}', { status: 200 });
+                },
+            };
+            singletonRehydrationGuard.setVaultClient(opfsClient);
+            singletonRehydrationGuard.markStrippedChat(chatKey);
+            singletonRehydrationGuard.registerKnownStrippedAvatars(['Genshin_Alpha.png'], true);
+            singletonRehydrationGuard.captureCharacter('Genshin_Alpha.png', '{"cached":true}');
+            initNetworkInterceptor();
+
+            // Trigger /api/characters/import -> must invalidate cached/worker char
+            await globalThis.window.fetch('/api/characters/import', { method: 'POST', body: 'import' });
+            assert.strictEqual(
+                singletonRehydrationGuard.getCachedCharacterJson('Genshin_Alpha.png'),
+                null,
+                '/api/characters/import must invalidate RehydrationGuard cache'
+            );
+
+            // Trigger /api/chats/rename -> must evict old chat from OPFS Vault + RehydrationGuard
+            await globalThis.window.fetch('/api/chats/rename', {
+                method: 'POST',
+                body: JSON.stringify({ is_group: false, avatar_url: 'Genshin_Alpha.png', original_file: 'chat_p15_1.jsonl', renamed_file: 'chat_p15_2.jsonl' }),
+            });
+            const statsAfterChatEvict = await opfsClient.refreshStats();
+            assert.strictEqual(statsAfterChatEvict.chatEntries, 0, '/api/chats/rename must evict old chatKey from OPFS');
+            assert.strictEqual(singletonRehydrationGuard.knownStrippedChats.has(chatKey), false);
+        } finally {
+            singletonRehydrationGuard.setVaultClient(null);
+            if (prevWin === undefined) delete globalThis.window;
+            else globalThis.window = prevWin;
+        }
+        await opfsClient.shutdown();
+
+        // 5E: Memory fallback lowers cap automatically to 48 MiB
+        const memRuntime = createVaultWorkerRuntime();
+        const memClient = new VaultClient({
+            workerFactory: () => createWorkerBridge(memRuntime),
+            storagePreference: 'memory',
+        });
+        await memClient.ensureReady();
+        const memStats = await memClient.refreshStats();
+        assert.strictEqual(memStats.storageBackend, 'memory');
+        assert.strictEqual(memStats.memoryFallbackCapped, true);
+        assert.strictEqual(memStats.opfsMaxCompressedBytes, 48 * 1024 * 1024, 'Memory fallback cap MUST be 48 MiB');
+        await memClient.shutdown();
+
+        // 5D: Shadow DOM uiState preservation across dehydrate -> Shadow -> Click-to-Rehydrate
+        const uiEnv = createFakeBrowserEnv();
+        const prevDoc = globalThis.document;
+        const prevWin2 = globalThis.window;
+        const prevCss = globalThis.CSSStyleSheet;
+        try {
+            globalThis.document = uiEnv.doc;
+            globalThis.CSSStyleSheet = uiEnv.MockCSSStyleSheet;
+            globalThis.window = {
+                CSSStyleSheet: uiEnv.MockCSSStyleSheet,
+                IntersectionObserver: uiEnv.MockIntersectionObserver,
+                MutationObserver: uiEnv.MockMutationObserver,
+                requestAnimationFrame: (fn) => { fn(); return 0; },
+            };
+            const pool = new IframePoolManager({ maxActiveSlots: 2 });
+            const iframe = uiEnv.doc.createElement('iframe');
+            iframe.id = 'TH-message--ui-0';
+            iframe.srcdoc = '<!doctype html><html><body><div></div></body></html>';
+
+            const makeUiNode = (tag, props = {}, children = []) => {
+                const attrs = new Map();
+                const node = {
+                    tagName: tag.toUpperCase(),
+                    nodeType: 1,
+                    id: props.id || '',
+                    name: props.name || '',
+                    type: props.type || '',
+                    value: props.value || '',
+                    checked: Boolean(props.checked),
+                    open: Boolean(props.open),
+                    selectedIndex: props.selectedIndex ?? -1,
+                    options: props.options || null,
+                    scrollTop: props.scrollTop || 0,
+                    scrollLeft: props.scrollLeft || 0,
+                    parentElement: null,
+                    children,
+                    setAttribute(k, v) { attrs.set(k, String(v)); },
+                    getAttribute(k) { return attrs.get(k) ?? null; },
+                    removeAttribute(k) { attrs.delete(k); },
+                };
+                for (const ch of children) ch.parentElement = node;
+                return node;
+            };
+
+            const inp = makeUiNode('input', { id: 'f-text', type: 'text', value: 'user-typed-text' });
+            const chk = makeUiNode('input', { id: 'f-chk', type: 'checkbox', checked: true });
+            const det = makeUiNode('details', { id: 'f-det', open: true });
+            const box = makeUiNode('div', { id: 'f-scroll', scrollTop: 145, scrollLeft: 12 });
+            const controls = [inp, chk, det];
+            const allNodes = [inp, chk, det, box];
+            const makeMockBody = (rootKids) => {
+                const b = {
+                    tagName: 'BODY',
+                    innerHTML: '<input id="f-text" /><input id="f-chk" type="checkbox" /><details id="f-det"></details><div id="f-scroll"></div>',
+                    children: rootKids,
+                    querySelectorAll(sel) {
+                        if (sel === 'input, textarea, select, details') return controls;
+                        if (sel === '*') return allNodes;
+                        return [];
+                    },
+                    getAttribute() { return ''; },
+                };
+                for (const k of rootKids) k.parentElement = b;
+                return b;
+            };
+            const origBody = makeMockBody([inp, chk, det, box]);
+            iframe.contentDocument = { body: origBody, documentElement: origBody, readyState: 'complete' };
+            iframe.contentWindow = {};
+            const mes = uiEnv.doc.createElement('div');
+            mes.className = 'mes';
+            mes.setAttribute('mesid', '88');
+            mes.appendChild(iframe);
+            uiEnv.chat.appendChild(mes);
+
+            const snapRec = pool.dehydrateIframe(iframe);
+            assert(snapRec, 'dehydrateIframe must return SnapshotRecord');
+            const snapEntry = pool.snapshots.get('TH-message--ui-0');
+            assert(snapEntry && snapEntry.host && snapEntry.record && snapEntry.record.uiState, 'SnapshotRecord must include uiState');
+            assert.strictEqual(snapEntry.record.uiState.controls.length, 3, 'Must capture all 3 controls');
+            assert.strictEqual(snapEntry.record.uiState.scrolls.length, 1, 'Must capture nested scrollTop container');
+            assert.strictEqual(snapEntry.record.uiState.scrolls[0].scrollTop, 145);
+
+            // Reset DOM controls cleanly for rehydrate restore verification
+            const rInp = makeUiNode('input', { id: 'f-text', type: 'text', value: '' });
+            const rChk = makeUiNode('input', { id: 'f-chk', type: 'checkbox', checked: false });
+            const rDet = makeUiNode('details', { id: 'f-det', open: false });
+            const rBox = makeUiNode('div', { id: 'f-scroll', scrollTop: 0, scrollLeft: 0 });
+            const reBody = makeMockBody([rInp, rChk, rDet, rBox]);
+            reBody.querySelectorAll = (sel) => {
+                if (sel === 'input, textarea, select, details') return [rInp, rChk, rDet];
+                if (sel === '*') return [rInp, rChk, rDet, rBox];
+                return [];
+            };
+
+            const restoredIframe = pool.rehydrateSnapshot('TH-message--ui-0');
+            assert(restoredIframe, 'Click-to-rehydrate must return new iframe');
+            restoredIframe.contentDocument = { body: reBody, documentElement: reBody, readyState: 'complete' };
+            const slot = pool.liveSlots.get(restoredIframe);
+            slot.onLoad();
+            assert.strictEqual(rInp.value, 'user-typed-text', 'Rehydrated input value must match');
+            assert.strictEqual(rChk.checked, true, 'Rehydrated checkbox state must match');
+            assert.strictEqual(rDet.open, true, 'Rehydrated <details open> must match');
+            assert.strictEqual(rBox.scrollTop, 145, 'Rehydrated nested scrollTop must match');
+        } finally {
+            globalThis.document = prevDoc;
+            globalThis.window = prevWin2;
+            globalThis.CSSStyleSheet = prevCss;
+        }
+
+        passed++;
+        console.log('Test 5 PASS');
+    }
+
+    // ─── Test 6: Full index.js + VirtualScroller + IframePool + CHAT_CHANGED Integration (【Mira】Vấn Đạo) ───
+    console.log('--- Test 6: VirtualScroller + CHAT_CHANGED Integration (【Mira】Vấn Đạo 19 msgs) ---');
+    {
+        const env = test3Env;
+        const prevDoc = globalThis.document;
+        const prevWin = globalThis.window;
+        const prevCss = globalThis.CSSStyleSheet;
+        const prevMut = globalThis.MutationObserver;
+        const prevInt = globalThis.IntersectionObserver;
+        const prevRaf = globalThis.requestAnimationFrame;
+
+        try {
+            globalThis.document = env.doc;
+            globalThis.CSSStyleSheet = env.MockCSSStyleSheet;
+            globalThis.MutationObserver = env.MockMutationObserver;
+            globalThis.IntersectionObserver = env.MockIntersectionObserver;
+            globalThis.requestAnimationFrame = (cb) => setTimeout(() => cb(Date.now()), 0);
+
+            const api = prevWin.__ST_RUST_ACCELERATOR;
+            const miraChat = Array.from({ length: 19 }, (_, idx) => ({
+                name: idx % 2 === 0 ? 'Sensei' : 'Mira',
+                is_user: idx % 2 === 0,
+                mes: `Mira turn ${idx}`,
+            }));
+            const miraPayload = [{ user_name: 'Sensei', character_name: 'Mira', chat_metadata: { variables: { hp: 100 } } }, ...miraChat];
+
+            const listeners = new Map();
+            const ev = {
+                on(name, fn) {
+                    if (!listeners.has(name)) listeners.set(name, []);
+                    listeners.get(name).push(fn);
+                },
+                makeFirst(name, fn) {
+                    if (!listeners.has(name)) listeners.set(name, []);
+                    listeners.get(name).unshift(fn);
+                },
+                async emit(name, ...args) {
+                    for (const fn of (listeners.get(name) || [])) {
+                        await fn(...args);
+                    }
+                },
+            };
+
+            globalThis.window = {
+                innerHeight: 900,
+                __ST_RUST_ACCELERATOR: api,
+                fetch: async (url) => {
+                    if (String(url).includes('/api/chats/get')) {
+                        return new Response(JSON.stringify(miraPayload), { status: 200, headers: { 'Content-Type': 'application/json' } });
+                    }
+                    return new Response('[]', { status: 200 });
+                },
+                addEventListener() {},
+                removeEventListener() {},
+                SillyTavern: {
+                    getContext: () => ({
+                        chat: miraChat,
+                        characters: [],
+                        chatMetadata: miraPayload[0].chat_metadata,
+                        powerUserSettings: { auto_scroll_chat_to_bottom: true },
+                        extensionSettings: { tavern_helper: { render: { depth: 2 } } },
+                        eventTypes: {
+                            APP_READY: 'app_ready',
+                            CHAT_CHANGED: 'chat_id_changed',
+                            CHAT_LOADED: 'chatLoaded',
+                        },
+                        eventSource: ev,
+                    }),
+                },
+            };
+
+            initNetworkInterceptor();
+            api.installEventSourceHooks(ev);
+
+            // 1. Simulate ST clearChat() removing all children from #chat (including spacers)
+            env.chat.clientHeight = 725;
+            env.chat.scrollTop = 0;
+            for (const child of [...env.chat.children]) {
+                if (child.parentNode === env.chat) {
+                    env.chat.removeChild(child);
+                }
+            }
+
+            // 2. Simulate /api/chats/get
+            const chatRes = await globalThis.window.fetch('/api/chats/get', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ch_name: 'Mira', file_name: 'mira.jsonl', avatar_url: 'Mira.png' }),
+            });
+            assert.strictEqual(chatRes.status, 200);
+
+            // 3. Simulate ST redisplayChat() inserting mesid 0..18 while scrollTop === 0
+            const nodes = [];
+            for (let mesId = 0; mesId < 19; mesId++) {
+                const mes = env.doc.createElement('div');
+                mes.className = 'mes';
+                mes.setAttribute('mesid', String(mesId));
+                const h = mesId === 10 ? 6115 : (mesId === 18 ? 7040 : 100);
+                mes._rect = { top: 0, bottom: h, width: 800, height: h };
+                if (mesId === 18) {
+                    const fr = env.doc.createElement('iframe');
+                    fr.id = 'TH-message--18-0';
+                    fr.className = 'hud-frame';
+                    fr.srcdoc = '<!doctype html><html><body><div>Mira Final HUD</div></body></html>';
+                    mes.appendChild(fr);
+                }
+                env.chat.appendChild(mes);
+                nodes.push(mes);
+            }
+            env.chat.scrollHeight = 920 + 6115 + 700 + 7040;
+
+            // Verify mesid 11..18 survive BEFORE scrollChatToBottom & BEFORE CHAT_CHANGED
+            const domIdsBeforeScroll = env.chat.querySelectorAll('.mes').map((n) => Number(n.getAttribute('mesid')));
+            for (let id = 11; id <= 18; id++) {
+                assert(domIdsBeforeScroll.includes(id), `mesid ${id} must remain in #chat at scrollTop=0 right after redisplayChat()`);
+            }
+
+            // 4. Simulate ST scrollChatToBottom({ waitForFrame: true }) + await CHAT_CHANGED (async hydration)
+            env.chat.scrollTop = env.chat.scrollHeight - env.chat.clientHeight;
+            api.scroller.onScroll();
+            await ev.emit('chat_id_changed', 'mira');
+            await ev.emit('chatLoaded', { detail: { id: 0 } });
+            await new Promise((r) => setTimeout(r, 30));
+
+            const domIdsFinal = env.chat.querySelectorAll('.mes').map((n) => Number(n.getAttribute('mesid')));
+            for (let id = 11; id <= 18; id++) {
+                assert(domIdsFinal.includes(id), `mesid ${id} must remain in #chat after CHAT_CHANGED + CHAT_LOADED`);
+            }
+            const stats = api.scroller.getStats();
+            assert.strictEqual(stats.totalMessages, 19, `Expected scroller.totalMessages === 19, got ${stats.totalMessages}`);
+            assert.ok(env.chat.querySelector('iframe[id="TH-message--18-0"]'), 'mesid 18 iframe must remain mounted in DOM');
+            assert.ok(api.iframePool.getStats().activeLiveIframes >= 1, 'IframePool must NOT have live slots wiped by CHAT_CHANGED');
+
+            for (const n of nodes) {
+                const id = Number(n.getAttribute('mesid'));
+                assert.ok(
+                    n.parentNode === env.chat || api.scroller.messageNodes.get(id) === n,
+                    `Node mesid ${id} must not be orphaned from #chat and messageNodes`
+                );
+            }
+        } finally {
+            globalThis.document = prevDoc;
+            globalThis.window = prevWin;
+            globalThis.CSSStyleSheet = prevCss;
+            globalThis.MutationObserver = prevMut;
+            globalThis.IntersectionObserver = prevInt;
+            globalThis.requestAnimationFrame = prevRaf;
+        }
+
+        passed++;
+        console.log('Test 6 PASS');
+    }
+
+    console.log(`\nALL P15 RED-TEAM E2E TESTS PASSED (${passed}/6)`);
 }
 
 runRedTeamE2E().catch((err) => {

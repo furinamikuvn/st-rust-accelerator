@@ -823,6 +823,7 @@ class RootArrayTailBuffer {
 class CharAvatarElementTracker {
     constructor(isArrayRoot) {
         this.started = false;
+        this.arrayClosed = false;
         this.isArrayRoot = isArrayRoot;
         this.depth = 0;
         this.inString = false;
@@ -911,6 +912,9 @@ class CharAvatarElementTracker {
                     this.expectKey = true;
                     this.awaitingColon = false;
                     this.expectValueForAvatar = false;
+                } else if (b === 0x5D) {
+                    this.depth = 0;
+                    this.arrayClosed = true;
                 }
                 continue;
             }
@@ -1437,6 +1441,8 @@ async function rawSpliceVaultRefsInJsonBytes(u8, fetchRawEntryFn, fetchJsValueFn
 /**
  * Instantiates a Worker Vault runtime engine (works in Browser Dedicated Worker and Node test harnesses).
  */
+const MEMORY_BACKEND_MAX_COMPRESSED_BYTES = 48 * 1024 * 1024;
+
 export function createVaultWorkerRuntime(overrides = {}) {
     const sessionTag = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
     let initialized = false;
@@ -1450,6 +1456,107 @@ export function createVaultWorkerRuntime(overrides = {}) {
         : 180 * 1024 * 1024;
     const streams = new Map();
     const hotBlobCache = new Map(); // Bounded tiny decoded ref cache cleared post-hydrate if desired
+    const pendingZstdRecompress = new Set();
+    let recompressTimer = null;
+    let recompressInFlight = false;
+
+    function isMemoryBackend() {
+        return Boolean(backend && backend.name === 'memory');
+    }
+
+    function getEffectiveMaxCompressedBytes() {
+        if (isMemoryBackend()) {
+            return opfsMaxCompressedBytes > 0
+                ? Math.min(opfsMaxCompressedBytes, MEMORY_BACKEND_MAX_COMPRESSED_BYTES)
+                : MEMORY_BACKEND_MAX_COMPRESSED_BYTES;
+        }
+        return opfsMaxCompressedBytes;
+    }
+
+    function clearRecompressTimer() {
+        if (recompressTimer !== null) {
+            clearTimeout(recompressTimer);
+            recompressTimer = null;
+        }
+    }
+
+    async function runOneBackgroundRecompressStep() {
+        if (!initialized || !backend || codecPref !== constants.codecZstd || pendingZstdRecompress.size === 0) {
+            pendingZstdRecompress.clear();
+            return;
+        }
+        if (streams.size > 0) {
+            scheduleBackgroundRecompress(250);
+            return;
+        }
+        recompressInFlight = true;
+        let touched = false;
+        try {
+            const hash64 = pendingZstdRecompress.values().next().value;
+            pendingZstdRecompress.delete(hash64);
+            const entry = manifest.blobs[hash64];
+            if (entry && entry.codec === 'lz4') {
+                const container = await backend.getBlob(entry);
+                if (container) {
+                    const rawBytes = decodeStv3Container(container, constants);
+                    const maxFrame = constants.wasmBlobBufBytes || 524288;
+                    const baseFlags = entry.flags !== undefined ? entry.flags : determineStv3Flags(entry.fieldPath || '');
+                    const isChunked = rawBytes.byteLength > maxFrame;
+                    const encoded = encodeChunksToStv3Frames(
+                        [rawBytes],
+                        maxFrame,
+                        isChunked ? (baseFlags | constants.stv3FlagChunked) : baseFlags,
+                        constants.codecZstd
+                    );
+                    const zstdBytes = concatUint8Arrays(encoded.frames, encoded.totalBytes);
+                    if (manifest.blobs[hash64]) {
+                        const prevComp = entry.compressedBytes || 0;
+                        const loc = await backend.putBlob(hash64, zstdBytes, entry.storage !== 'pack' || isChunked);
+                        manifest.blobs[hash64] = {
+                            ...entry,
+                            ...loc,
+                            compressedBytes: zstdBytes.byteLength,
+                            codec: 'zstd',
+                        };
+                        manifest.metrics.totalCompressedBytes = Math.max(
+                            0,
+                            manifest.metrics.totalCompressedBytes - prevComp + zstdBytes.byteLength
+                        );
+                        touched = true;
+                    }
+                }
+            }
+            if (touched && pendingZstdRecompress.size === 0) {
+                const compRes = await backend.compactPack(manifest, { force: false });
+                if (compRes.compactedFiles > 0) {
+                    manifest.metrics.packCompactions += compRes.compactedFiles;
+                }
+                await backend.saveManifest(manifest);
+            } else if (touched) {
+                await backend.saveManifest(manifest);
+            }
+        } catch (_) {
+            // Non-fatal idle optimization: keep existing valid LZ4 blob intact
+        } finally {
+            recompressInFlight = false;
+        }
+        if (pendingZstdRecompress.size > 0 && initialized) {
+            scheduleBackgroundRecompress(40);
+        }
+    }
+
+    function scheduleBackgroundRecompress(delayMs = 150) {
+        if (overrides.disableBackgroundRecompress === true) return;
+        if (pendingZstdRecompress.size === 0 || codecPref !== constants.codecZstd) return;
+        if (recompressTimer !== null || recompressInFlight) return;
+        recompressTimer = setTimeout(() => {
+            recompressTimer = null;
+            void runOneBackgroundRecompressStep();
+        }, delayMs);
+        if (recompressTimer && typeof recompressTimer.unref === 'function') {
+            recompressTimer.unref();
+        }
+    }
 
     function setActiveCodec(pref) {
         if (pref === 'lz4' || pref === constants.codecLz4) {
@@ -1511,7 +1618,8 @@ export function createVaultWorkerRuntime(overrides = {}) {
     }
 
     async function enforceStorageCap(protectedChatKey = '', protectedCharSet = null) {
-        if (!opfsMaxCompressedBytes || manifest.metrics.totalCompressedBytes <= opfsMaxCompressedBytes) {
+        const effectiveCap = getEffectiveMaxCompressedBytes();
+        if (!effectiveCap || manifest.metrics.totalCompressedBytes <= effectiveCap) {
             return { evictedCount: 0, freedBytes: 0, compactedFiles: 0 };
         }
         const candidates = [];
@@ -1539,7 +1647,7 @@ export function createVaultWorkerRuntime(overrides = {}) {
 
         let evictedCount = 0;
         let freedBytes = 0;
-        for (let i = 0; i < candidates.length && manifest.metrics.totalCompressedBytes > opfsMaxCompressedBytes; i++) {
+        for (let i = 0; i < candidates.length && manifest.metrics.totalCompressedBytes > effectiveCap; i++) {
             const c = candidates[i];
             if (c.kind === 'chat' && manifest.chats[c.key]) {
                 const hashes = manifest.chats[c.key].hashes || [];
@@ -1694,6 +1802,7 @@ export function createVaultWorkerRuntime(overrides = {}) {
             stream.dedupHits++;
         } else {
             const baseFlags = determineStv3Flags(meta.fieldPath);
+            const activeWriteCodec = stream.writeCodec || codecPref;
             // Encode any remaining raw slices cleanly (<= 512 KiB/frame)
             if (blobState.pendingBytes > 0) {
                 const isChunked = blobState.encodedFrames.length > 0 || blobState.pendingBytes > (constants.wasmBlobBufBytes || 524288);
@@ -1701,7 +1810,7 @@ export function createVaultWorkerRuntime(overrides = {}) {
                     blobState.pendingSlices,
                     constants.wasmBlobBufBytes || 524288,
                     isChunked ? (baseFlags | constants.stv3FlagChunked) : baseFlags,
-                    codecPref
+                    activeWriteCodec
                 );
                 for (let i = 0; i < remEncoded.frames.length; i++) {
                     blobState.encodedFrames.push(remEncoded.frames[i]);
@@ -1714,6 +1823,7 @@ export function createVaultWorkerRuntime(overrides = {}) {
             blobState.encodedFrames = [];
 
             const loc = await backend.putBlob(hash64, containerBytes, rawBytesLen > (constants.wasmBlobBufBytes || 524288));
+            const codecLabel = activeWriteCodec === constants.codecLz4 ? 'lz4' : 'zstd';
             manifest.blobs[hash64] = {
                 ...loc,
                 rawBytes: rawBytesLen,
@@ -1721,7 +1831,12 @@ export function createVaultWorkerRuntime(overrides = {}) {
                 valueKind,
                 fieldPath: meta.fieldPath,
                 flags: baseFlags,
+                codec: codecLabel,
             };
+            if (activeWriteCodec === constants.codecLz4 && codecPref === constants.codecZstd && rawBytesLen >= 16384) {
+                pendingZstdRecompress.add(hash64);
+                stream.fastBootLz4Hashes.add(hash64);
+            }
             manifest.metrics.totalRawBytes += rawBytesLen;
             manifest.metrics.totalCompressedBytes += containerBytes.byteLength;
             if (meta.fieldPath === 'variables' || meta.fieldPath === 'swipes') {
@@ -1741,7 +1856,11 @@ export function createVaultWorkerRuntime(overrides = {}) {
                     manifest.chars[avatar] = Object.create(null);
                     stream.manifestDirty = true;
                 }
-                if (manifest.chars[avatar][meta.fieldPath] !== hash64) {
+                const prevHash = manifest.chars[avatar][meta.fieldPath];
+                if (prevHash !== hash64) {
+                    if (prevHash) {
+                        stream.replacedCharHashes.push(prevHash);
+                    }
                     manifest.chars[avatar][meta.fieldPath] = hash64;
                     stream.manifestDirty = true;
                 }
@@ -1760,12 +1879,16 @@ export function createVaultWorkerRuntime(overrides = {}) {
         } else {
             if (meta.elementIndex === 0) {
                 stream.line0Hashes.push(hash64);
-                if (stream.hydrateLine0KeySet && rawBytesLen <= stream.hydrateLine0MaxBytes) {
-                    const subKey = meta.fieldPath.startsWith('chat_metadata.')
-                        ? meta.fieldPath.slice('chat_metadata.'.length)
-                        : meta.fieldPath;
-                    const leafKey = subKey.includes('.') ? subKey.slice(subKey.lastIndexOf('.') + 1) : subKey;
-                    if (stream.hydrateLine0KeySet.has(subKey) || stream.hydrateLine0KeySet.has(leafKey)) {
+                if (rawBytesLen <= stream.hydrateLine0MaxBytes) {
+                    if (stream.hydrateLine0KeySet) {
+                        const subKey = meta.fieldPath.startsWith('chat_metadata.')
+                            ? meta.fieldPath.slice('chat_metadata.'.length)
+                            : meta.fieldPath;
+                        const leafKey = subKey.includes('.') ? subKey.slice(subKey.lastIndexOf('.') + 1) : subKey;
+                        if (stream.hydrateLine0KeySet.has(subKey) || stream.hydrateLine0KeySet.has(leafKey)) {
+                            stream.line0AutoHydrateHashes.add(hash64);
+                        }
+                    } else if (stream.hydrateLine0SizeOnly) {
                         stream.line0AutoHydrateHashes.add(hash64);
                     }
                 }
@@ -1808,6 +1931,7 @@ export function createVaultWorkerRuntime(overrides = {}) {
             }
         }
         const maxFrame = constants.wasmBlobBufBytes || 524288;
+        const activeWriteCodec = (stream && stream.writeCodec) || codecPref;
         if (stream.activeRawSlices && stream.activeRawSlices.size > 0) {
             for (const blobState of stream.activeRawSlices.values()) {
                 if (blobState.pendingBytes >= maxFrame) {
@@ -1815,7 +1939,7 @@ export function createVaultWorkerRuntime(overrides = {}) {
                     const flags = determineStv3Flags(blobState.fieldPath) | constants.stv3FlagChunked;
                     let off = 0;
                     while (off + maxFrame <= merged.byteLength) {
-                        const frame = stv3EncodeChunk(merged.subarray(off, off + maxFrame), flags, codecPref, Date.now());
+                        const frame = stv3EncodeChunk(merged.subarray(off, off + maxFrame), flags, activeWriteCodec, Date.now());
                         blobState.encodedFrames.push(frame);
                         blobState.encodedBytes += frame.byteLength;
                         off += maxFrame;
@@ -1872,7 +1996,8 @@ export function createVaultWorkerRuntime(overrides = {}) {
                         coreVersion: getWasmCoreVersion(),
                         storageBackend: backend.name,
                         codecPreference: codecPrefName,
-                        opfsMaxCompressedBytes,
+                        opfsMaxCompressedBytes: getEffectiveMaxCompressedBytes(),
+                        memoryFallbackCapped: isMemoryBackend(),
                         linearMemoryBytes: getLinearMemoryBytes(),
                         hasSharedArrayBuffer: false,
                         opfsSupported: backend.name === 'opfs-sync',
@@ -1881,6 +2006,10 @@ export function createVaultWorkerRuntime(overrides = {}) {
 
                 case 'SET_CODEC': {
                     const activeName = setActiveCodec(payload.codecPreference);
+                    if (codecPref === constants.codecLz4) {
+                        clearRecompressTimer();
+                        pendingZstdRecompress.clear();
+                    }
                     return wrapOk({
                         codecPreference: activeName,
                         codecId: codecPref,
@@ -1931,19 +2060,31 @@ export function createVaultWorkerRuntime(overrides = {}) {
                     const hydrateLine0Keys = Array.isArray(payload.hydrateLine0Keys) && payload.hydrateLine0Keys.length > 0
                         ? payload.hydrateLine0Keys.map((k) => String(k))
                         : null;
-                    const hydrateLine0MaxBytes =
-                        Number(payload.hydrateLine0MaxBytes) > 0
-                            ? Number(payload.hydrateLine0MaxBytes)
-                            : 32 * 1024 * 1024;
+                    const hasExplicitLine0Max = Number(payload.hydrateLine0MaxBytes) > 0;
+                    const hydrateLine0SizeOnly = !hydrateLine0Keys && hasExplicitLine0Max;
+                    const hydrateLine0MaxBytes = hasExplicitLine0Max
+                        ? Number(payload.hydrateLine0MaxBytes)
+                        : 32 * 1024 * 1024;
+                    const holdLine0 = Boolean(hydrateLine0Keys || hydrateLine0SizeOnly);
+                    const isFullGallery = modeNum === constants.scrubModeCharList && !payload.avatar && payload.isFullGallery !== false;
+                    const useFastBootLz4 =
+                        modeNum === constants.scrubModeCharList &&
+                        isFullGallery &&
+                        codecPref === constants.codecZstd &&
+                        (payload.bootFastLz4 === true || (payload.bootFastLz4 !== false && Object.keys(manifest.chars).length === 0));
                     const stream = {
                         streamId: payload.streamId,
                         mode: modeNum,
                         keepLastMessages,
                         expectedTotalMessages,
                         explicitAvatar: payload.avatar || '',
+                        isFullGallery,
+                        writeCodec: useFastBootLz4 ? constants.codecLz4 : codecPref,
+                        fastBootLz4Hashes: new Set(),
                         chatKey: payload.chatKey || 'active_chat',
                         hydrateTailAllRefs: Boolean(payload.hydrateTailAllRefs),
                         hydrateLine0KeySet: hydrateLine0Keys ? new Set(hydrateLine0Keys) : null,
+                        hydrateLine0SizeOnly,
                         hydrateLine0MaxBytes,
                         line0AutoHydrateHashes: new Set(),
                         dedupCharSubtrees,
@@ -1957,14 +2098,15 @@ export function createVaultWorkerRuntime(overrides = {}) {
                         dedupHits: 0,
                         touchedHashes: new Set(),
                         strippedAvatars: new Set(),
+                        replacedCharHashes: [],
                         pendingCharFields: new Map(),
                         line0Hashes: [],
                         msgRefHashes: Object.create(null),
                         readyToStoreQueue: [],
                         activeRawSlices,
                         tailBuffer:
-                            modeNum === constants.scrubModeChatLoad && expectedTotalMessages === 0 && (keepLastMessages > 0 || Boolean(hydrateLine0Keys))
-                                ? new RootArrayTailBuffer(keepLastMessages, Boolean(hydrateLine0Keys))
+                            modeNum === constants.scrubModeChatLoad && expectedTotalMessages === 0 && (keepLastMessages > 0 || holdLine0)
+                                ? new RootArrayTailBuffer(keepLastMessages, holdLine0)
                                 : null,
                         charTracker:
                             modeNum === constants.scrubModeCharList
@@ -1994,7 +2136,11 @@ export function createVaultWorkerRuntime(overrides = {}) {
                                                 stream.manifestDirty = true;
                                             }
                                             for (let i = 0; i < pending.length; i++) {
-                                                if (manifest.chars[avatar][pending[i].fieldPath] !== pending[i].hash64) {
+                                                const prevHash = manifest.chars[avatar][pending[i].fieldPath];
+                                                if (prevHash !== pending[i].hash64) {
+                                                    if (prevHash) {
+                                                        stream.replacedCharHashes.push(prevHash);
+                                                    }
                                                     manifest.chars[avatar][pending[i].fieldPath] = pending[i].hash64;
                                                     stream.manifestDirty = true;
                                                 }
@@ -2175,7 +2321,11 @@ export function createVaultWorkerRuntime(overrides = {}) {
                                     stream.manifestDirty = true;
                                 }
                                 for (let i = 0; i < pending.length; i++) {
-                                    if (manifest.chars[avatar][pending[i].fieldPath] !== pending[i].hash64) {
+                                    const prevHash = manifest.chars[avatar][pending[i].fieldPath];
+                                    if (prevHash !== pending[i].hash64) {
+                                        if (prevHash) {
+                                            stream.replacedCharHashes.push(prevHash);
+                                        }
                                         manifest.chars[avatar][pending[i].fieldPath] = pending[i].hash64;
                                         stream.manifestDirty = true;
                                     }
@@ -2187,6 +2337,41 @@ export function createVaultWorkerRuntime(overrides = {}) {
                             }
                         }
                         stream.pendingCharFields.clear();
+                    }
+
+                    // Hạng mục 2: Instant OPFS eviction when cards are removed or updated in full gallery stream
+                    let evictedMissingChars = 0;
+                    let replacedCharFreedBytes = 0;
+                    if (stream.mode === constants.scrubModeCharList) {
+                        if (stream.isFullGallery && stream.charTracker && stream.charTracker.isArrayRoot && stream.charTracker.arrayClosed) {
+                            const seenAvatars = new Set(stream.charTracker.avatarsByElem.values());
+                            for (const av of Object.keys(manifest.chars)) {
+                                if (!seenAvatars.has(av)) {
+                                    const rec = manifest.chars[av];
+                                    if (rec) {
+                                        for (const fp of Object.keys(rec)) {
+                                            if (rec[fp]) stream.replacedCharHashes.push(rec[fp]);
+                                        }
+                                    }
+                                    delete manifest.chars[av];
+                                    if (manifest.lru && manifest.lru.chars) {
+                                        delete manifest.lru.chars[av];
+                                    }
+                                    evictedMissingChars++;
+                                    stream.manifestDirty = true;
+                                }
+                            }
+                        }
+                        if (stream.replacedCharHashes.length > 0) {
+                            replacedCharFreedBytes = await pruneUnreferencedBlobs(stream.replacedCharHashes);
+                            if (replacedCharFreedBytes > 0) {
+                                const compRes = await backend.compactPack(manifest, { force: false });
+                                if (compRes.compactedFiles > 0) {
+                                    manifest.metrics.packCompactions += compRes.compactedFiles;
+                                }
+                                stream.manifestDirty = true;
+                            }
+                        }
                     }
 
                     // Rehydrate hot last-K tail messages for MODE_CHAT_LOAD unknown-length stream
@@ -2241,7 +2426,8 @@ export function createVaultWorkerRuntime(overrides = {}) {
 
                     await backend.endBatch();
 
-                    if (manifest.metrics.totalCompressedBytes > opfsMaxCompressedBytes) {
+                    const effectiveCap = getEffectiveMaxCompressedBytes();
+                    if (effectiveCap > 0 && manifest.metrics.totalCompressedBytes > effectiveCap) {
                         const capRes = await enforceStorageCap(
                             stream.mode === constants.scrubModeChatLoad ? stream.chatKey : '',
                             stream.strippedAvatars
@@ -2259,6 +2445,9 @@ export function createVaultWorkerRuntime(overrides = {}) {
 
                     const scrubberStats = finishRes ? finishRes.stats : null;
                     streams.delete(payload.streamId);
+                    if (stream.fastBootLz4Hashes.size > 0 && codecPref === constants.codecZstd) {
+                        scheduleBackgroundRecompress(150);
+                    }
 
                     const tail = concatUint8Arrays(tailParts);
                     const ab = tail.byteOffset === 0 && tail.byteLength === tail.buffer.byteLength
@@ -2275,6 +2464,10 @@ export function createVaultWorkerRuntime(overrides = {}) {
                                 storedNewBlobs: stream.storedNewBlobs,
                                 dedupHits: stream.dedupHits,
                                 deltaStrippedBytes: stream.deltaStrippedBytes,
+                                evictedMissingChars,
+                                replacedCharFreedBytes,
+                                fastBootLz4Used: stream.writeCodec === constants.codecLz4,
+                                fastBootLz4Pending: pendingZstdRecompress.size,
                                 strippedAvatars: Array.from(stream.strippedAvatars),
                                 linearMemoryBytes: getLinearMemoryBytes(),
                                 storageBackend: backend.name,
@@ -2552,7 +2745,9 @@ export function createVaultWorkerRuntime(overrides = {}) {
                         initialized,
                         storageBackend: backend ? backend.name : 'none',
                         codecPreference: codecPrefName,
-                        opfsMaxCompressedBytes,
+                        opfsMaxCompressedBytes: getEffectiveMaxCompressedBytes(),
+                        memoryFallbackCapped: isMemoryBackend(),
+                        fastBootLz4Pending: pendingZstdRecompress.size,
                         opfsSupported: backend ? backend.name === 'opfs-sync' : false,
                         hasSharedArrayBuffer: false,
                         linearMemoryBytes: initialized ? getLinearMemoryBytes() : 0,
@@ -2572,6 +2767,8 @@ export function createVaultWorkerRuntime(overrides = {}) {
                 }
 
                 case 'SHUTDOWN': {
+                    clearRecompressTimer();
+                    pendingZstdRecompress.clear();
                     streams.clear();
                     hotBlobCache.clear();
                     if (backend) {

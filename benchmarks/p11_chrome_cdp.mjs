@@ -21,11 +21,16 @@ import { spawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
+import { cleanupOrphanedCdpTempDirs, killProcessTree, removeDirWithRetry } from './cdp-cleanup.mjs';
+
+const require = createRequire(import.meta.url);
+const { resolveGenshinCardFixture, resolveHeavyChatWithMvh } = require('../test-helpers/genshin-fixture.js');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,8 +40,9 @@ const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrom
 const CHAR_DIR = 'D:/ST/SillyTavern/data/default-user/characters';
 const MUSHOKU_PATH =
     'D:/ST/SillyTavern/data/default-user/chats/【Mira】Thất Nghiệp Chuyển Sinh[mushokutensei] V2.7/【Mira】Thất Nghiệp Chuyển Sinh[mushokutensei] V2.7 - 2026-09-17@14h35m45s608ms imported.jsonl';
-const TEYVAT_PATH =
-    'D:/ST/SillyTavern/data/default-user/chats/Genshin Impact · Teyvat3/Genshin Impact · Teyvat - 2026-11-11@11h15m40s510ms.jsonl';
+const _genshinFix = resolveGenshinCardFixture({ charactersDir: CHAR_DIR });
+const _heavyMvhFix = resolveHeavyChatWithMvh();
+const TEYVAT_PATH = _heavyMvhFix.found ? _heavyMvhFix.chatPath : _genshinFix.chatPath;
 
 function sha256(input) {
     return crypto.createHash('sha256').update(input).digest('hex');
@@ -815,17 +821,18 @@ async function runChromeBenchmark() {
         throw new Error(`Google Chrome not found at ${CHROME_PATH}`);
     }
 
+    await cleanupOrphanedCdpTempDirs();
     console.log('=== PHASE P11: REAL GOOGLE CHROME CDP E2E BENCHMARK ===');
     const datasets = loadRealDatasets();
     console.log(
         `Datasets loaded: ${datasets.cardsCount} real PNG cards (${(datasets.cardsBytes / 1048576).toFixed(2)} MB JSON), ` +
         `Mushoku (${(datasets.mushokuJsonBuf.length / 1048576).toFixed(2)} MB), ` +
-        `Teyvat3 (${(datasets.teyvatJsonBuf.length / 1048576).toFixed(2)} MB)`
+        `HeavyMVH (${(datasets.teyvatJsonBuf.length / 1048576).toFixed(2)} MB)`
     );
 
     const { server, port, serverMetrics } = await startTestServer(datasets);
     const origin = `http://127.0.0.1:${port}`;
-    const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'st_rust_p11_cdp_'));
+    const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'st-p11-cdp-'));
 
     const chromeProc = spawn(
         CHROME_PATH,
@@ -926,20 +933,9 @@ async function runChromeBenchmark() {
         console.log(`Server Parity Checks -> Edit: ${serverMetrics.editVerifications.every(e => e.match)} | Chat Saves: ${serverMetrics.chatSaveVerifications.every(s => s.match)} (${serverMetrics.chatSaveVerifications.length} runs) | /api/characters/get calls: ${serverMetrics.charsGetCalls}`);
         console.log('=============================================================');
     } finally {
-        if (process.platform === 'win32') {
-            try { execFileSync('taskkill', ['/PID', String(chromeProc.pid), '/T', '/F'], { stdio: 'ignore' }); } catch (_) {}
-        } else {
-            try { chromeProc.kill('SIGTERM'); } catch (_) {}
-            await new Promise((r) => setTimeout(r, 400));
-            if (chromeProc.exitCode === null) {
-                try { chromeProc.kill('SIGKILL'); } catch (_) {}
-            }
-        }
-        await new Promise((r) => setTimeout(r, 300));
+        await killProcessTree(chromeProc.pid);
         server.close();
-        try {
-            fs.rmSync(userDataDir, { recursive: true, force: true });
-        } catch (_) {}
+        await removeDirWithRetry(userDataDir, 8, 350);
     }
 }
 

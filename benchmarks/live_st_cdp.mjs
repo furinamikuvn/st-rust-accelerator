@@ -15,8 +15,13 @@ import assert from 'node:assert';
 import { execFileSync, spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
+import { cleanupOrphanedCdpTempDirs, killProcessTree, removeDirWithRetry } from './cdp-cleanup.mjs';
+
+const require = createRequire(import.meta.url);
+const { resolveGenshinCardFixture, resolveHeavyChatWithMvh } = require('../test-helpers/genshin-fixture.js');
 
 const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const ST_ROOT = 'D:/ST/SillyTavern';
@@ -25,10 +30,15 @@ const ST_SETTINGS_PATH = path.join(ST_USER_DIR, 'settings.json');
 const CHAR_DIR = path.join(ST_USER_DIR, 'characters');
 const CHATS_DIR = path.join(ST_USER_DIR, 'chats');
 
-const TEYVAT_AVATAR = 'Genshin Impact · Teyvat3.png';
+const GENSHIN_FIXTURE = resolveGenshinCardFixture({ charactersDir: CHAR_DIR, chatsDir: CHATS_DIR });
+const HEAVY_MVH_FIXTURE = resolveHeavyChatWithMvh({ chatsDir: CHATS_DIR });
+
+const TEYVAT_AVATAR = GENSHIN_FIXTURE.avatar;
 const MUSHOKU_AVATAR = '【Mira】Thất Nghiệp Chuyển Sinh[mushokutensei] V2.7.png';
-const TEYVAT_CHAT_NAME = 'Genshin Impact · Teyvat - 2026-11-11@11h15m40s510ms';
-const TEYVAT_CHAT_PATH = path.join(CHATS_DIR, 'Genshin Impact · Teyvat3', `${TEYVAT_CHAT_NAME}.jsonl`);
+const MIRA_VANDAO_AVATAR = '【Mira】Vấn Đạo.png';
+const TEYVAT_CHAT_NAME = GENSHIN_FIXTURE.chatName;
+const TEYVAT_CHAT_PATH = GENSHIN_FIXTURE.chatPath;
+const DISK_PNG_COUNT = fs.readdirSync(CHAR_DIR).filter((f) => f.toLowerCase().endsWith('.png')).length;
 
 const ST_PORT_BASE = 8189;
 const CDP_PORT_BASE = 9349;
@@ -254,25 +264,29 @@ function classifyErrors(consoleErrors, pageExceptions) {
     };
 }
 
-async function runLiveSession({ mode, mushokuChatName, backupRecords }) {
+async function runLiveSession({ mode, mushokuChatName, miraVanDaoChatName, miraExpectedCount, backupRecords }) {
     const isBaseline = mode === 'baseline';
     const stPort = isBaseline ? ST_PORT_BASE : ST_PORT_BASE + 1;
     const cdpPort = isBaseline ? CDP_PORT_BASE : CDP_PORT_BASE + 1;
     const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), `st-live-cdp-${mode}-`));
-    const tempChatFolder = path.join(CHATS_DIR, 'Genshin Impact · Teyvat3');
+    const tempChatFolder = path.join(CHATS_DIR, GENSHIN_FIXTURE.cardName);
     const tempChatName = `__st_rust_live_verify_${Date.now()}`;
     const tempChatPath = path.join(tempChatFolder, `${tempChatName}.jsonl`);
 
-    // Ensure clean starting state for every pass, then toggle disabledExtensions for baseline
+    // Ensure clean starting state for every pass, then toggle disabledExtensions explicitly
     restoreProtectedFiles(backupRecords);
-    if (isBaseline) {
+    {
         const settings = JSON.parse(fs.readFileSync(ST_SETTINGS_PATH, 'utf8'));
         if (!settings.extension_settings) settings.extension_settings = {};
-        const disabled = Array.isArray(settings.extension_settings.disabledExtensions)
+        let disabled = Array.isArray(settings.extension_settings.disabledExtensions)
             ? [...settings.extension_settings.disabledExtensions]
             : [];
-        if (!disabled.includes('third-party/st-rust-accelerator')) {
-            disabled.push('third-party/st-rust-accelerator');
+        if (isBaseline) {
+            if (!disabled.includes('third-party/st-rust-accelerator')) {
+                disabled.push('third-party/st-rust-accelerator');
+            }
+        } else {
+            disabled = disabled.filter((x) => x !== 'third-party/st-rust-accelerator');
         }
         settings.extension_settings.disabledExtensions = disabled;
         fs.writeFileSync(ST_SETTINGS_PATH, JSON.stringify(settings, null, 4), 'utf8');
@@ -354,7 +368,7 @@ async function runLiveSession({ mode, mushokuChatName, backupRecords }) {
             const deadline = Date.now() + 60000;
             while (Date.now() < deadline) {
                 const ctx = window.SillyTavern && window.SillyTavern.getContext && window.SillyTavern.getContext();
-                const charsLoaded = ctx && Array.isArray(ctx.characters) && ctx.characters.length >= 70;
+                const charsLoaded = ctx && Array.isArray(ctx.characters) && ctx.characters.length >= ${DISK_PNG_COUNT};
                 if (${isBaseline}) {
                     if (charsLoaded) break;
                 } else {
@@ -394,9 +408,9 @@ async function runLiveSession({ mode, mushokuChatName, backupRecords }) {
             assert.strictEqual(bootReport.vStats.storageBackend, 'opfs-sync', 'Real Chrome must run opfs-sync backend');
             assert.strictEqual(bootReport.vStats.hasSharedArrayBuffer, false);
             assert(bootReport.vStats.linearMemoryBytes <= 8 * 1024 * 1024, 'WASM linear memory <= 8 MiB');
-            assert(bootReport.vStats.dedupHits >= 70, `Expected PNG subtree dedup hits >= 70, got ${bootReport.vStats.dedupHits}`);
+            assert(bootReport.vStats.dedupHits >= Math.max(60, DISK_PNG_COUNT - 5), `Expected PNG subtree dedup hits >= ${Math.max(60, DISK_PNG_COUNT - 5)}, got ${bootReport.vStats.dedupHits}`);
         }
-        assert(bootReport.charCount >= 74, `Expected >= 74 characters in Live ST, got ${bootReport.charCount}`);
+        assert(bootReport.charCount >= DISK_PNG_COUNT, `Expected >= ${DISK_PNG_COUNT} characters in Live ST, got ${bootReport.charCount}`);
 
         const bootMetrics = await captureCdpMetrics(cdp, profileDir);
 
@@ -487,12 +501,17 @@ async function runLiveSession({ mode, mushokuChatName, backupRecords }) {
                 ],
                 loreState: { activeChapter: 9 },
             };
+            const mvhSource = HEAVY_MVH_FIXTURE.found && HEAVY_MVH_FIXTURE.line0?.chat_metadata?.multiverse_hypervisor
+                ? HEAVY_MVH_FIXTURE.line0.chat_metadata.multiverse_hypervisor
+                : { megaBlob: 'M'.repeat(Math.floor(4.5 * 1024 * 1024)) };
             const hybridLine0 = {
                 ...origTeyvatChat[0],
                 chat_metadata: {
                     ...(origTeyvatChat[0].chat_metadata || {}),
                     variables: largeVars,
                     world_backstage_v1: expectedWorldBackstage,
+                    custom_p15_small: { tag: 'live_auto_warm', payload: 'C'.repeat(8000) },
+                    multiverse_hypervisor: mvhSource,
                 },
             };
             const hybridFullChat = [hybridLine0, ...testMessages];
@@ -519,8 +538,12 @@ async function runLiveSession({ mode, mushokuChatName, backupRecords }) {
 
                 const wbAfterOpen = ctx.chatMetadata.world_backstage_v1;
                 const varsAfterOpen = ctx.chatMetadata.variables;
+                const customAfterOpen = ctx.chatMetadata.custom_p15_small;
+                const mvhAfterOpen = ctx.chatMetadata.multiverse_hypervisor;
                 const wbHasRef = Boolean(wbAfterOpen && wbAfterOpen.__st_rust_vault_ref);
                 const varsHasRef = Boolean(varsAfterOpen && varsAfterOpen.__st_rust_vault_ref);
+                const customWarmOk = Boolean(customAfterOpen && !customAfterOpen.__st_rust_vault_ref && customAfterOpen.tag === 'live_auto_warm');
+                const mvhStayedCold = Boolean(mvhAfterOpen && mvhAfterOpen.__st_rust_vault_ref);
                 const wbValid = Boolean(wbAfterOpen && wbAfterOpen.recoveryPoints && wbAfterOpen.recoveryPoints[0]?.id === 'rp_live_1');
                 const largeVarsCount = varsAfterOpen ? Object.keys(varsAfterOpen).length : 0;
 
@@ -579,6 +602,8 @@ async function runLiveSession({ mode, mushokuChatName, backupRecords }) {
                 return {
                     wbHasRef,
                     varsHasRef,
+                    customWarmOk,
+                    mvhStayedCold,
                     wbValid,
                     largeVarsCount,
                     oldMsgHydratedOnPointer,
@@ -608,6 +633,8 @@ async function runLiveSession({ mode, mushokuChatName, backupRecords }) {
             assert.strictEqual(diskSavedLines.length, hybridFullChat.length);
             assert.strictEqual(liveFeatureReport.wbHasRef, false);
             assert.strictEqual(liveFeatureReport.varsHasRef, false);
+            assert.strictEqual(liveFeatureReport.customWarmOk, true, 'Line 0 <= 4 MiB custom field must auto-warm');
+            assert.strictEqual(liveFeatureReport.mvhStayedCold, true, 'Line 0 > 4 MiB MVH must stay cold when MVH off');
             assert.strictEqual(liveFeatureReport.wbValid, true);
             assert(liveFeatureReport.largeVarsCount >= 60);
             assert.strictEqual(liveFeatureReport.oldMsgHydratedOnPointer, true);
@@ -651,6 +678,62 @@ async function runLiveSession({ mode, mushokuChatName, backupRecords }) {
             })()`, { timeoutMs: 45000 });
         }
 
+        // Open 【Mira】Vấn Đạo (dynamic message count from disk .jsonl) & verify zero tail truncation
+        currentPhase = 'mira-vandao-open';
+        let miraVanDaoReport = null;
+        if (miraVanDaoChatName && miraExpectedCount > 0) {
+            const expectedLastId = miraExpectedCount - 1;
+            const tailIds = Array.from(
+                { length: Math.min(8, miraExpectedCount) },
+                (_, idx) => expectedLastId - idx
+            ).reverse();
+            miraVanDaoReport = await cdp.evaluate(`(async () => {
+                const initCtx = window.SillyTavern.getContext();
+                const chars = initCtx.characters || [];
+                const idx = chars.findIndex((c) => c.avatar === ${JSON.stringify(MIRA_VANDAO_AVATAR)});
+                if (idx >= 0) {
+                    const t0 = performance.now();
+                    for (let attempt = 0; attempt < 20; attempt++) {
+                        await window.SillyTavern.getContext().selectCharacterById(idx);
+                        if (String(window.SillyTavern.getContext().characterId) === String(idx)) break;
+                        await new Promise((r) => setTimeout(r, 250));
+                    }
+                    await new Promise((r) => setTimeout(r, 800));
+                    await window.SillyTavern.getContext().openCharacterChat(${JSON.stringify(miraVanDaoChatName)});
+                    await new Promise((r) => setTimeout(r, 2200));
+                    const ctx = window.SillyTavern.getContext();
+                    const mesEls = Array.from(document.querySelectorAll('#chat .mes'));
+                    const mesIds = mesEls.map((el) => Number(el.getAttribute('mesid'))).filter((n) => !Number.isNaN(n));
+                    const tailIdsExpected = ${JSON.stringify(tailIds)};
+                    const lastMes = document.querySelector('#chat .mes[mesid="${expectedLastId}"]');
+                    const hasAnyIframe = mesEls.some((el) => Boolean(el.querySelector('iframe') || el.querySelector('.st-shadow-snapshot-host')));
+                    const api = window.__ST_RUST_ACCELERATOR;
+                    return {
+                        opened: true,
+                        elapsedMs: Number((performance.now() - t0).toFixed(1)),
+                        chatLen: (ctx.chat || []).length,
+                        domCount: mesEls.length,
+                        mesIds,
+                        expectedLastId: ${expectedLastId},
+                        hasTailIds: tailIdsExpected.every((id) => mesIds.includes(id)),
+                        lastMesHasIframe: Boolean(lastMes && (lastMes.querySelector('iframe') || lastMes.querySelector('.st-shadow-snapshot-host'))),
+                        hasAnyIframe,
+                        lastMesHeight: lastMes ? Math.round(lastMes.getBoundingClientRect().height) : 0,
+                        scrollerStats: api && api.scroller ? api.scroller.getStats() : null,
+                    };
+                }
+                return { opened: false };
+            })()`, { timeoutMs: 45000 });
+            if (miraVanDaoReport && miraVanDaoReport.opened) {
+                assert.strictEqual(miraVanDaoReport.chatLen, miraExpectedCount, `[${mode}] Mira Van Dao chatLen must be ${miraExpectedCount}`);
+                assert.strictEqual(miraVanDaoReport.hasTailIds, true, `[${mode}] Mira Van Dao DOM must retain tail ${JSON.stringify(tailIds)} (got ${JSON.stringify(miraVanDaoReport.mesIds)})`);
+                assert.strictEqual(miraVanDaoReport.hasAnyIframe, true, `[${mode}] Mira Van Dao must retain iframe/snapshot at tail`);
+                if (!isBaseline && miraVanDaoReport.scrollerStats) {
+                    assert.strictEqual(miraVanDaoReport.scrollerStats.totalMessages, miraExpectedCount, `[${mode}] scroller.totalMessages must be ${miraExpectedCount}`);
+                }
+            }
+        }
+
         const finalMetrics = await captureCdpMetrics(cdp, profileDir);
         const errorSummary = classifyErrors(consoleErrors, pageExceptions);
         if (!isBaseline) {
@@ -674,6 +757,7 @@ async function runLiveSession({ mode, mushokuChatName, backupRecords }) {
             teyvatReport,
             teyvatMetrics,
             mushokuReport,
+            miraVanDaoReport,
             finalMetrics,
             liveFeatureReport,
             errorSummary,
@@ -681,10 +765,9 @@ async function runLiveSession({ mode, mushokuChatName, backupRecords }) {
     } finally {
         try { fs.rmSync(tempChatPath, { force: true }); } catch (_) {}
         try { cdp?.close(); } catch (_) {}
-        try { chromeProc?.kill('SIGKILL'); } catch (_) {}
-        try { stProc.kill('SIGKILL'); } catch (_) {}
-        await new Promise((r) => setTimeout(r, 400));
-        try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch (_) {}
+        await killProcessTree(chromeProc?.pid);
+        await killProcessTree(stProc?.pid);
+        await removeDirWithRetry(profileDir, 8, 350);
     }
 }
 
@@ -700,41 +783,68 @@ async function main() {
         throw new Error(`Chrome binary not found at ${CHROME_PATH}`);
     }
 
+    const orphaned = await cleanupOrphanedCdpTempDirs();
+    if (orphaned > 0) {
+        console.log(`[LiveST] Cleaned ${orphaned} orphaned temp dir(s) before startup.`);
+    }
+
     const mushokuChatName = findChatRelativeName(MUSHOKU_AVATAR, 'imported') || null;
     const mushokuChatPath = mushokuChatName
         ? path.join(CHATS_DIR, MUSHOKU_AVATAR.replace(/\.png$/i, ''), `${mushokuChatName}.jsonl`)
         : null;
+    const miraVanDaoChatName = findChatRelativeName(MIRA_VANDAO_AVATAR, '2026-') || null;
+    const miraVanDaoChatPath = miraVanDaoChatName
+        ? path.join(CHATS_DIR, MIRA_VANDAO_AVATAR.replace(/\.png$/i, ''), `${miraVanDaoChatName}.jsonl`)
+        : null;
+    const miraExpectedCount = miraVanDaoChatPath && fs.existsSync(miraVanDaoChatPath)
+        ? Math.max(0, fs.readFileSync(miraVanDaoChatPath, 'utf8').split(/\r?\n/).filter(Boolean).length - 1)
+        : 0;
 
     const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'st-live-bak-'));
     const protectedPaths = [
         path.join(CHAR_DIR, TEYVAT_AVATAR),
         path.join(CHAR_DIR, MUSHOKU_AVATAR),
+        ...(fs.existsSync(path.join(CHAR_DIR, MIRA_VANDAO_AVATAR)) ? [path.join(CHAR_DIR, MIRA_VANDAO_AVATAR)] : []),
         ST_SETTINGS_PATH,
         TEYVAT_CHAT_PATH,
         ...(mushokuChatPath ? [mushokuChatPath] : []),
+        ...(miraVanDaoChatPath ? [miraVanDaoChatPath] : []),
     ];
     const backupRecords = backupProtectedFiles(protectedPaths, backupDir);
+    console.log(`[LiveST] Active Genshin card: ${TEYVAT_AVATAR} (${(GENSHIN_FIXTURE.cardBytes / 1048576).toFixed(2)} MiB) | MVH fixture: ${HEAVY_MVH_FIXTURE.found ? path.basename(HEAVY_MVH_FIXTURE.chatPath) : 'synthetic'} | Mira msgs: ${miraExpectedCount}`);
     console.log(`[LiveST] Backed up ${backupRecords.length} real files to ${backupDir} (SHA-256 protected).`);
 
     try {
         console.log('\n=== PASS 1: BASELINE (st-rust-accelerator DISABLED) ===');
-        const baseline = await runLiveSession({ mode: 'baseline', mushokuChatName, backupRecords });
+        const baseline = await runLiveSession({ mode: 'baseline', mushokuChatName, miraVanDaoChatName, miraExpectedCount, backupRecords });
 
         console.log('\n=== PASS 2: OPTIMIZED (st-rust-accelerator v3.0.0 ENABLED) ===');
-        const optimized = await runLiveSession({ mode: 'optimized', mushokuChatName, backupRecords });
+        const optimized = await runLiveSession({ mode: 'optimized', mushokuChatName, miraVanDaoChatName, miraExpectedCount, backupRecords });
 
         console.log('\n=== A/B COMPARISON REPORT (Real SillyTavern + Chrome CDP) ===');
         console.log('Boot time        :', fmtDelta(baseline.bootMs, optimized.bootMs, ' ms'));
         console.log('Boot PrivateMB   :', fmtDelta(baseline.bootMetrics.rendererPrivateMB, optimized.bootMetrics.rendererPrivateMB, ' MB'));
         console.log('Boot JSHeapUsed  :', fmtDelta(baseline.bootMetrics.jsHeapUsedMB, optimized.bootMetrics.jsHeapUsedMB, ' MB'));
-        console.log('Teyvat3 Open     :', fmtDelta(baseline.teyvatReport.elapsedMs, optimized.teyvatReport.elapsedMs, ' ms'));
-        console.log('Teyvat3 PrivateMB:', fmtDelta(baseline.teyvatMetrics.rendererPrivateMB, optimized.teyvatMetrics.rendererPrivateMB, ' MB'));
-        console.log('Teyvat3 JSHeap   :', fmtDelta(baseline.teyvatMetrics.jsHeapUsedMB, optimized.teyvatMetrics.jsHeapUsedMB, ' MB'));
+        console.log('Genshin Open     :', fmtDelta(baseline.teyvatReport.elapsedMs, optimized.teyvatReport.elapsedMs, ' ms'));
+        console.log('Genshin PrivateMB:', fmtDelta(baseline.teyvatMetrics.rendererPrivateMB, optimized.teyvatMetrics.rendererPrivateMB, ' MB'));
+        console.log('Genshin JSHeap   :', fmtDelta(baseline.teyvatMetrics.jsHeapUsedMB, optimized.teyvatMetrics.jsHeapUsedMB, ' MB'));
         console.log('Final PrivateMB  :', fmtDelta(baseline.finalMetrics.rendererPrivateMB, optimized.finalMetrics.rendererPrivateMB, ' MB'));
         console.log('Final JSHeapUsed :', fmtDelta(baseline.finalMetrics.jsHeapUsedMB, optimized.finalMetrics.jsHeapUsedMB, ' MB'));
         console.log('Final Documents  :', fmtDelta(baseline.finalMetrics.documents, optimized.finalMetrics.documents));
         console.log('Final Frames     :', fmtDelta(baseline.finalMetrics.frames, optimized.finalMetrics.frames));
         console.log('Final DOM Nodes  :', fmtDelta(baseline.finalMetrics.nodes, optimized.finalMetrics.nodes));
+        if (optimized.miraVanDaoReport && optimized.miraVanDaoReport.opened) {
+            console.log('Mira Van Dao DOM :', JSON.stringify({
+                expectedMsgs: miraExpectedCount,
+                baselineDomCount: baseline.miraVanDaoReport?.domCount,
+                optimizedDomCount: optimized.miraVanDaoReport.domCount,
+                hasTailIds: optimized.miraVanDaoReport.hasTailIds,
+                lastMesHasIframe: optimized.miraVanDaoReport.lastMesHasIframe,
+                hasAnyIframe: optimized.miraVanDaoReport.hasAnyIframe,
+                lastMesHeight: optimized.miraVanDaoReport.lastMesHeight,
+                scrollerStats: optimized.miraVanDaoReport.scrollerStats,
+            }));
+        }
 
         console.log('\n=== THIRD-PARTY NOISE & ERROR COMPARISON (Baseline vs Optimized) ===');
         console.log('Baseline Errors  :', JSON.stringify({
@@ -756,7 +866,7 @@ async function main() {
     } finally {
         const restored = restoreProtectedFiles(backupRecords);
         console.log(`[LiveST] Restored & verified SHA-256 for ${restored.length} modified user file(s):`, restored);
-        try { fs.rmSync(backupDir, { recursive: true, force: true }); } catch (_) {}
+        await removeDirWithRetry(backupDir, 8, 350);
     }
 }
 

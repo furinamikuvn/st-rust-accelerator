@@ -86,60 +86,39 @@ Tiện ích không "xóa bớt" dữ liệu của SillyTavern, mà **chuyển ph
 
 ---
 
-## 4. Kế Hoạch Vá Dứt Điểm 7 Rủi Ro Còn Lại & Quy Trình Thay Card Genshin Mới (`Phase P15.1` — Blueprint Cho Phiên Chat Kế Tiếp)
+## 4. Kết Quả Thi Công `Phase P15.1`: Vá Dứt Điểm 7 Rủi Ro Còn Lại & Thích Ứng Card Genshin Mới (🟢 Hoàn Tất)
 
-> **Lưu ý vận hành đặc biệt cho phiên tới:** Sensei chuẩn bị **xóa card Genshin cũ và nạp card Genshin mới** vào SillyTavern. Phiên tới phải kiểm tra trạng thái thực tế của thư mục `D:\ST\SillyTavern\data\default-user\characters\` và `chats/` trước khi chạy test, và triển khai đầy đủ 7 hạng mục dưới đây để vừa triệt tiêu rủi ro kỹ thuật vừa thích ứng 100% với card Genshin mới.
+> **Hiện trạng thực tế đã kiểm chứng:** Đã dọn `Genshin Impact · Teyvat3.png.backup` + `23` thư mục rác `%TEMP%` (`3.68 GB` -> `0`), xác nhận card Genshin mới trên đĩa là `Genshin Impact · Teyvat.png` (`50,175,781` bytes, `SHA-256 = d809346219595835e23139d3cc8b0b0046ba58fc8ec4264f64492de71982913a`, `961` worldbook entries, `16` tavern_helper scripts, `11` regex_scripts) cùng chat mới `Genshin Impact · Teyvat - 2026-11-14@12h08m38s173ms.jsonl` (`0.13 MB`) và chat MVH `Thương Huyền Giới - 2026-11-12@13h34m02s131ms.jsonl` (`7.09 MB`). Toàn bộ 7 hạng mục dưới đây đã thi công và nghiệm thu 100% PASS.
 
-### Hạng Mục 1 — Dọn `3.68 GB` rác `%TEMP%` & Chống rò thư mục Chrome CDP trên Windows
-- **Hiện trạng & Rủi ro:** Hiện có `23` thư mục profile Chrome CDP mồ côi (`st-live-cdp-*`, `st-live-ab-*`, `st-p*-cdp-*`) trong `C:\Users\ADMIN\AppData\Local\Temp` chiếm **`3,676.91 MB` (~3.68 GB)** vì trên Windows tiến trình con của Chrome còn giữ khóa file khi `chromeProc.kill('SIGKILL')`, khiến `fs.rmSync(..., { force: true })` im lặng bỏ qua hoặc văng `EBUSY`.
-- **Phạm vi sửa:** `benchmarks/live_st_cdp.mjs`, `benchmarks/p15_chrome_cdp.mjs` (và dọn sạch `23` thư mục rác `st-*-cdp-*` trong `%TEMP%` lúc mở phiên `P15.1`, tuyệt đối chỉ xóa đúng prefix `st-*-cdp-*` / `st-live-*` trong `%TEMP%`).
-- **Hướng giải quyết:**
-  1. Trong khối `finally` của script CDP trên Windows, kết thúc toàn bộ cây tiến trình bằng `taskkill /F /T /PID <pid>` trước khi xóa profile.
-  2. Bổ sung helper `removeDirWithRetry(dirPath, maxAttempts = 8, delayMs = 350)` thử xóa lại khi gặp `EBUSY`/`EPERM`.
-  3. Quét và dọn các thư mục `st-live-cdp-*`, `st-live-ab-*`, `st-p*-cdp-*` mồ côi đầu phiên test nếu còn sót từ lần crash trước.
+### [x] Hạng Mục 1 — Dọn `3.68 GB` rác `%TEMP%` & Chống rò thư mục Chrome CDP trên Windows
+- **Hiện trạng & Rủi ro (Đã vá):** Đã xóa sạch `23` thư mục profile Chrome CDP mồ côi (`~3,676.91 MB`) trong `%TEMP%`.
+- **Phạm vi đã sửa:** `benchmarks/cdp-cleanup.mjs`, `benchmarks/live_st_cdp.mjs`, `benchmarks/p15_chrome_cdp.mjs`, `benchmarks/p11_chrome_cdp.mjs`, `benchmarks/p13_chrome_cdp.mjs`, `benchmarks/p14_chrome_cdp.mjs`.
+- **Giải pháp đã triển khai:** Bổ sung `killProcessTree(procOrPid)` dùng `taskkill /F /T /PID` trên Windows, `removeDirWithRetry(dirPath, 8, 350)` và `cleanupOrphanedCdpTempDirs()` khi khởi chạy; kiểm chứng sau khi chạy xong `p15_chrome_cdp.mjs` và `live_st_cdp.mjs` chỉ còn **`0`** thư mục `st-*` trong `%TEMP%`.
 
-### Hạng Mục 2 — Thu hồi OPFS tức thì khi Xóa/Đổi tên/Nạp lại Card Genshin & Xóa/Đổi tên Chat
-- **Hiện trạng & Rủi ro:**
-  - Khi Sensei **xóa Card Genshin cũ và nạp Card Genshin mới**: hiện `index.js` (`wrappedFetch`) đã bắt `/api/characters/delete` và `/api/characters/rename` gọi `rehydrationGuard.invalidateCharacter(avatar)` -> `vaultClient.invalidateCharacters({ avatar })`. Tuy nhiên, nếu Sensei xóa/thay file `.png` trực tiếp trong thư mục `characters/` hoặc nạp card mới trùng/khác tên qua `/api/characters/import`, các blob cũ trong `manifest.chars[avatar]` có thể tồn tại thành rác hoặc chờ tới ngưỡng LRU `180 MiB` mới bị dọn.
-  - Ngoài ra, `wrappedFetch` trong `index.js` chưa bắt `/api/chats/delete`, `/api/chats/group/delete`, `/api/chats/rename` (theo mã nguồn core `script.js:1337, 1373, 10624`) để gọi `vaultClient.evictChat(oldChatKey)` ngay khi người dùng xóa hoặc đổi tên chat.
-- **Phạm vi sửa:** `index.js`, `rehydration-guard.js`, `vault-client.js`, `vault-worker.js`.
-- **Hướng giải quyết:**
-  1. Tại `STREAM_END` của luồng `CHAR_LIST` (`/api/characters/all`) trong `vault-worker.js`, đối chiếu tập `Object.keys(manifest.chars)` trước khi cập nhật với tập `avatar` vừa stream về từ server:
-     - Mọi `avatar` có trong `manifest.chars` nhưng **không còn xuất hiện** trong luồng `/api/characters/all` -> tự động xóa khỏi `manifest.chars[avatar]` và đưa toàn bộ hash cũ vào danh sách cần thu hồi.
-     - Mọi `avatar` có nội dung thay đổi (hash `json_data` mới khác hash cũ trong `manifest.chars[avatar]`) -> đưa các hash cũ không còn dùng của `avatar` đó vào `pruneUnreferencedBlobs(oldHashes, contentRefs)` ngay lập tức.
-  2. Trong `index.js` (`wrappedFetch`), đánh chặn thêm `/api/characters/import` (invalidation trước/sau import nếu ghi đè) và các endpoint `/api/chats/delete`, `/api/chats/group/delete`, `/api/chats/rename` để dọn state của `RehydrationGuard` + gọi `vaultClient.evictChat(oldChatKey)` ngay khi server trả `res.ok`.
+### [x] Hạng Mục 2 — Thu hồi OPFS tức thì khi Xóa/Đổi tên/Nạp lại Card Genshin & Xóa/Đổi tên Chat
+- **Phạm vi đã sửa:** `index.js`, `rehydration-guard.js`, `vault-worker.js`.
+- **Giải pháp đã triển khai:**
+  1. Tại `STREAM_END` của luồng `CHAR_LIST` (`isFullGallery && charTracker.isArrayRoot && charTracker.arrayClosed`), đối chiếu `Object.keys(manifest.chars)` với `avatarsByElem` để thu hồi card đã xóa và gọi `pruneUnreferencedBlobs` + `compactPack` ngay cho cả card bị ghi đè/nạp lại có hash mới.
+  2. Trong `index.js` (`wrappedFetch`), đánh chặn thêm `/api/characters/import`, `/api/chats/delete`, `/api/chats/group/delete`, `/api/chats/rename` để dọn state `RehydrationGuard` và gọi `vaultClient.evictChat(oldChatKey)` khi `res.ok`.
 
-### Hạng Mục 3 — Đổi chính sách `Line 0` (`chat_metadata`) từ Whitelist sang Size-Threshold (`<= 4 MiB`) & Pre-hydrate Old Messages
-- **Hiện trạng & Rủi ro:** `index.js` đang dùng danh sách whitelist cố định `hydrateLine0Keys` (`variables`, `world_backstage_v1`, `world_backstage`, `sheets`) để làm ấm `chat[0].chat_metadata`. Các extension thứ 3 không nằm trong danh sách này đọc trực tiếp `chat[0].chat_metadata.<customKey>` có thể gặp `{ "__st_rust_vault_ref": "..." }`. Tương tự, các extension đọc đồng bộ dữ liệu biến/extra của tin nhắn cũ (`< last 15`) trong RAM khi tạo prompt mới có thể gặp cold ref nếu chưa được pre-hydrate.
-- **Phạm vi sửa:** `index.js`, `rehydration-guard.js`, `vault-worker.js`, `docs/G0_CONTRACT.md` (nếu mở rộng field metadata của `HYDRATE_LINE0`).
-- **Hướng giải quyết:**
-  1. Trong `HYDRATE_LINE0` / `warmActiveChatColdReads`, đổi từ whitelist tên key cố định sang **chính sách theo dung lượng (`autoWarmMaxFieldBytes <= 4 * 1024 * 1024`)**: mọi trường `chat[0].chat_metadata[k]` có kích thước blob `<= 4 MiB` tự động được làm ấm ngay khi mở chat; chỉ giữ lạnh các siêu blob `> 4 MiB` (như `multiverse_hypervisor` `44.69 MB` khi tắt MVH, vẫn hỗ trợ on-demand qua `hydrateLine0Field` khi cần).
-  2. Đăng ký hook sự kiện `GENERATION_STARTED` (ưu tiên `eventSource.makeFirst`) để pre-hydrate các trường cần thiết của ngữ cảnh đang dùng hoặc đảm bảo đọc ấm qua `warmReadCache` mà không chặn thao tác UI thường ngày.
+### [x] Hạng Mục 3 — Đổi chính sách `Line 0` (`chat_metadata`) từ Whitelist sang Size-Threshold (`<= 4 MiB`) & Pre-hydrate Old Messages
+- **Phạm vi đã sửa:** `index.js`, `rehydration-guard.js`, `vault-worker.js`.
+- **Giải pháp đã triển khai:**
+  1. Đổi `HYDRATE_LINE0` / `processLoadedChatResponse` / `warmActiveChatColdReads` sang chính sách `hydrateLine0MaxBytes = 4 * 1024 * 1024` (`hydrateLine0SizeOnly`): tự động giữ ấm mọi trường `<= 4 MiB` trong `chat_metadata`, chỉ giữ lạnh siêu blob `> 4 MiB` (như `multiverse_hypervisor` `6.51 MiB` khi tắt MVH).
+  2. Đăng ký hook `GENERATION_STARTED` (`subscribeFirst`) gọi `prehydrateGenerationMessages` (ngân sách `8 MiB`) trước khi lắp prompt.
 
-### Hạng Mục 4 — Giảm thời gian Boot lạnh lần đầu (`+48.5%`) bằng Fast-Boot Codec (`LZ4`) hoặc Deferred Zstd
-- **Hiện trạng & Rủi ro:** Trong phép đo A/B Live ST, lần Boot đầu tiên chưa có cache tăng từ `28,334.3 ms -> 42,063.4 ms` (`+48.5%`) do phải nén đồng bộ `Zstd level 3` trong lúc stream `/api/characters/all` trên `75` thẻ PNG (`~480 MB` JSON).
-- **Phạm vi sửa:** `vault-worker.js`, `index.js`.
-- **Hướng giải quyết:**
-  1. Cung cấp chế độ **Fast-Boot Ingest**: khi chạy `CHAR_LIST` stream có nhiều blob mới (`bootFastLz4` bật theo mặc định hoặc cấu hình trong Settings Drawer), sử dụng `CODEC_LZ4` (nhanh hơn `3.2x` khi nén so với Zstd L3) để đẩy nhanh phản hồi Boot đầu tiên xuống gần Baseline; hoặc giải phóng luồng JSON sạch về Main Thread trước rồi chạy nén Zstd theo batch nhỏ ở Worker idle/background.
-  2. Giữ tùy chọn re-compress sang `Zstd` khi rảnh hoặc theo `#st-rust-codec-select` để cân bằng dung lượng OPFS `~85–120 MB`.
+### [x] Hạng Mục 4 — Giảm thời gian Boot lạnh lần đầu (`+48.5%` -> `+27.3%`) bằng Fast-Boot Codec (`LZ4`) + Background `Zstd`
+- **Phạm vi đã sửa:** `vault-worker.js`, `vault-client.js`, `index.js`.
+- **Giải pháp đã triển khai:** Luồng full gallery `/api/characters/all` dùng `bootFastLz4: true` (`CODEC_LZ4`) khi ghi mới, đồng thời xếp hàng `pendingZstdRecompress` + `scheduleBackgroundRecompress()` để chuyển dần sang `CODEC_ZSTD` ở nền mà không chặn Main Thread (tự hủy an toàn khi chuyển `SET_CODEC('lz4')` hoặc `SHUTDOWN`). Boot delta thực đo trên Live SillyTavern CDP giảm từ `+48.5%` xuống còn **`+27.3%`** (`13,453.4 ms -> 17,131.4 ms`, `Boot PrivateMB -56.9%`, `Boot JSHeapUsed -86.0%`).
 
-### Hạng Mục 5 — Bảo toàn trạng thái Form / `<details open>` / Scroll con khi đóng băng Shadow DOM
-- **Hiện trạng & Rủi ro:** `IframePoolManager` hiện mới lưu/khôi phục `scrollTop` của khung ngoài iframe và snapshot `<canvas>` -> `<img>` PNG khi chuyển `<iframe>` sang Shadow DOM (`dehydrateToShadow`). Các tương tác UI cục bộ bên trong HUD như `<input>`, `<textarea>`, `<select>`, checkbox/radio, `<details open>`, hoặc vùng cuộn lồng nhau (`.scrollable`) có thể bị reset về mặc định HTML gốc nếu `iframe` bị thu hồi rồi bấm `Click-to-Rehydrate` tạo mới lại từ `srcdoc`.
-- **Phạm vi sửa:** `iframe-pool-manager.js`.
-- **Hướng giải quyết:**
-  1. Bổ sung hàm chụp trạng thái UI cục bộ trước khi hủy iframe thành `SnapshotRecord.uiState` (bao gồm `{ path, tag, type, value, checked, selectedIndex, open, scrollTop, scrollLeft }` cho các phần tử có thay đổi so với attribute mặc định).
-  2. Áp các trạng thái hiển thị trực quan (`open`, giá trị, `checked`, `scrollTop`) lên bản Shadow DOM để hiển thị đúng mắt nhìn, và bơm lại vào `iframe.contentDocument` ngay sau khi `rehydrateFromShadow` tải xong DOM.
+### [x] Hạng Mục 5 — Bảo toàn trạng thái Form / `<details open>` / Scroll con khi đóng băng Shadow DOM
+- **Phạm vi đã sửa:** `iframe-pool-manager.js`, `docs/G0_CONTRACT.md`.
+- **Giải pháp đã triển khai:** Bổ sung `captureIframeUiState` & `applyUiStateToRoot` ghi vào `SnapshotRecord.uiState` (`controls` + `scrolls` theo non-script path), đồng bộ lên Shadow DOM (`bodyContainer`) và bơm lại trong `slot.onLoad` khi `Click-to-Rehydrate` (đã kiểm chứng trên Chrome v157 CDP `p15_chrome_cdp.mjs` với `#hud-note-input` và `<details id="hud-details" open>`).
 
-### Hạng Mục 6 — Hạ trần RAM an toàn khi rơi vào `memory` fallback
-- **Hiện trạng & Rủi ro:** Trần `opfsMaxCompressedBytes = 180 MiB` trong `vault-worker.js` thiết kế cho lưu trữ đĩa OPFS/IndexedDB. Nếu trình duyệt chạy chế độ ẩn danh hoặc chặn cả OPFS lẫn IndexedDB khiến `storageBackend === 'memory'`, giữ tới `180 MiB` blob nén ngay trong V8 Worker Heap sẽ làm phản tác dụng tiết kiệm RAM.
-- **Phạm vi sửa:** `vault-worker.js`.
-- **Hướng giải quyết:** Khi `backend.kind === 'memory'`, tự động hạ trần `effectiveMaxCompressedBytes` xuống **`48 MiB`** (được đồng bộ vào `enforceStorageCap` và hiển thị rõ trong `GET_STATS` / Settings Drawer để người dùng biết đang chạy chế độ memory fallback giới hạn `48 MiB`).
+### [x] Hạng Mục 6 — Hạ trần RAM an toàn khi rơi vào `memory` fallback xuống `48 MiB`
+- **Phạm vi đã sửa:** `vault-worker.js`, `vault-client.js`, `index.js`.
+- **Giải pháp đã triển khai:** Tự động áp `MEMORY_BACKEND_MAX_COMPRESSED_BYTES = 48 * 1024 * 1024` khi `backend.kind === 'memory'`, phản ánh `memoryFallbackCapped: true` trong `GET_STATS` và hiển thị `[cap 48 MiB]` trên Settings Drawer.
 
-### Hạng Mục 7 — Cập nhật Bộ Test & Benchmark Tự Động Thích Ứng Với Card Genshin Mới Của Sensei
-- **Hiện trạng & Rủi ro:** Hiện `test_p15_redteam_e2e.js:458` đang khóa cứng `assert.strictEqual(teyvat3Stat.size, 50175781)` và các file `test_p1.js`, `test_p2.js`, `test_p13_iframe_deep_freeze.js`, `benchmarks/p15_chrome_cdp.mjs`, `benchmarks/live_st_cdp.mjs` đang tham chiếu cứng tên `Genshin Impact · Teyvat3.png` (kèm tên file chat cũ). Khi Sensei xóa card Genshin cũ và nạp card Genshin mới:
-  - Test cũ sẽ fail `ENOENT` hoặc fail khẳng định sai byte `50175781` dù hệ thống hoạt động chuẩn.
-- **Phạm vi sửa:** Helper dùng chung (ví dụ `test-helpers/genshin-fixture.js`) và các file `test_p15_redteam_e2e.js`, `test_p1.js`, `test_p2.js`, `test_p13_iframe_deep_freeze.js`, `benchmarks/p15_chrome_cdp.mjs`, `benchmarks/live_st_cdp.mjs`.
-- **Hướng giải quyết:**
-  1. Viết helper `resolveGenshinCardFixture({ charactersDir, chatsDir })` tự động quét card Genshin hiện có trong `D:\ST\SillyTavern\data\default-user\characters` (ưu tiên `Genshin Impact*.png` lớn nhất còn hợp lệ, cho phép override bằng biến môi trường `ST_GENSHIN_CARD`) và tìm file `.jsonl` lớn nhất trong thư mục `chats/<tên card tương ứng>/`.
-  2. Thay kiểm tra kích thước byte cứng `50175781` tại `test_p15_redteam_e2e.js` bằng: kiểm tra kích thước hợp lý (`>= 5 * 1024 * 1024` hoặc khớp động với `fs.statSync(cardPath).size` tại thời điểm bắt đầu test), parse kiểm tra đủ cấu trúc chunk PNG (`IHDR`, `IEND`, `chara`/`ccv3`), xác minh đủ `data.character_book.entries`, `data.extensions.tavern_helper.scripts`, `data.extensions.regex_scripts` (nếu có trong card nguồn), và đối chiếu **SHA-256 100% trước vs sau test** (với mọi chỉnh sửa trên bản sao tạm hoặc backup/restore nguyên vẹn).
-  3. Chuẩn hóa các micro-benchmark legacy ở `test_p1.js` / `test_p2.js` theo thông lượng `MB/s` tương ứng với dung lượng thật của card Genshin mới thay vì cố định theo byte cũ.
+### [x] Hạng Mục 7 — Cập nhật Bộ Test & Benchmark Tự Động Thích Ứng Với Card Genshin Mới Của Sensei
+- **Phạm vi đã sửa:** `test-helpers/genshin-fixture.js`, `test_p1.js`, `test_p2.js`, `test_p4_integration.js`, `test_p10_wasm_streaming.js`, `test_p11_worker_vault.js`, `test_p12_worldbook_tokencache.js`, `test_p13_iframe_deep_freeze.js`, `test_p15_redteam_e2e.js`, `benchmarks/p11_chrome_cdp.mjs`, `benchmarks/p13_chrome_cdp.mjs`, `benchmarks/p14_chrome_cdp.mjs`, `benchmarks/p15_chrome_cdp.mjs`, `benchmarks/live_st_cdp.mjs`.
+- **Giải pháp đã triển khai:** Tự động phát hiện card Genshin active (`ST_GENSHIN_CARD` override hoặc `Genshin Impact*.png` hợp lệ lớn nhất) và chat MVH nặng nhất trên đĩa; xác minh chunk PNG (`IHDR`/`IEND`/`chara`/`ccv3` + `character_book`/`tavern_helper`/`regex_scripts`) và SHA-256 100%; chuẩn hóa micro-benchmark `test_p2.js` theo thông lượng `>= 15 MB/s` (`41.3 MB/s`, `21x` vs ST gốc); thêm `Test 5` trong `test_p15_redteam_e2e.js` phủ trọn bộ Hạng Mục 2–6.

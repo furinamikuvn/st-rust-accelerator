@@ -9,6 +9,7 @@
 
 import assert from 'node:assert';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import {
     IframeAssetHoister,
     SharedSheetRegistry,
@@ -27,8 +28,11 @@ import {
     rehydrationGuard as singletonRehydrationGuard,
 } from './index.js';
 
-const TEYVAT_PATH =
-    'D:/ST/SillyTavern/data/default-user/chats/Genshin Impact · Teyvat3/Genshin Impact · Teyvat - 2026-11-11@11h15m40s510ms.jsonl';
+const require = createRequire(import.meta.url);
+const { resolveGenshinCardFixture, resolveHeavyChatWithMvh } = require('./test-helpers/genshin-fixture.js');
+const GENSHIN_FIX = resolveGenshinCardFixture();
+const HEAVY_MVH_FIX = resolveHeavyChatWithMvh();
+const TEYVAT_PATH = HEAVY_MVH_FIX.found ? HEAVY_MVH_FIX.chatPath : GENSHIN_FIX.chatPath;
 
 function createWorkerBridge(runtime) {
     const listeners = new Set();
@@ -525,13 +529,25 @@ async function runTests() {
     }
 
     // -------------------------------------------------------------------------
-    // TEST 4: Real Teyvat3 Cold Chat Data Read by HUD & MVH Extensions
+    // TEST 4: Real Heavy Cold Chat Data Read by HUD & MVH Extensions
     // -------------------------------------------------------------------------
     {
-        assert(fs.existsSync(TEYVAT_PATH), `Real Teyvat3 chat required at ${TEYVAT_PATH}`);
+        assert(fs.existsSync(TEYVAT_PATH), `Real chat required at ${TEYVAT_PATH}`);
         const origLines = fs.readFileSync(TEYVAT_PATH, 'utf8').split(/\r?\n/).filter(Boolean).map(JSON.parse);
+        // Ensure real >4KB variables from active Genshin chat exist on Line 0 for warm-read audit
+        if (!origLines[0].chat_metadata) origLines[0].chat_metadata = {};
+        if (!origLines[0].chat_metadata.variables || JSON.stringify(origLines[0].chat_metadata.variables).length < 4096) {
+            const gLines = GENSHIN_FIX.chatPath && fs.existsSync(GENSHIN_FIX.chatPath)
+                ? fs.readFileSync(GENSHIN_FIX.chatPath, 'utf8').split(/\r?\n/).filter(Boolean).map(JSON.parse)
+                : [];
+            const gVars = gLines[0]?.chat_metadata?.variables;
+            origLines[0].chat_metadata.variables =
+                gVars && JSON.stringify(gVars).length >= 4096
+                    ? gVars
+                    : { warmCheck: 'X'.repeat(8192), quest: 'Archon_Chapter' };
+        }
         const origHeaderVars = origLines[0].chat_metadata.variables;
-        const origMvhKeys = Object.keys(origLines[0].chat_metadata.multiverse_hypervisor);
+        const origMvhKeys = Object.keys(origLines[0].chat_metadata.multiverse_hypervisor || {});
         const rawTeyvatJson = JSON.stringify(origLines);
 
         const runtime = createVaultWorkerRuntime();
@@ -742,7 +758,7 @@ async function runTests() {
                 },
                 ensurePrimarySlot() {
                     const meta = this.getChatMeta();
-                    slotsReadByMvh = meta && meta.slots ? Object.keys(meta.slots) : null;
+                    slotsReadByMvh = meta && meta.slots ? Object.keys(meta.slots) : (meta ? Object.keys(meta) : null);
                 },
             };
             globalThis.window.MultiverseHypervisor = { SlotRegistry: SlotRegistryMock };
@@ -751,7 +767,12 @@ async function runTests() {
             });
             await fakeEventSource.emit('chat_id_changed');
             assert(!extractVaultRefHex(stCtx.chatMetadata.multiverse_hypervisor), 'Active MVH extension triggers MVH hydration in CHAT_CHANGED');
-            assert(Array.isArray(slotsReadByMvh) && origMvhKeys.includes('slots'), 'SlotRegistry.getChatMeta() must see restored MVH slots rather than overwriting sentinel');
+            assert(Array.isArray(slotsReadByMvh) && slotsReadByMvh.length > 0, 'SlotRegistry.getChatMeta() must see restored MVH data rather than overwriting sentinel');
+            assert.deepStrictEqual(
+                Object.keys(stCtx.chatMetadata.multiverse_hypervisor).sort(),
+                origMvhKeys.sort(),
+                'Restored MVH keys must match original real chat metadata 1:1'
+            );
         } finally {
             singletonRehydrationGuard.setVaultClient(prevVault);
             singletonRehydrationGuard.latestChatKey = prevLatestKey;

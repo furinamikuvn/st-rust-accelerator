@@ -309,6 +309,267 @@ function captureIframeRestoreSpec(iframe, iframeId) {
     return { attrs, srcdoc: String(srcdoc || ''), src: String(src || '') };
 }
 
+/**
+ * Computes a deterministic child-index path relative to `rootBody`, skipping `<script>` elements
+ * so paths align 1:1 between live iframe `body` and script-stripped Shadow DOM `bodyContainer`.
+ *
+ * @param {Element} el
+ * @param {Element} rootBody
+ * @returns {number[]|null}
+ */
+function computeNonScriptPath(el, rootBody) {
+    if (!el || !rootBody || el === rootBody) return [];
+    const path = [];
+    let cur = el;
+    while (cur && cur !== rootBody) {
+        const parent = cur.parentElement;
+        if (!parent || !parent.children) return null;
+        let idx = 0;
+        let found = false;
+        for (let i = 0; i < parent.children.length; i++) {
+            const sib = parent.children[i];
+            if (!sib) continue;
+            if (String(sib.tagName || '').toUpperCase() === 'SCRIPT') continue;
+            if (sib === cur) {
+                found = true;
+                break;
+            }
+            idx++;
+        }
+        if (!found) return null;
+        path.push(idx);
+        cur = parent;
+    }
+    if (cur !== rootBody) return null;
+    path.reverse();
+    return path;
+}
+
+/**
+ * Resolves a node inside `rootBody` from its `computeNonScriptPath`, falling back to `id` / `name`+`tag`.
+ *
+ * @param {Element} rootBody
+ * @param {{ path?: number[]|null, id?: string, name?: string, tag?: string }} item
+ * @returns {Element|null}
+ */
+function resolveNonScriptPath(rootBody, item) {
+    if (!rootBody || !item) return null;
+    if (Array.isArray(item.path) && rootBody.children) {
+        let cur = rootBody;
+        let ok = true;
+        for (let depth = 0; depth < item.path.length; depth++) {
+            const targetIdx = item.path[depth];
+            if (!cur || !cur.children) {
+                ok = false;
+                break;
+            }
+            let nonScriptIdx = 0;
+            let matched = null;
+            for (let i = 0; i < cur.children.length; i++) {
+                const child = cur.children[i];
+                if (!child) continue;
+                if (String(child.tagName || '').toUpperCase() === 'SCRIPT') continue;
+                if (nonScriptIdx === targetIdx) {
+                    matched = child;
+                    break;
+                }
+                nonScriptIdx++;
+            }
+            if (!matched) {
+                ok = false;
+                break;
+            }
+            cur = matched;
+        }
+        if (ok && cur && (!item.tag || String(cur.tagName || '').toUpperCase() === item.tag)) {
+            return cur;
+        }
+    }
+    if (item.id && typeof rootBody.querySelector === 'function') {
+        try {
+            const byId = rootBody.querySelector(`#${item.id.replace(/[^a-zA-Z0-9_-]/g, '\\$&')}`);
+            if (byId) return byId;
+        } catch (_) {}
+    }
+    return null;
+}
+
+/**
+ * Captures volatile local UI state (inputs, selects, checkboxes, `<details open>`, nested scroll offsets)
+ * before an `<iframe>` is collapsed into a Shadow DOM snapshot.
+ *
+ * @param {Document} doc
+ * @returns {{ controls: Array<Object>, scrolls: Array<Object> }}
+ */
+function captureIframeUiState(doc) {
+    const empty = { controls: [], scrolls: [] };
+    if (!doc || !doc.body || typeof doc.body.querySelectorAll !== 'function') return empty;
+
+    const root = doc.body;
+    const controls = [];
+    const scrolls = [];
+
+    try {
+        const controlEls = root.querySelectorAll('input, textarea, select, details');
+        for (let i = 0; i < controlEls.length; i++) {
+            const el = controlEls[i];
+            if (!el) continue;
+            const tag = String(el.tagName || '').toUpperCase();
+            if (tag === 'INPUT' && String(el.type || '').toLowerCase() === 'file') continue;
+
+            const path = computeNonScriptPath(el, root);
+            const base = {
+                path,
+                tag,
+                id: el.id ? String(el.id) : '',
+                name: el.name ? String(el.name) : '',
+            };
+
+            if (tag === 'DETAILS') {
+                controls.push({ ...base, open: Boolean(el.open) });
+            } else if (tag === 'SELECT') {
+                const selectedValues = [];
+                if (el.options) {
+                    for (let k = 0; k < el.options.length; k++) {
+                        if (el.options[k] && el.options[k].selected) {
+                            selectedValues.push(String(el.options[k].value));
+                        }
+                    }
+                }
+                controls.push({
+                    ...base,
+                    multiple: Boolean(el.multiple),
+                    selectedIndex: Number.isInteger(el.selectedIndex) ? el.selectedIndex : -1,
+                    selectedValues,
+                    value: el.value !== undefined ? String(el.value) : '',
+                });
+            } else if (tag === 'INPUT') {
+                const inputType = String(el.type || 'text').toLowerCase();
+                if (inputType === 'checkbox' || inputType === 'radio') {
+                    controls.push({ ...base, inputType, checked: Boolean(el.checked) });
+                } else {
+                    controls.push({
+                        ...base,
+                        inputType,
+                        value: el.value !== undefined ? String(el.value) : '',
+                    });
+                }
+            } else if (tag === 'TEXTAREA') {
+                controls.push({
+                    ...base,
+                    value: el.value !== undefined ? String(el.value) : '',
+                });
+            }
+        }
+    } catch (_) {}
+
+    try {
+        const allEls = root.querySelectorAll('*');
+        for (let i = 0; i < allEls.length; i++) {
+            const el = allEls[i];
+            if (!el) continue;
+            const st = Number(el.scrollTop || 0);
+            const sl = Number(el.scrollLeft || 0);
+            if (st > 0 || sl > 0) {
+                scrolls.push({
+                    path: computeNonScriptPath(el, root),
+                    tag: String(el.tagName || '').toUpperCase(),
+                    id: el.id ? String(el.id) : '',
+                    scrollTop: st,
+                    scrollLeft: sl,
+                });
+            }
+        }
+    } catch (_) {}
+
+    return { controls, scrolls };
+}
+
+/**
+ * Restores captured UI state (`uiState`) onto either a Shadow DOM `bodyContainer` or a rehydrated iframe `body`.
+ *
+ * @param {Element} rootBody
+ * @param {{ controls?: Array<Object>, scrolls?: Array<Object> }|null} uiState
+ * @param {Object} [options={}]
+ */
+function applyUiStateToRoot(rootBody, uiState, options = {}) {
+    if (!rootBody || !uiState) return;
+    const controls = Array.isArray(uiState.controls) ? uiState.controls : [];
+    const scrolls = Array.isArray(uiState.scrolls) ? uiState.scrolls : [];
+
+    for (let i = 0; i < controls.length; i++) {
+        const item = controls[i];
+        const target = resolveNonScriptPath(rootBody, item);
+        if (!target) continue;
+        try {
+            if (item.tag === 'DETAILS') {
+                target.open = Boolean(item.open);
+                if (item.open && typeof target.setAttribute === 'function') {
+                    target.setAttribute('open', '');
+                } else if (!item.open && typeof target.removeAttribute === 'function') {
+                    target.removeAttribute('open');
+                }
+            } else if (item.tag === 'SELECT') {
+                if (item.multiple && target.options && Array.isArray(item.selectedValues)) {
+                    const wanted = new Set(item.selectedValues);
+                    for (let k = 0; k < target.options.length; k++) {
+                        target.options[k].selected = wanted.has(String(target.options[k].value));
+                    }
+                } else {
+                    if (item.value !== undefined) target.value = item.value;
+                    if (Number.isInteger(item.selectedIndex) && item.selectedIndex >= 0 && target.selectedIndex !== item.selectedIndex) {
+                        target.selectedIndex = item.selectedIndex;
+                    }
+                    if (target.options) {
+                        for (let k = 0; k < target.options.length; k++) {
+                            const isSel = k === target.selectedIndex || (item.value !== undefined && String(target.options[k].value) === item.value);
+                            if (typeof target.options[k].setAttribute === 'function') {
+                                if (isSel) target.options[k].setAttribute('selected', '');
+                                else target.options[k].removeAttribute('selected');
+                            }
+                        }
+                    }
+                }
+            } else if (item.tag === 'INPUT') {
+                if (item.inputType === 'checkbox' || item.inputType === 'radio') {
+                    target.checked = Boolean(item.checked);
+                    if (typeof target.setAttribute === 'function') {
+                        if (item.checked) target.setAttribute('checked', '');
+                        else if (typeof target.removeAttribute === 'function') target.removeAttribute('checked');
+                    }
+                } else if (item.value !== undefined) {
+                    target.value = item.value;
+                    if (options.isShadowSnapshot && typeof target.setAttribute === 'function') {
+                        target.setAttribute('value', item.value);
+                    }
+                }
+            } else if (item.tag === 'TEXTAREA' && item.value !== undefined) {
+                target.value = item.value;
+                if (options.isShadowSnapshot) {
+                    target.textContent = item.value;
+                }
+            }
+        } catch (_) {}
+    }
+
+    const applyScrolls = () => {
+        for (let i = 0; i < scrolls.length; i++) {
+            const s = scrolls[i];
+            const target = resolveNonScriptPath(rootBody, s);
+            if (!target) continue;
+            try {
+                if (s.scrollTop > 0) target.scrollTop = s.scrollTop;
+                if (s.scrollLeft > 0) target.scrollLeft = s.scrollLeft;
+            } catch (_) {}
+        }
+    };
+
+    applyScrolls();
+    if (scrolls.length > 0 && typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(applyScrolls);
+    }
+}
+
 class IframePoolManager {
     /**
      * @param {Object} [options={}]
@@ -921,6 +1182,7 @@ class IframePoolManager {
             0;
 
         const canvasSnapshots = captureCanvasSnapshots(doc);
+        const uiState = captureIframeUiState(doc);
         const { htmlBody, bodyClass, bodyStyle } = extractStaticSnapshotBody(doc, canvasSnapshots);
         const inlineFallbackCss = extractInlineFallbackCss(doc);
         const restoreSpec = captureIframeRestoreSpec(iframe, iframeId);
@@ -947,6 +1209,7 @@ class IframePoolManager {
             inlineFallbackCss,
             canvasSnapshots,
             scrollTop,
+            uiState,
             originalSrcdocHash: fnv1a64Hex(restoreSpec.srcdoc || restoreSpec.src || htmlBody),
         };
 
@@ -987,6 +1250,7 @@ class IframePoolManager {
                 bodyContainer.setAttribute('style', bodyStyle);
             }
             bodyContainer.innerHTML = htmlBody;
+            applyUiStateToRoot(bodyContainer, uiState, { isShadowSnapshot: true });
             if (scrollTop > 0) {
                 bodyContainer.scrollTop = scrollTop;
             }
@@ -1122,7 +1386,11 @@ class IframePoolManager {
         };
         slot.onLoad = () => {
             const doc = getAccessibleContentDocument(iframe);
-            if (doc && record.scrollTop > 0) {
+            if (!doc) return;
+            if (doc.body && record.uiState) {
+                applyUiStateToRoot(doc.body, record.uiState, { isShadowSnapshot: false });
+            }
+            if (record.scrollTop > 0) {
                 try {
                     if (doc.scrollingElement) doc.scrollingElement.scrollTop = record.scrollTop;
                     else if (doc.body) doc.body.scrollTop = record.scrollTop;

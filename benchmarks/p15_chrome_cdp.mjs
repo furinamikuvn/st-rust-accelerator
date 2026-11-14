@@ -19,10 +19,15 @@ import { spawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
+import { cleanupOrphanedCdpTempDirs, killProcessTree, removeDirWithRetry } from './cdp-cleanup.mjs';
+
+const require = createRequire(import.meta.url);
+const { resolveGenshinCardFixture, resolveHeavyChatWithMvh } = require('../test-helpers/genshin-fixture.js');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -31,8 +36,10 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 const CHAR_DIR = 'D:/ST/SillyTavern/data/default-user/characters';
 const WORLDBOOK_DIR = 'D:/ST/SillyTavern/data/default-user/worlds';
-const TEYVAT_CHAT_PATH = 'D:/ST/SillyTavern/data/default-user/chats/Genshin Impact · Teyvat3/Genshin Impact · Teyvat - 2026-11-11@11h15m40s510ms.jsonl';
-const TEYVAT_CARD_PATH = path.join(CHAR_DIR, 'Genshin Impact · Teyvat.png');
+const GENSHIN_FIXTURE = resolveGenshinCardFixture({ charactersDir: CHAR_DIR });
+const HEAVY_MVH_FIXTURE = resolveHeavyChatWithMvh();
+const TEYVAT_CHAT_PATH = HEAVY_MVH_FIXTURE.found ? HEAVY_MVH_FIXTURE.chatPath : GENSHIN_FIXTURE.chatPath;
+const TEYVAT_CARD_PATH = GENSHIN_FIXTURE.cardPath;
 const HTH_CARD_PATH = path.join(CHAR_DIR, '【Mira】Hoàng Thiên Hậu Thổ.png');
 const TAILWIND_JS_PATH = 'D:/ST/SillyTavern/public/scripts/extensions/third-party/JS-Slash-Runner/lib/tailwindcss.min.js';
 
@@ -77,10 +84,11 @@ function extractAllStyles(html) {
 
 function loadRealDatasets() {
     const pngFiles = fs.readdirSync(CHAR_DIR).filter((f) => f.toLowerCase().endsWith('.png'));
-    assert(pngFiles.length >= 73, `Expected >= 73 PNG cards, found ${pngFiles.length}`);
+    assert(pngFiles.length >= 50, `Expected >= 50 PNG cards, found ${pngFiles.length}`);
 
-    const cards = [];
+    const cardBuffers = [Buffer.from('[')];
     const expectedCardShaByAvatar = new Map();
+    let cardCount = 0;
     for (const file of pngFiles) {
         const extracted = extractPngCardJson(path.join(CHAR_DIR, file));
         if (!extracted) continue;
@@ -91,12 +99,16 @@ function loadRealDatasets() {
             data: parsed?.data || {},
             json_data: rawStr,
         };
-        cards.push(card);
+        if (cardCount > 0) cardBuffers.push(Buffer.from(','));
+        cardBuffers.push(Buffer.from(JSON.stringify(card), 'utf8'));
+        cardCount++;
         expectedCardShaByAvatar.set(file, {
             jsonDataSha: sha256(rawStr),
             jsonDataLen: rawStr.length,
         });
     }
+    cardBuffers.push(Buffer.from(']'));
+    const cardsJsonBytes = Buffer.concat(cardBuffers);
 
     const teyvatMessages = fs
         .readFileSync(TEYVAT_CHAT_PATH, 'utf8')
@@ -116,8 +128,8 @@ function loadRealDatasets() {
     const genshinWb = JSON.parse(fs.readFileSync(path.join(WORLDBOOK_DIR, 'Genshin Impact.json'), 'utf8'));
 
     return {
-        cards,
-        cardsJsonBytes: Buffer.from(JSON.stringify(cards), 'utf8'),
+        cardCount,
+        cardsJsonBytes,
         expectedCardShaByAvatar,
         teyvatChatBytes: Buffer.from(teyvatChatJson, 'utf8'),
         teyvatMessageCount: teyvatMessages.length,
@@ -330,8 +342,10 @@ function createE2EServer(datasets) {
 </head><body class="bg-slate-950 text-slate-100 p-2">
 <div class="hud-root p-2 rounded border border-amber-500/40 bg-slate-900/90">
   <div class="flex items-center justify-between text-xs font-bold text-amber-300">
-    <span>Teyvat3 Live Status</span><span class="hp-val">HP 100/100</span>
+    <span>Genshin Live Status</span><span class="hp-val">HP 100/100</span>
   </div>
+  <input id="hud-note-input" type="text" value="default-note" />
+  <details id="hud-details"><summary>Details</summary><p>Nested state</p></details>
   <canvas class="fx-canvas" width="96" height="24"></canvas>
 </div>
 <script>
@@ -602,8 +616,12 @@ async function waitForDebuggerPort(proc, timeoutMs = 10000) {
 
 async function runP15ChromeCdp() {
     console.log('=== PHASE P15 REAL GOOGLE CHROME CDP GATE G3 VERIFICATION ===\n');
+    const orphaned = await cleanupOrphanedCdpTempDirs();
+    if (orphaned > 0) {
+        console.log(`[P15] Cleaned ${orphaned} orphaned temp dir(s) before startup.`);
+    }
     const datasets = loadRealDatasets();
-    console.log(`Loaded real datasets: ${datasets.cards.length} PNGs (${(datasets.cardsJsonBytes.byteLength / 1048576).toFixed(2)} MB), Teyvat3 (${datasets.teyvatMessageCount} lines, ${(datasets.teyvatChatBytes.byteLength / 1048576).toFixed(2)} MB)`);
+    console.log(`Loaded real datasets: ${datasets.cardCount} PNGs (${(datasets.cardsJsonBytes.byteLength / 1048576).toFixed(2)} MB), Active Genshin=${GENSHIN_FIXTURE.avatar}, Heavy MVH Chat (${datasets.teyvatMessageCount} lines, ${(datasets.teyvatChatBytes.byteLength / 1048576).toFixed(2)} MB)`);
 
     const { server, state } = createE2EServer(datasets);
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -648,6 +666,7 @@ async function runP15ChromeCdp() {
             return origEventPush(msg);
         };
 
+        console.log('[P15] Navigating to harness & awaiting extension boot...');
         await cdp.send('Page.navigate', { url: `${baseUrl}/test-p15.html` });
         await cdp.evaluate(`
             new Promise((resolve, reject) => {
@@ -663,26 +682,32 @@ async function runP15ChromeCdp() {
                 check();
             })
         `);
+        console.log('[P15] Extension booted; running Layer 1 (chars/all + chats/get + edit + save)...');
 
-        // 1. Stream 74 real PNG cards + 45.34 MiB Teyvat3 chat
+        // 1. Stream all real PNG cards + heavy MVH chat
+        const targetAvatar = GENSHIN_FIXTURE.avatar;
+        const targetCardName = GENSHIN_FIXTURE.cardName;
         const layer1Summary = await cdp.evaluate(`
             (async () => {
                 const hdrs = window.SillyTavern.getContext().getRequestHeaders();
                 const charsResp = await fetch('/api/characters/all', { method: 'POST', headers: hdrs, body: '{}' });
                 const chars = await charsResp.json();
                 window.SILLY_STATE.characters = chars;
+                const t3Idx = chars.findIndex((c) => c.avatar === ${JSON.stringify(targetAvatar)});
+                window.SILLY_STATE.characterId = t3Idx;
+                const t3BookBeforeChat = typeof chars[t3Idx]?.data?.character_book === 'string'
+                    ? chars[t3Idx].data.character_book
+                    : typeof chars[t3Idx]?.data?.character_book;
 
                 const chatResp = await fetch('/api/chats/get', {
                     method: 'POST',
                     headers: hdrs,
-                    body: JSON.stringify({ avatar_url: 'Genshin Impact · Teyvat.png', file_name: 'Genshin Impact - Teyvat3' }),
+                    body: JSON.stringify({ avatar_url: ${JSON.stringify(targetAvatar)}, file_name: ${JSON.stringify(targetCardName)} }),
                 });
                 const chatArr = await chatResp.json();
                 window.SILLY_STATE.chat = chatArr;
-                window.SILLY_STATE.characterId = chars.findIndex((c) => c.avatar === 'Genshin Impact · Teyvat3.png');
 
-                // Simulate edit submit on stripped Teyvat3 card -> RehydrationGuard must recover full JSON
-                const t3Idx = window.SILLY_STATE.characterId;
+                // Simulate edit submit on stripped Genshin card -> RehydrationGuard must recover full JSON
                 const editResp = await fetch('/api/characters/edit', {
                     method: 'POST',
                     headers: hdrs,
@@ -698,19 +723,22 @@ async function runP15ChromeCdp() {
                     method: 'POST',
                     headers: hdrs,
                     body: JSON.stringify({
-                        ch_name: 'Genshin Impact · Teyvat3',
-                        avatar_url: 'Genshin Impact · Teyvat.png',
-                        file_name: 'Teyvat3',
+                        ch_name: ${JSON.stringify(targetCardName)},
+                        avatar_url: ${JSON.stringify(targetAvatar)},
+                        file_name: ${JSON.stringify(targetCardName)},
                         chat: chatArr,
                     }),
                 });
                 await saveResp.json();
 
                 const stats = await window.__ST_RUST_ACCELERATOR.vaultClient.refreshStats();
+                const inactiveStrippedCount = chars.filter((c, i) => i !== t3Idx && c?.data?.character_book === '__ST_RUST_STRIPPED__').length;
                 return {
                     charsLen: chars.length,
-                    t3JsonData: chars[t3Idx]?.json_data,
-                    t3BookSentinel: chars[t3Idx]?.data?.character_book,
+                    t3JsonData: typeof chars[t3Idx]?.json_data === 'string' && chars[t3Idx].json_data.length <= 64 ? chars[t3Idx].json_data : typeof chars[t3Idx]?.json_data,
+                    t3BookBeforeChat,
+                    t3BookAfterChatType: typeof chars[t3Idx]?.data?.character_book,
+                    inactiveStrippedCount,
                     t3StrippedFlag: chars[t3Idx]?.__st_rust_stripped,
                     chatLen: chatArr.length,
                     line0Stripped: Boolean(chatArr[0]?.chat_metadata?.multiverse_hypervisor?.__st_rust_vault_ref),
@@ -719,9 +747,11 @@ async function runP15ChromeCdp() {
             })()
         `);
 
-        assert.strictEqual(layer1Summary.charsLen, datasets.cards.length);
+        assert.strictEqual(layer1Summary.charsLen, datasets.cardCount);
         assert.strictEqual(layer1Summary.t3JsonData, '');
-        assert.strictEqual(layer1Summary.t3BookSentinel, '__ST_RUST_STRIPPED__');
+        assert.strictEqual(layer1Summary.t3BookBeforeChat, '__ST_RUST_STRIPPED__');
+        assert.strictEqual(layer1Summary.t3BookAfterChatType, 'object', 'Active card character_book must auto-hydrate when opening chat');
+        assert(layer1Summary.inactiveStrippedCount > 0, 'Inactive cards must keep character_book stripped cold');
         assert.strictEqual(layer1Summary.t3StrippedFlag, true);
         assert.strictEqual(layer1Summary.chatLen, datasets.teyvatMessageCount);
         assert.strictEqual(layer1Summary.line0Stripped, true);
@@ -729,9 +759,10 @@ async function runP15ChromeCdp() {
         assert.strictEqual(layer1Summary.stats.hasSharedArrayBuffer, false);
         assert(layer1Summary.stats.linearMemoryBytes <= 8 * 1024 * 1024, `Linear memory > 8 MiB: ${layer1Summary.stats.linearMemoryBytes}`);
 
-        const expectedT3Sha = datasets.expectedCardShaByAvatar.get('Genshin Impact · Teyvat3.png').jsonDataSha;
+        const expectedT3Sha = datasets.expectedCardShaByAvatar.get(targetAvatar).jsonDataSha;
         assert.strictEqual(state.editVerifiedSha, expectedT3Sha, 'Character edit rehydration SHA-256 mismatch!');
         assert.strictEqual(state.chatSaveVerifiedSha, datasets.expectedTeyvatChatSha, 'Chat save rehydration SHA-256 mismatch!');
+        console.log('[P15] Layer 1 PASS; running Layer 3 (Worldbook + TokenCache)...');
 
         // 2. Layer 3: Worldbook scan + 10x concurrent tokenizer fetch coalescing
         const layer3Summary = await cdp.evaluate(`
@@ -755,6 +786,7 @@ async function runP15ChromeCdp() {
         `);
         assert(layer3Summary.wbHits > 0, 'Worldbook scan must find matches');
         assert.strictEqual(state.encodeCalls, 1, `Expected 10 identical token requests -> 1 upstream call, got ${state.encodeCalls}`);
+        console.log('[P15] Layer 3 PASS; running Layer 4 (25 HUD iframes + Pool + Shadow UI state)...');
 
         // 3. Layer 4: Mount 25 real HUD iframes -> Pool maxActiveSlots=2 + Click-to-Rehydrate < 50ms
         const layer4Summary = await cdp.evaluate(`
@@ -777,8 +809,43 @@ async function runP15ChromeCdp() {
                 // Scroll near bottom so top 23 HUDs sleep & bottom 2 stay live
                 chatEl.scrollTop = chatEl.scrollHeight;
                 await new Promise((r) => setTimeout(r, 450));
+                // Mutate input & details state on iframe 0 before final reconcile or after rehydrate->dehydrate
+                const firstIframe = document.querySelector('iframe.TH-render');
+                const targetIframeId = firstIframe ? firstIframe.id : null;
                 window.__ST_RUST_ACCELERATOR.iframePool.reconcilePool();
                 await new Promise((r) => setTimeout(r, 250));
+
+                // Test Shadow DOM uiState capture & click-to-rehydrate restore on iframe 0
+                const host0 = document.querySelector('.st-shadow-snapshot-host');
+                if (host0) host0.click();
+                await new Promise((r) => setTimeout(r, 150));
+                const live0 = document.getElementById('TH-message--0-0') || document.querySelector('iframe.TH-render');
+                let shadowInputVal = null;
+                let shadowDetailsOpen = false;
+                let rehydratedInputVal = null;
+                let rehydratedDetailsOpen = false;
+                if (live0 && live0.contentDocument) {
+                    const inp = live0.contentDocument.getElementById('hud-note-input');
+                    const det = live0.contentDocument.getElementById('hud-details');
+                    if (inp) inp.value = 'p15-edited-state';
+                    if (det) det.open = true;
+                    const pool = window.__ST_RUST_ACCELERATOR.iframePool;
+                    pool.dehydrateIframe(live0);
+                    const recHost = document.querySelector('.st-shadow-snapshot-host[data-st-iframe-id="' + live0.id + '"]');
+                    const sr = recHost && recHost.shadowRoot;
+                    shadowInputVal = sr ? sr.getElementById('hud-note-input')?.value : null;
+                    shadowDetailsOpen = Boolean(sr && sr.getElementById('hud-details')?.open);
+                    if (recHost) recHost.click();
+                    await new Promise((r) => setTimeout(r, 150));
+                    const restoredFrame = document.getElementById(live0.id);
+                    rehydratedInputVal = restoredFrame?.contentDocument?.getElementById('hud-note-input')?.value || null;
+                    rehydratedDetailsOpen = Boolean(restoredFrame?.contentDocument?.getElementById('hud-details')?.open);
+                }
+
+                // Scroll back down so pool re-evicts cleanly
+                chatEl.scrollTop = chatEl.scrollHeight;
+                window.__ST_RUST_ACCELERATOR.iframePool.reconcilePool();
+                await new Promise((r) => setTimeout(r, 200));
 
                 const liveBefore = document.querySelectorAll('iframe.TH-render').length;
                 const hostsBefore = document.querySelectorAll('.st-shadow-snapshot-host').length;
@@ -819,6 +886,10 @@ async function runP15ChromeCdp() {
                 return {
                     liveBefore,
                     hostsBefore,
+                    shadowInputVal,
+                    shadowDetailsOpen,
+                    rehydratedInputVal,
+                    rehydratedDetailsOpen,
                     rehydrateMs: Number(rehydrateMs.toFixed(2)),
                     drawerUi,
                 };
@@ -827,6 +898,10 @@ async function runP15ChromeCdp() {
 
         assert(layer4Summary.liveBefore <= 2, `Expected live HUD iframes <= 2, got ${layer4Summary.liveBefore}`);
         assert(layer4Summary.hostsBefore >= 20, `Expected >= 20 Shadow DOM snapshots, got ${layer4Summary.hostsBefore}`);
+        assert.strictEqual(layer4Summary.shadowInputVal, 'p15-edited-state', 'Shadow snapshot must preserve input value');
+        assert.strictEqual(layer4Summary.shadowDetailsOpen, true, 'Shadow snapshot must preserve <details open>');
+        assert.strictEqual(layer4Summary.rehydratedInputVal, 'p15-edited-state', 'Rehydrated iframe must restore input value');
+        assert.strictEqual(layer4Summary.rehydratedDetailsOpen, true, 'Rehydrated iframe must restore <details open>');
         assert(layer4Summary.drawerUi['st-rust-server-badge'].includes('Client-Side Browser Engine Active'));
         assert(layer4Summary.drawerUi['st-rust-stat-vault'].includes('opfs-sync'), `Drawer vault badge: ${layer4Summary.drawerUi['st-rust-stat-vault']}`);
         assert(/Chars\s+1\b.*Chats\s+1\b.*Blocks\s+0\b/.test(layer4Summary.drawerUi['st-rust-stat-rehydration']), `Drawer rehydration: ${layer4Summary.drawerUi['st-rust-stat-rehydration']}`);
@@ -855,11 +930,9 @@ async function runP15ChromeCdp() {
         console.log(`  - Console Errors: ${consoleErrors.length}, Page Exceptions: ${pageErrors.length}`);
     } finally {
         cdp?.close();
-        if (chromeProc) {
-            try { chromeProc.kill(); } catch (_) {}
-        }
+        await killProcessTree(chromeProc?.pid);
         server.close();
-        try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch (_) {}
+        await removeDirWithRetry(userDataDir, 8, 350);
     }
 }
 

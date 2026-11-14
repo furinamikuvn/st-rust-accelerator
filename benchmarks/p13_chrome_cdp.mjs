@@ -22,14 +22,19 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { cleanupOrphanedCdpTempDirs, killProcessTree, removeDirWithRetry } from './cdp-cleanup.mjs';
+
+const require = createRequire(import.meta.url);
+const { resolveGenshinCardFixture } = require('../test-helpers/genshin-fixture.js');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '..');
 
 const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-const TEYVAT_CARD_PATH = 'D:/ST/SillyTavern/data/default-user/characters/Genshin Impact · Teyvat.png';
+const TEYVAT_CARD_PATH = resolveGenshinCardFixture().cardPath;
 const HTH_CARD_PATH = 'D:/ST/SillyTavern/data/default-user/characters/【Mira】Hoàng Thiên Hậu Thổ.png';
 const TAILWIND_JS_PATH = 'D:/ST/SillyTavern/public/scripts/extensions/third-party/JS-Slash-Runner/lib/tailwindcss.min.js';
 
@@ -504,9 +509,10 @@ async function runBenchmark() {
         `tailwindcss.min.js=${(assets.tailwindBuf.length / 1024).toFixed(1)} KB`
     );
 
+    await cleanupOrphanedCdpTempDirs();
     const { server, port } = await startServer(assets);
     const origin = `http://127.0.0.1:${port}`;
-    const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'st_rust_p13_cdp_'));
+    const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'st-p13-cdp_'));
 
     const chromeProc = spawn(
         CHROME_PATH,
@@ -568,9 +574,9 @@ async function runBenchmark() {
         console.log('P13 REAL CHROME CDP BENCHMARK PASSED 100%!');
         console.log('=============================================================');
     } finally {
-        try { chromeProc.kill('SIGKILL'); } catch (_) {}
+        await killProcessTree(chromeProc.pid);
         try { server.close(); } catch (_) {}
-        try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch (_) {}
+        await removeDirWithRetry(userDataDir, 8, 350);
     }
 }
 

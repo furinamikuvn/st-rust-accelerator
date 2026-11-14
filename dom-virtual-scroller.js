@@ -39,9 +39,11 @@ class VirtualScroller {
         this.isTicking = false;
         this.isEnabled = true;
         this.isInternalMutation = false;
+        this.pendingBottomAnchor = false;
         this.lastScrollTop = 0;
         this.visibleRange = { start: 0, end: 0 };
         this.protectedIframeCount = 0;
+        this.onChatCleared = typeof options.onChatCleared === 'function' ? options.onChatCleared : null;
     }
 
     /**
@@ -101,7 +103,7 @@ class VirtualScroller {
     }
 
     /**
-     * Ensures top/bottom virtual spacers are attached inside the container.
+     * Ensures top/bottom virtual spacers are attached inside the container at exact boundary positions.
      */
     _ensureSpacers() {
         if (!this.container || typeof document === 'undefined') return;
@@ -111,7 +113,12 @@ class VirtualScroller {
                 this.spacerTop.className = 'st-virtual-spacer-top';
                 this.spacerTop.style.cssText = 'width: 100%; height: 0px; pointer-events: none; margin: 0; padding: 0;';
             }
-            if (!this._isSpacerAttached(this.spacerTop)) {
+            const topAttached = this._isSpacerAttached(this.spacerTop);
+            const firstChild = this.container.firstElementChild || (this.container.children && this.container.children[0]) || null;
+            if (!topAttached || firstChild !== this.spacerTop) {
+                if (topAttached && typeof this.spacerTop.remove === 'function') {
+                    this.spacerTop.remove();
+                }
                 this.container.prepend(this.spacerTop);
             }
 
@@ -120,29 +127,123 @@ class VirtualScroller {
                 this.spacerBottom.className = 'st-virtual-spacer-bottom';
                 this.spacerBottom.style.cssText = 'width: 100%; height: 0px; pointer-events: none; margin: 0; padding: 0;';
             }
-            if (!this._isSpacerAttached(this.spacerBottom)) {
+            const bottomAttached = this._isSpacerAttached(this.spacerBottom);
+            const kids = this.container.children;
+            const lastChild = this.container.lastElementChild || (kids && kids.length > 0 ? kids[kids.length - 1] : null);
+            if (!bottomAttached || lastChild !== this.spacerBottom) {
+                if (bottomAttached && typeof this.spacerBottom.remove === 'function') {
+                    this.spacerBottom.remove();
+                }
                 this.container.appendChild(this.spacerBottom);
             }
         });
     }
 
     /**
-     * Clears tracked message Maps and spacer state (used on chat switches / clearChat()).
+     * Marks the start of a new chat load so initial DOM insertion anchors to the bottom
+     * until SillyTavern's `scrollChatToBottom` or user scroll updates `scrollTop`.
      */
-    reset() {
+    beginChatLoad() {
+        this.pendingBottomAnchor = true;
+        this.lastScrollTop = 0;
+    }
+
+    /**
+     * Re-attaches valid detached message nodes back into `#chat` in ascending `mesid` order.
+     */
+    _restoreDetachedNodesToDom() {
+        if (!this.container || this.detachedNodes.size === 0) return;
+        const domMesNodes = Array.from(this.container.querySelectorAll('.mes'));
+        if (domMesNodes.length === 0) return;
+
+        this._ensureSpacers();
+        const existingByMesId = new Map();
+        for (const node of domMesNodes) {
+            const raw = node && typeof node.getAttribute === 'function' ? node.getAttribute('mesid') : null;
+            const mesId = raw !== null ? parseInt(raw, 10) : NaN;
+            if (!isNaN(mesId)) existingByMesId.set(mesId, node);
+        }
+
+        const combined = [];
+        for (const [id, node] of existingByMesId.entries()) {
+            combined.push({ id, node });
+        }
         for (const node of this.detachedNodes) {
-            if (node && typeof node.removeAttribute === 'function') {
+            if (!node) continue;
+            if (typeof node.removeAttribute === 'function') {
                 node.removeAttribute('data-st-virtual-detached');
             }
+            const raw = typeof node.getAttribute === 'function' ? node.getAttribute('mesid') : null;
+            const mesId = raw !== null ? parseInt(raw, 10) : NaN;
+            if (!isNaN(mesId) && !existingByMesId.has(mesId) && node.parentNode !== this.container) {
+                combined.push({ id: mesId, node });
+                existingByMesId.set(mesId, node);
+            }
         }
+        if (combined.length === domMesNodes.length) return;
+
+        combined.sort((a, b) => a.id - b.id);
+        this._runInternalMutation(() => {
+            let nextRef = this.spacerBottom;
+            for (let i = combined.length - 1; i >= 0; i--) {
+                const entry = combined[i];
+                if (entry.node.parentNode !== this.container) {
+                    this.container.insertBefore(entry.node, nextRef);
+                }
+                nextRef = entry.node;
+            }
+        });
+    }
+
+    /**
+     * Clears tracked message Maps and spacer state.
+     * If `#chat` still holds `.mes` nodes (and `forceClear` is not set), safely restores
+     * valid `detachedNodes` back to DOM in ascending `mesid` order first so no messages are orphaned.
+     *
+     * @param {Object} [options={}]
+     * @param {boolean} [options.forceClear=false]
+     */
+    reset(options = {}) {
+        const forceClear = Boolean(options && options.forceClear);
+        const domMesNodes = this.container
+            ? Array.from(this.container.querySelectorAll('.mes'))
+            : [];
+
+        if (!forceClear && domMesNodes.length > 0 && this.detachedNodes.size > 0) {
+            this._restoreDetachedNodesToDom();
+        } else {
+            for (const node of this.detachedNodes) {
+                if (node && typeof node.removeAttribute === 'function') {
+                    node.removeAttribute('data-st-virtual-detached');
+                }
+            }
+        }
+
         this.messageNodes.clear();
         this.heightCache.clear();
         this.detachedNodes.clear();
-        this.visibleRange = { start: 0, end: 0 };
         this.protectedIframeCount = 0;
         if (this.spacerTop) this.spacerTop.style.height = '0px';
         if (this.spacerBottom) this.spacerBottom.style.height = '0px';
         this._ensureSpacers();
+
+        const remainingMes = this.container
+            ? Array.from(this.container.querySelectorAll('.mes'))
+            : [];
+        this.totalMessages = remainingMes.length;
+        if (remainingMes.length === 0) {
+            this.visibleRange = { start: 0, end: 0 };
+            this.pendingBottomAnchor = true;
+            this.lastScrollTop = 0;
+        } else {
+            const ids = remainingMes
+                .map((n) => parseInt(n.getAttribute && n.getAttribute('mesid'), 10))
+                .filter((id) => !isNaN(id))
+                .sort((a, b) => a - b);
+            this.visibleRange = ids.length > 0
+                ? { start: ids[0], end: ids[ids.length - 1] }
+                : { start: 0, end: 0 };
+        }
         debugLog('DOM Virtual Scroller state reset.');
     }
 
@@ -157,6 +258,9 @@ class VirtualScroller {
             setTimeout(() => this.init(), 500);
             return;
         }
+
+        const existingMes = this.container.querySelectorAll('.mes');
+        this.pendingBottomAnchor = existingMes.length === 0;
 
         this._ensureSpacers();
         this.container.addEventListener('scroll', () => this.onScroll(), { passive: true });
@@ -175,6 +279,10 @@ class VirtualScroller {
      */
     onScroll() {
         if (!this.isEnabled) return;
+        if (this.container && (this.container.scrollTop || 0) > 0) {
+            this.pendingBottomAnchor = false;
+            this.lastScrollTop = this.container.scrollTop;
+        }
         if (!this.isTicking) {
             requestAnimationFrame(() => {
                 this.update();
@@ -192,22 +300,36 @@ class VirtualScroller {
     onDomMutated(mutations = []) {
         if (this.isInternalMutation) return;
 
+        const spacersDetached = Boolean(this.spacerTop && !this._isSpacerAttached(this.spacerTop));
+        const currentDomMes = this.container ? this.container.querySelectorAll('.mes') : [];
+
         // If SillyTavern clearChat() ran $('#chat').children().remove(), spacers were detached too.
-        if (this.spacerTop && !this._isSpacerAttached(this.spacerTop)) {
-            this.reset();
-        } else if (Array.isArray(mutations) && mutations.length > 0) {
-            for (const m of mutations) {
-                if (!m.removedNodes || m.removedNodes.length === 0) continue;
-                for (const removed of m.removedNodes) {
-                    if (this.detachedNodes.has(removed)) continue;
-                    const mesAttr = removed && removed.getAttribute ? removed.getAttribute('mesid') : null;
-                    if (mesAttr !== null) {
-                        const mesId = parseInt(mesAttr, 10);
-                        if (!isNaN(mesId) && this.messageNodes.get(mesId) === removed) {
-                            this.messageNodes.delete(mesId);
-                            this.heightCache.delete(mesId);
+        if (spacersDetached) {
+            this.reset({ forceClear: currentDomMes.length === 0 });
+            if (currentDomMes.length === 0 && this.onChatCleared) {
+                try { this.onChatCleared(); } catch (_) {}
+            }
+        } else {
+            if (Array.isArray(mutations) && mutations.length > 0) {
+                for (const m of mutations) {
+                    if (!m.removedNodes || m.removedNodes.length === 0) continue;
+                    for (const removed of m.removedNodes) {
+                        if (this.detachedNodes.has(removed)) continue;
+                        const mesAttr = removed && removed.getAttribute ? removed.getAttribute('mesid') : null;
+                        if (mesAttr !== null) {
+                            const mesId = parseInt(mesAttr, 10);
+                            if (!isNaN(mesId) && this.messageNodes.get(mesId) === removed) {
+                                this.messageNodes.delete(mesId);
+                                this.heightCache.delete(mesId);
+                            }
                         }
                     }
+                }
+            }
+            if (currentDomMes.length === 0 && (this.messageNodes.size > 0 || this.detachedNodes.size > 0)) {
+                this.reset({ forceClear: true });
+                if (this.onChatCleared) {
+                    try { this.onChatCleared(); } catch (_) {}
                 }
             }
         }
@@ -216,7 +338,7 @@ class VirtualScroller {
         let relevantChange = !Array.isArray(mutations) || mutations.length === 0 || (this.spacerTop && !this._isSpacerAttached(this.spacerTop));
         if (!relevantChange && Array.isArray(mutations)) {
             const isRelevantNode = (n) => Boolean(
-                n && n.nodeType === 1 && (
+                n && (n.nodeType === 1 || (n.nodeType === undefined && typeof n.getAttribute === 'function')) && (
                     (n.classList && n.classList.contains('mes')) ||
                     (typeof n.getAttribute === 'function' && n.getAttribute('mesid') !== null)
                 )
@@ -267,10 +389,11 @@ class VirtualScroller {
      */
     _syncTrackedNodes(allMesNodes) {
         if (this.spacerTop && !this._isSpacerAttached(this.spacerTop)) {
-            this.messageNodes.clear();
-            this.heightCache.clear();
-            this.detachedNodes.clear();
-            this._ensureSpacers();
+            if (allMesNodes.length === 0) {
+                this.reset({ forceClear: true });
+            } else {
+                this._ensureSpacers();
+            }
         } else {
             for (const [mesId, trackedNode] of this.messageNodes.entries()) {
                 if (trackedNode.parentNode !== this.container && !this.detachedNodes.has(trackedNode)) {
@@ -283,6 +406,11 @@ class VirtualScroller {
         allMesNodes.forEach(node => {
             const mesId = parseInt(node.getAttribute('mesid'), 10);
             if (!isNaN(mesId)) {
+                const prevNode = this.messageNodes.get(mesId);
+                if (prevNode && prevNode !== node) {
+                    this.detachedNodes.delete(prevNode);
+                    this.heightCache.delete(mesId);
+                }
                 this.messageNodes.set(mesId, node);
                 this.detachedNodes.delete(node);
                 if (typeof node.removeAttribute === 'function') {
@@ -302,22 +430,39 @@ class VirtualScroller {
 
         const allMesNodes = Array.from(this.container.querySelectorAll('.mes'));
         if (this.spacerTop && !this._isSpacerAttached(this.spacerTop)) {
-            this.messageNodes.clear();
-            this.heightCache.clear();
-            this.detachedNodes.clear();
+            if (allMesNodes.length === 0) {
+                this.reset({ forceClear: true });
+                return;
+            }
             this._ensureSpacers();
         }
 
         if (allMesNodes.length <= this.maxVisibleItems && this.messageNodes.size === 0) {
+            this._ensureSpacers();
             if (this.spacerTop) this.spacerTop.style.height = '0px';
             if (this.spacerBottom) this.spacerBottom.style.height = '0px';
+            this.totalMessages = allMesNodes.length;
+            if (allMesNodes.length > 0) {
+                const ids = allMesNodes
+                    .map((n) => parseInt(n.getAttribute && n.getAttribute('mesid'), 10))
+                    .filter((id) => !isNaN(id))
+                    .sort((a, b) => a - b);
+                this.visibleRange = ids.length > 0
+                    ? { start: ids[0], end: ids[ids.length - 1] }
+                    : { start: 0, end: 0 };
+            } else {
+                this.visibleRange = { start: 0, end: 0 };
+            }
             return;
         }
 
+        this._ensureSpacers();
         this._syncTrackedNodes(allMesNodes);
 
         const sortedMesIds = Array.from(this.messageNodes.keys()).sort((a, b) => a - b);
         const totalCount = sortedMesIds.length;
+        this.totalMessages = totalCount;
+
         if (totalCount === 0) {
             if (this.spacerTop) this.spacerTop.style.height = '0px';
             if (this.spacerBottom) this.spacerBottom.style.height = '0px';
@@ -327,8 +472,12 @@ class VirtualScroller {
 
         const scrollTop = this.container.scrollTop || 0;
         const clientHeight = this.container.clientHeight || 800;
-        const buffer = clientHeight * this.bufferRatio;
+        if (scrollTop > 0) {
+            this.pendingBottomAnchor = false;
+            this.lastScrollTop = scrollTop;
+        }
 
+        const buffer = clientHeight * this.bufferRatio;
         const viewportTop = Math.max(0, scrollTop - buffer);
         const viewportBottom = scrollTop + clientHeight + buffer;
 
@@ -357,16 +506,37 @@ class VirtualScroller {
             }
         }
 
-        const windowSize = endIndex - startIndex + 1;
-        if (windowSize > this.maxVisibleItems) {
-            endIndex = Math.min(totalCount - 1, startIndex + this.maxVisibleItems - 1);
+        if (endIndex < startIndex) {
+            endIndex = startIndex;
         }
 
         const effectiveScrollHeight = Math.max(this.container.scrollHeight || 0, accumulatedHeight);
-        const isNearBottom = scrollTop > 0 && (effectiveScrollHeight - scrollTop - clientHeight) < 150;
-        if (isNearBottom) {
+        const bottomThreshold = Math.max(300, clientHeight * 0.5);
+        const isNearBottom = scrollTop > 0 && (effectiveScrollHeight - scrollTop - clientHeight) < bottomThreshold;
+
+        if (totalCount <= this.maxVisibleItems) {
+            startIndex = 0;
+            endIndex = totalCount - 1;
+        } else if ((this.pendingBottomAnchor && scrollTop === 0) || isNearBottom) {
             endIndex = totalCount - 1;
             startIndex = Math.max(0, endIndex - this.maxVisibleItems + 1);
+        } else {
+            const windowSize = endIndex - startIndex + 1;
+            if (windowSize > this.maxVisibleItems) {
+                endIndex = Math.min(totalCount - 1, startIndex + this.maxVisibleItems - 1);
+            } else if (windowSize < this.maxVisibleItems) {
+                // Keep a balanced node buffer when super-tall messages (e.g. 6000px+ HUDs) span the viewport
+                const missing = Math.min(this.maxVisibleItems, totalCount) - windowSize;
+                const addBefore = startIndex === 0 ? 0 : Math.min(startIndex, Math.floor(missing / 2));
+                startIndex -= addBefore;
+                const remainingAfter = missing - addBefore;
+                const addAfter = Math.min(totalCount - 1 - endIndex, remainingAfter);
+                endIndex += addAfter;
+                const leftover = remainingAfter - addAfter;
+                if (leftover > 0 && startIndex > 0) {
+                    startIndex = Math.max(0, startIndex - leftover);
+                }
+            }
         }
 
         let topSpacerHeight = 0;
@@ -436,6 +606,33 @@ class VirtualScroller {
     }
 
     /**
+     * Completes initial bottom-scroll synchronization if `scrollChatToBottom` has not yet run
+     * or if `scrollTop` remained `0` while `pendingBottomAnchor` is still active.
+     *
+     * @param {Object} [options={}]
+     * @param {boolean} [options.autoScroll=true]
+     */
+    syncScrollToBottomIfPending({ autoScroll = true } = {}) {
+        if (!autoScroll || !this.container || !this.pendingBottomAnchor) return;
+        const doScroll = () => {
+            if (!this.container || !this.pendingBottomAnchor) return;
+            const sh = this.container.scrollHeight || 0;
+            const ch = this.container.clientHeight || 0;
+            if (sh > ch && (this.container.scrollTop || 0) === 0) {
+                this.container.scrollTop = sh;
+                this.pendingBottomAnchor = false;
+                this.lastScrollTop = this.container.scrollTop || sh;
+                this.update();
+            }
+        };
+        if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(doScroll);
+        } else {
+            doScroll();
+        }
+    }
+
+    /**
      * Toggles virtualization mode. Restores all nodes into DOM in chronological order when disabled.
      *
      * @param {boolean} enabled - Whether virtualization is active
@@ -478,7 +675,7 @@ class VirtualScroller {
             ? this.container.querySelectorAll('.mes').length
             : 0;
         return {
-            totalMessages: this.messageNodes.size,
+            totalMessages: this.messageNodes.size > 0 ? this.messageNodes.size : this.totalMessages,
             renderedDomNodes: renderedCount,
             visibleRange: this.visibleRange,
             protectedIframeCount: this.protectedIframeCount,

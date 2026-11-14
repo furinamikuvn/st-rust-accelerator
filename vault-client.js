@@ -81,6 +81,8 @@ class VaultClient {
             packCompactions: 0,
             manifestSkippedSaves: 0,
             opfsMaxCompressedBytes: this.opfsMaxCompressedBytes,
+            memoryFallbackCapped: false,
+            fastBootLz4Pending: 0,
         };
     }
 

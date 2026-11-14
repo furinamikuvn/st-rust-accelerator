@@ -153,6 +153,27 @@ export interface CanvasSnapshotItem {
   cssHeight: string;
 }
 
+export interface IframeUiControlState {
+  path: number[] | null;
+  tag: string;
+  id?: string;
+  name?: string;
+  inputType?: string;
+  value?: string;
+  checked?: boolean;
+  selectedIndex?: number;
+  selectedValues?: string[];
+  open?: boolean;
+}
+
+export interface IframeUiScrollState {
+  path: number[] | null;
+  tag: string;
+  id?: string;
+  scrollTop: number;
+  scrollLeft: number;
+}
+
 export interface SnapshotRecord {
   mesId: number;             // Chỉ số tin nhắn .mes[mesid]
   iframeId: string;          // ID iframe đích (VD: "TH-message--12--0")
@@ -164,6 +185,7 @@ export interface SnapshotRecord {
   inlineFallbackCss: string; // Quy tắc CSS cục bộ không tách được vào pool
   canvasSnapshots: CanvasSnapshotItem[];
   scrollTop: number;         // Vị trí cuộn bên trong HUD trước khi đóng băng
+  uiState?: { controls: IframeUiControlState[]; scrolls: IframeUiScrollState[] }; // Trạng thái form / details / scroll con
   originalSrcdocHash: string;// Hash để đối chiếu khi tái sinh iframe sống
 }
 ```

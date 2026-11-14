@@ -235,6 +235,85 @@ class RehydrationGuard {
         this.latestChatKey = key;
     }
 
+    hasTrackedStrippedChats() {
+        return this.knownStrippedChats.size > 0 || this.chatCache.size > 0;
+    }
+
+    /**
+     * Evicts all main-thread + Worker Vault state associated with a deleted or renamed chatKey.
+     *
+     * @param {string} chatKey
+     * @param {Object} [options={}]
+     * @returns {Promise<{ clearedLocal: boolean, vaultResult: Object|null }>}
+     */
+    async evictChat(chatKey, options = {}) {
+        const key = String(chatKey || '').trim();
+        if (!key) return { clearedLocal: false, vaultResult: null };
+
+        let clearedLocal = false;
+        if (this.chatCache.has(key)) {
+            this.chatCache.delete(key);
+            clearedLocal = true;
+        }
+        if (this.knownStrippedChats.has(key)) {
+            this.knownStrippedChats.delete(key);
+            clearedLocal = true;
+        }
+        if (this.latestChatKey === key) {
+            this.latestChatKey = '';
+            clearedLocal = true;
+        }
+        const prefix = `${key}::`;
+        for (const [warmKey, entry] of this.warmReadCache.entries()) {
+            if (warmKey.startsWith(prefix)) {
+                this.warmReadCache.delete(warmKey);
+                if (entry) {
+                    this.warmReadCacheBytes = Math.max(0, this.warmReadCacheBytes - entry.bytes);
+                }
+                clearedLocal = true;
+            }
+        }
+
+        let vaultResult = null;
+        if (options.evictVault !== false && this.vaultClient && typeof this.vaultClient.evictChat === 'function') {
+            try {
+                vaultResult = await this.vaultClient.evictChat(key);
+            } catch (_) {}
+        }
+        return { clearedLocal, vaultResult };
+    }
+
+    /**
+     * Builds canonical `chatKey` and evicts on chat delete / rename / group delete.
+     *
+     * @param {string} scopeKey `avatar_url` for 1-1 chat or `'group'` for group chat
+     * @param {string} chatFile Chat filename or group chat id (with or without `.jsonl`)
+     */
+    async evictChatByFile(scopeKey, chatFile) {
+        const scope = String(scopeKey || '').trim();
+        const fileBase = String(chatFile || '').replace(/\.jsonl$/i, '').trim();
+        if (!fileBase) return { clearedLocal: false, vaultResult: null };
+        const candidateKeys = new Set();
+        if (scope) {
+            candidateKeys.add(`${scope}::${fileBase}`);
+        }
+        for (const tracked of this.knownStrippedChats) {
+            if (tracked === fileBase || tracked.endsWith(`::${fileBase}`)) {
+                candidateKeys.add(tracked);
+            }
+        }
+        for (const cached of this.chatCache.keys()) {
+            if (cached === fileBase || cached.endsWith(`::${fileBase}`)) {
+                candidateKeys.add(cached);
+            }
+        }
+        let lastRes = { clearedLocal: false, vaultResult: null };
+        for (const k of candidateKeys) {
+            lastRes = await this.evictChat(k);
+        }
+        return lastRes;
+    }
+
     /**
      * Derives canonical lookup key for a character card object.
      *
@@ -1431,15 +1510,14 @@ class RehydrationGuard {
     }
 
     /**
-     * Selectively pre-warms lightweight `chat_metadata.variables` (`<= maxWarmVariableBytes`, default 32 MiB)
-     * plus `world_backstage_v1` / tail `extra.world_backstage` so synchronous readers such as
-     * `JS-Slash-Runner`, `ST-Prompt-template`, and `world-backstage` work seamlessly while massive
-     * non-variable blobs (e.g. `44 MB` `multiverse_hypervisor` when MVH is off) remain cold in OPFS/IDB.
+     * Selectively pre-warms ALL `chat[0].chat_metadata` fields whose decoded blob size is
+     * `<= autoWarmMaxFieldBytes` (default `4 MiB`), while leaving mega-blobs `> 4 MiB`
+     * (such as `multiverse_hypervisor` when MVH extension is off) cold in OPFS/IDB.
      *
      * @param {Array} chatArray
      * @param {string} [chatKey]
      * @param {Object} [options={}]
-     * @returns {Promise<{ warmed: boolean, bytes: number, mvhHydrated?: boolean, worldBackstageHydrated?: boolean, skippedReason?: string }>}
+     * @returns {Promise<{ warmed: boolean, bytes: number, hydratedFields?: string[], skippedOversizedFields?: string[], mvhHydrated?: boolean, worldBackstageHydrated?: boolean, skippedReason?: string }>}
      */
     async hydrateWarmChatVariables(chatArray, chatKey = this.latestChatKey || '', options = {}) {
         const header = Array.isArray(chatArray) && chatArray[0] ? chatArray[0] : null;
@@ -1450,49 +1528,73 @@ class RehydrationGuard {
             return {
                 warmed: false,
                 bytes: 0,
+                hydratedFields: [],
+                skippedOversizedFields: [],
                 mvhHydrated: false,
                 worldBackstageHydrated: false,
                 skippedReason: 'no_chat_metadata',
             };
         }
 
+        const autoWarmMaxFieldBytes = Number(options.autoWarmMaxFieldBytes) > 0
+            ? Number(options.autoWarmMaxFieldBytes)
+            : 4 * 1024 * 1024;
+        const hydratedFields = [];
+        const skippedOversizedFields = [];
         let warmed = false;
         let totalBytes = 0;
         let skippedReason;
         let mvhHydrated = false;
         let worldBackstageHydrated = false;
+        let sawAnyColdRef = false;
 
-        const refHex = extractVaultRefHex(meta.variables);
-        if (refHex) {
-            const maxWarmVariableBytes = options.maxWarmVariableBytes ?? 32 * 1024 * 1024;
-            const res = await this.hydrateColdField(meta, 'variables', chatKey, { maxBytes: maxWarmVariableBytes });
+        for (const k of Object.keys(meta)) {
+            if (!extractVaultRefHex(meta[k])) continue;
+            sawAnyColdRef = true;
+
+            if ((k === 'world_backstage_v1' || k === 'world_backstage') && options.hydrateWorldBackstage === false) {
+                continue;
+            }
+            if (k === 'sheets' && options.hydrateSheets === false) {
+                continue;
+            }
+
+            let fieldCap = autoWarmMaxFieldBytes;
+            if (k === 'multiverse_hypervisor') {
+                fieldCap = options.hydrateMultiverseHypervisor
+                    ? (options.maxMvhBytes ?? 64 * 1024 * 1024)
+                    : autoWarmMaxFieldBytes;
+            } else if (k === 'variables' && options.maxWarmVariableBytes !== undefined) {
+                fieldCap = options.maxWarmVariableBytes;
+            }
+
+            const res = await this.hydrateColdField(meta, k, chatKey, { maxBytes: fieldCap });
             if (res.hydrated) {
-                this.stats.warmChatVariablesHydrated++;
                 warmed = true;
+                hydratedFields.push(k);
                 totalBytes += res.bytes;
+                if (k === 'variables') {
+                    this.stats.warmChatVariablesHydrated++;
+                } else if (k === 'world_backstage_v1' || k === 'world_backstage') {
+                    worldBackstageHydrated = true;
+                } else if (k === 'multiverse_hypervisor') {
+                    mvhHydrated = true;
+                }
             } else {
                 totalBytes += res.bytes;
-                skippedReason = res.oversized ? 'exceeds_warm_cap' : 'not_found_in_vault';
+                if (res.oversized) {
+                    skippedOversizedFields.push(k);
+                    if (!skippedReason || k === 'variables') {
+                        skippedReason = 'exceeds_warm_cap';
+                    }
+                } else if (!skippedReason && k === 'variables') {
+                    skippedReason = 'not_found_in_vault';
+                }
             }
-        } else {
+        }
+
+        if (!sawAnyColdRef) {
             skippedReason = 'not_cold_ref';
-        }
-
-        if (options.hydrateWorldBackstage !== false && extractVaultRefHex(meta.world_backstage_v1)) {
-            const wbRes = await this.hydrateColdField(meta, 'world_backstage_v1', chatKey);
-            if (wbRes.hydrated) {
-                warmed = true;
-                worldBackstageHydrated = true;
-                totalBytes += wbRes.bytes;
-            }
-        }
-
-        if (options.hydrateSheets !== false && extractVaultRefHex(meta.sheets)) {
-            const sheetsRes = await this.hydrateColdField(meta, 'sheets', chatKey);
-            if (sheetsRes.hydrated) {
-                warmed = true;
-                totalBytes += sheetsRes.bytes;
-            }
         }
 
         if (options.hydrateWorldBackstage !== false && Array.isArray(chatArray) && chatArray.length > 1) {
@@ -1502,7 +1604,7 @@ class RehydrationGuard {
                 if (msg && msg.extra && typeof msg.extra === 'object') {
                     for (const k of ['world_backstage', 'world_backstage_v1']) {
                         if (extractVaultRefHex(msg.extra[k])) {
-                            const mWbRes = await this.hydrateColdField(msg.extra, k, chatKey);
+                            const mWbRes = await this.hydrateColdField(msg.extra, k, chatKey, { maxBytes: autoWarmMaxFieldBytes });
                             if (mWbRes.hydrated) {
                                 warmed = true;
                                 worldBackstageHydrated = true;
@@ -1514,22 +1616,76 @@ class RehydrationGuard {
             }
         }
 
-        if (options.hydrateMultiverseHypervisor && extractVaultRefHex(meta.multiverse_hypervisor)) {
-            const mvhRes = await this.hydrateColdField(meta, 'multiverse_hypervisor', chatKey);
-            if (mvhRes.hydrated) {
-                warmed = true;
-                mvhHydrated = true;
-                totalBytes += mvhRes.bytes;
-            }
-        }
-
         return {
             warmed,
             bytes: totalBytes,
+            hydratedFields,
+            skippedOversizedFields,
             mvhHydrated,
             worldBackstageHydrated,
-            ...(warmed ? {} : { skippedReason }),
+            ...(warmed ? {} : { skippedReason: skippedReason || 'not_cold_ref' }),
         };
+    }
+
+    /**
+     * Pre-hydrates cold message fields across historical messages needed before LLM generation
+     * (triggered on `GENERATION_STARTED`), bounded cleanly by `maxTotalBytes` (default `8 MiB`).
+     *
+     * @param {Array} chatArray
+     * @param {string} [chatKey]
+     * @param {Object} [options={}]
+     * @returns {Promise<{ hydratedMessages: number, hydratedFields: number, bytes: number }>}
+     */
+    async prehydrateGenerationMessages(chatArray, chatKey = this.latestChatKey || '', options = {}) {
+        if (!Array.isArray(chatArray) || chatArray.length === 0) {
+            return { hydratedMessages: 0, hydratedFields: 0, bytes: 0 };
+        }
+        const maxFieldBytes = Number(options.maxFieldBytes) > 0 ? Number(options.maxFieldBytes) : 4 * 1024 * 1024;
+        const maxTotalBytes = Number(options.maxTotalBytes) > 0 ? Number(options.maxTotalBytes) : 8 * 1024 * 1024;
+        const lookbackMessages = Number(options.lookbackMessages) > 0 ? Number(options.lookbackMessages) : 32;
+
+        let totalBytes = 0;
+        let hydratedMessages = 0;
+        let hydratedFields = 0;
+
+        // First ensure header `chat_metadata` satisfies the <= 4 MiB threshold policy
+        const warmMeta = await this.hydrateWarmChatVariables(chatArray, chatKey, {
+            autoWarmMaxFieldBytes: maxFieldBytes,
+            hydrateMultiverseHypervisor: Boolean(options.hydrateMultiverseHypervisor),
+        });
+        totalBytes += warmMeta.bytes || 0;
+
+        const startIdx = Math.max(0, chatArray.length - lookbackMessages);
+        for (let i = chatArray.length - 1; i >= startIdx && totalBytes < maxTotalBytes; i--) {
+            const msg = chatArray[i];
+            if (!msg || typeof msg !== 'object') continue;
+            let msgTouched = false;
+            const remainingBudget = Math.min(maxFieldBytes, maxTotalBytes - totalBytes);
+
+            for (const field of ['variables', 'swipes']) {
+                if (!extractVaultRefHex(msg[field])) continue;
+                const res = await this.hydrateColdField(msg, field, chatKey, { maxBytes: remainingBudget });
+                if (res.hydrated) {
+                    totalBytes += res.bytes;
+                    hydratedFields++;
+                    msgTouched = true;
+                }
+            }
+            if (msg.extra && typeof msg.extra === 'object') {
+                for (const extraKey of ['world_backstage', 'world_backstage_v1', 'reasoning']) {
+                    if (!extractVaultRefHex(msg.extra[extraKey])) continue;
+                    const res = await this.hydrateColdField(msg.extra, extraKey, chatKey, { maxBytes: remainingBudget });
+                    if (res.hydrated) {
+                        totalBytes += res.bytes;
+                        hydratedFields++;
+                        msgTouched = true;
+                    }
+                }
+            }
+            if (msgTouched) hydratedMessages++;
+        }
+
+        return { hydratedMessages, hydratedFields, bytes: totalBytes };
     }
 
     getStats() {

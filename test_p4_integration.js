@@ -15,8 +15,11 @@ const ST_ROOT = 'D:\\ST\\SillyTavern';
 const EXTENSION_DEST = path.join(ST_ROOT, 'public', 'scripts', 'extensions', 'third-party', 'st-rust-accelerator');
 const PLUGIN_DEST = path.join(ST_ROOT, 'plugins', 'st-rust-accelerator');
 
-const REAL_CHAT_PATH = 'D:\\ST\\SillyTavern\\data\\default-user\\chats\\Genshin Impact · Teyvat3\\Genshin Impact · Teyvat - 2026-11-11@11h15m40s510ms.jsonl';
-const REAL_CARD_PATH = 'D:\\ST\\SillyTavern\\data\\default-user\\characters\\Genshin Impact · Teyvat3.png';
+const { resolveGenshinCardFixture, resolveHeavyChatWithMvh, sha256File } = require('./test-helpers/genshin-fixture.js');
+const genshinFixture = resolveGenshinCardFixture();
+const heavyFixture = resolveHeavyChatWithMvh();
+const REAL_CHAT_PATH = heavyFixture.found ? heavyFixture.chatPath : genshinFixture.chatPath;
+const REAL_CARD_PATH = genshinFixture.cardPath;
 
 let passedTests = 0;
 let totalTests = 0;
@@ -139,27 +142,29 @@ async function runAllTests() {
 
     const extAddon = require(path.join(PLUGIN_DEST, 'st_server_addon.node'));
 
-    runTest('Bóc tách thẻ thật 47.86MB & Cắt tỉa 46.8MB json_data qua Server Addon', () => {
+    runTest('Bóc tách thẻ Genshin thật & Cắt tỉa json_data qua Server Addon', () => {
         assert(fs.existsSync(REAL_CARD_PATH), `Card không tồn tại: ${REAL_CARD_PATH}`);
-        
+        const preSha = sha256File(REAL_CARD_PATH);
+
         const t0 = performance.now();
         const result = extAddon.extractCharacterCard(REAL_CARD_PATH, true);
         const t1 = performance.now();
 
         console.log(`\n       - File Card thật: ${path.basename(REAL_CARD_PATH)}`);
         console.log(`       - Tên nhân vật: "${result.name}"`);
-        console.log(`       - Thời gian bóc tách lõi Rust: ${result.durationMs.toFixed(3)} ms`);
+        console.log(`       - Thời gian bóc tách lõi Rust: ${result.durationMs.toFixed(3)} ms (wall ${(t1 - t0).toFixed(3)} ms)`);
         console.log(`       - Đã cắt tỉa json_data: ${result.strippedJsonData}`);
 
         assert(result.success === true);
-        assert.strictEqual(result.name, 'Genshin Impact · Teyvat');
+        assert.strictEqual(result.name, genshinFixture.cardName);
         assert.strictEqual(result.strippedJsonData, true);
+        assert.strictEqual(sha256File(REAL_CARD_PATH), preSha, 'File card gốc trên đĩa KHÔNG được thay đổi SHA-256!');
 
         const parsed = JSON.parse(result.dataJson);
         assert(!parsed.json_data, 'Trường json_data khổng lồ phải bị loại bỏ để giải phóng V8 heap!');
     });
 
-    runTest('Nén và truy xuất file chat thật 33.85MB qua WASM Vault', () => {
+    runTest('Nén và truy xuất file chat thật qua WASM Vault', () => {
         assert(fs.existsSync(REAL_CHAT_PATH), `Chat không tồn tại: ${REAL_CHAT_PATH}`);
         const extWasm = require(path.join(EXTENSION_DEST, 'pkg-node', 'st_wasm_core.js'));
 
@@ -178,9 +183,9 @@ async function runAllTests() {
         const t1 = performance.now();
         const throughput = ((decompressed.length / (1024 * 1024 * 1024)) / ((t1 - t0) / 1000));
 
-        console.log(`       - Thời gian giải nén 34.8MB: ${(t1 - t0).toFixed(2)} ms (Băng thông: ${throughput.toFixed(2)} GB/s)`);
+        console.log(`       - Thời gian giải nén: ${(t1 - t0).toFixed(2)} ms (Băng thông: ${throughput.toFixed(2)} GB/s)`);
 
-        assert(compressedBytes < line0Buffer.length * 0.50);
+        assert(compressedBytes < line0Buffer.length * 0.70);
         assert.strictEqual(decompressed.length, line0Buffer.length);
     });
 

@@ -39,6 +39,7 @@ class MockEventEmitter {
 
 class MockElement {
     constructor(tagName, id = '', className = '') {
+        this.nodeType = 1;
         this.tagName = tagName.toUpperCase();
         this.id = id;
         this.className = className;
@@ -758,7 +759,101 @@ async function main() {
         scroller.onDomMutated([]);
         assert.strictEqual(scroller.messageNodes.size, 0, 'messageNodes Map phải sạch hoàn toàn sau clearChat()');
         assert.strictEqual(scroller.heightCache.size, 0, 'heightCache Map phải sạch hoàn toàn sau clearChat()');
+        assert.strictEqual(scroller.getStats().totalMessages, 0, 'totalMessages phải về 0 sau clearChat()');
         assert.strictEqual(scroller.spacerTop.parentNode, vChat, 'Spacers phải tự gắn lại an toàn cho chat kế tiếp');
+    });
+
+    await runTest('VirtualScroller: tái hiện 【Mira】Vấn Đạo (19 tin, mesid 10=6115px & mesid 18=7040px, scrollTop=0 -> Bottom-Anchor -> reset() an toàn)', async () => {
+        const { VirtualScroller } = await import(toUrl(path.join(__dirname, 'dom-virtual-scroller.js')));
+        const miraChat = new MockElement('div', 'chat');
+        miraChat.clientHeight = 725;
+        miraChat.scrollHeight = 725;
+
+        const prevQuery = global.document.querySelector;
+        global.document.querySelector = (sel) => (sel === '#chat' ? miraChat : prevQuery(sel));
+
+        try {
+            // Boot VirtualScroller on empty #chat (like SillyTavern startup)
+            const scroller = new VirtualScroller('#chat', { maxVisibleItems: 18, estimatedItemHeight: 120 });
+            scroller.init();
+            assert.strictEqual(scroller.getStats().totalMessages, 0);
+
+            // Simulate clearChat() followed by redisplayChat() inserting mesid 0..18 at scrollTop = 0
+            miraChat.children.length = 0;
+            miraChat.scrollTop = 0;
+            scroller.onDomMutated([]);
+            scroller.beginChatLoad();
+
+            const createdNodes = [];
+            for (let mesId = 0; mesId < 19; mesId++) {
+                const mes = new MockElement('div', '', 'mes');
+                mes.setAttribute('mesid', String(mesId));
+                const h = mesId === 10 ? 6115 : (mesId === 18 ? 7040 : 100);
+                mes.getBoundingClientRect = () => ({ height: h, width: 800, top: 0, bottom: h });
+                if (mesId === 18) {
+                    const iframe = new MockElement('iframe', 'TH-message--18--0');
+                    iframe.setAttribute('srcdoc', '<html><body>Mira HUD</body></html>');
+                    mes.appendChild(iframe);
+                }
+                miraChat.appendChild(mes);
+                createdNodes.push(mes);
+            }
+            miraChat.scrollHeight = 920 + 6115 + 700 + 7040; // ~14775px
+
+            // MutationObserver fires BEFORE scrollChatToBottom() while scrollTop === 0!
+            scroller.onDomMutated([{ type: 'childList', addedNodes: createdNodes, removedNodes: [] }]);
+
+            const domIdsAfterMount = miraChat.querySelectorAll('.mes').map(n => Number(n.getAttribute('mesid')));
+            for (let id = 11; id <= 18; id++) {
+                assert(domIdsAfterMount.includes(id), `mesid ${id} phải còn nguyên trong DOM khi scrollTop=0 ở phiên nạp chat`);
+            }
+            assert.strictEqual(scroller.getStats().totalMessages, 19, 'totalMessages phải chính xác bằng 19');
+            assert.strictEqual(miraChat.children[miraChat.children.length - 1], scroller.spacerBottom, 'spacerBottom phải luôn đứng cuối #chat');
+
+            // Verify manual scroller.reset() while #chat still holds .mes restores detachedNodes (0 orphan)
+            scroller.reset();
+            const domIdsAfterManualReset = miraChat.querySelectorAll('.mes').map(n => Number(n.getAttribute('mesid')));
+            assert.strictEqual(domIdsAfterManualReset.length, 19, 'reset() khi #chat còn .mes phải trả toàn bộ detachedNodes về DOM (0 mồ côi)');
+            assert.deepStrictEqual(domIdsAfterManualReset, Array.from({ length: 19 }, (_, i) => i), 'Thứ tự mesid 0..18 phải chuẩn xác');
+            assert.strictEqual(scroller.getStats().totalMessages, 19);
+
+            // Re-run update() and simulate scrollChatToBottom() -> scrollTop moves off 0
+            scroller.beginChatLoad();
+            scroller.update();
+            miraChat.scrollTop = miraChat.scrollHeight - miraChat.clientHeight;
+            scroller.onScroll();
+            scroller.update();
+
+            const domIdsAtBottom = miraChat.querySelectorAll('.mes').map(n => Number(n.getAttribute('mesid')));
+            for (let id = 11; id <= 18; id++) {
+                assert(domIdsAtBottom.includes(id), `mesid ${id} phải còn nguyên khi ở đáy chat`);
+            }
+            assert.strictEqual(scroller.getStats().totalMessages, 19);
+
+            // Scroll into the middle of super-tall mesid 18 (e.g., scrollTop = 6310) -> must keep buffered window, not shrink to 1 node
+            miraChat.scrollTop = 6310;
+            scroller.update();
+            const domIdsMid18 = miraChat.querySelectorAll('.mes').map(n => Number(n.getAttribute('mesid')));
+            assert(domIdsMid18.includes(18), 'mesid 18 phải còn trong DOM khi cuộn ở giữa tin nhắn siêu cao');
+            assert(domIdsMid18.length >= 17, `Không được co cửa sổ về vài node khi gặp tin siêu cao (got ${domIdsMid18.length})`);
+
+            // Now user deliberately scrolls all the way back to top (scrollTop = 0) -> mesid 0 must re-mount!
+            miraChat.scrollTop = 0;
+            scroller.update();
+            const domIdsBackTop = miraChat.querySelectorAll('.mes').map(n => Number(n.getAttribute('mesid')));
+            assert(domIdsBackTop.includes(0), 'Khi user cuộn ngược lên scrollTop=0 sau khi đã cuộn đáy, mesid 0 phải được gắn lại');
+
+            // Verify no node is orphaned from both #chat and scroller.messageNodes
+            for (const n of createdNodes) {
+                const id = Number(n.getAttribute('mesid'));
+                assert(
+                    n.parentNode === miraChat || scroller.messageNodes.get(id) === n,
+                    `Node mesid ${id} không được bị mồ côi khỏi cả #chat lẫn messageNodes`
+                );
+            }
+        } finally {
+            global.document.querySelector = prevQuery;
+        }
     });
 
     await runTest('Cổng G0: xác minh tài liệu hợp đồng Worker RPC, OPFS Header .stv3 & Shadow Snapshot đã đóng băng', () => {

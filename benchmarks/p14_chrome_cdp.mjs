@@ -23,14 +23,19 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { cleanupOrphanedCdpTempDirs, killProcessTree, removeDirWithRetry } from './cdp-cleanup.mjs';
+
+const require = createRequire(import.meta.url);
+const { resolveGenshinCardFixture } = require('../test-helpers/genshin-fixture.js');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '..');
 
 const CHROME_PATH = process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
-const TEYVAT_CARD_PATH = 'D:/ST/SillyTavern/data/default-user/characters/Genshin Impact · Teyvat.png';
+const TEYVAT_CARD_PATH = resolveGenshinCardFixture().cardPath;
 const HTH_CARD_PATH = 'D:/ST/SillyTavern/data/default-user/characters/【Mira】Hoàng Thiên Hậu Thổ.png';
 const TAILWIND_JS_PATH = 'D:/ST/SillyTavern/public/scripts/extensions/third-party/JS-Slash-Runner/lib/tailwindcss.min.js';
 
@@ -486,7 +491,8 @@ async function collectPerfMetrics(cdp) {
 }
 
 async function measureIsolatedChromeScenario(url, { verifyP14 = false } = {}) {
-    const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'st_rust_p14_cdp_'));
+    await cleanupOrphanedCdpTempDirs();
+    const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'st-p14-cdp-'));
     const chromeProc = spawn(
         CHROME_PATH,
         [
@@ -562,9 +568,8 @@ async function measureIsolatedChromeScenario(url, { verifyP14 = false } = {}) {
             uncaught,
         };
     } finally {
-        try { chromeProc.kill('SIGKILL'); } catch (_) {}
-        await new Promise((r) => setTimeout(r, 250));
-        try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch (_) {}
+        await killProcessTree(chromeProc.pid);
+        await removeDirWithRetry(userDataDir, 8, 350);
     }
 }
 

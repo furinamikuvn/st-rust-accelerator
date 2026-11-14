@@ -12,9 +12,11 @@ const assert = require('assert');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { resolveGenshinCardFixture, resolveHeavyChatWithMvh } = require('./test-helpers/genshin-fixture.js');
 
-const REAL_TEYVAT3_PATH =
-    'D:\\ST\\SillyTavern\\data\\default-user\\chats\\Genshin Impact · Teyvat3\\Genshin Impact · Teyvat - 2026-11-11@11h15m40s510ms.jsonl';
+const _genshinFix = resolveGenshinCardFixture();
+const _heavyMvhFix = resolveHeavyChatWithMvh();
+const REAL_TEYVAT3_PATH = _heavyMvhFix.found ? _heavyMvhFix.chatPath : _genshinFix.chatPath;
 
 function sha256(bufOrStr) {
     return crypto.createHash('sha256').update(bufOrStr).digest('hex');
