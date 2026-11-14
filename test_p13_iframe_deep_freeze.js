@@ -20,7 +20,12 @@ import { CanvasThrottler } from './canvas-throttler.js';
 import { RehydrationGuard, extractVaultRefHex } from './rehydration-guard.js';
 import { VaultClient } from './vault-client.js';
 import { createVaultWorkerRuntime } from './vault-worker.js';
-import { installExtensionReadHooks, rehydrationGuard as singletonRehydrationGuard } from './index.js';
+import {
+    installExtensionReadHooks,
+    installEventSourceHooks,
+    warmActiveChatColdReads,
+    rehydrationGuard as singletonRehydrationGuard,
+} from './index.js';
 
 const TEYVAT_PATH =
     'D:/ST/SillyTavern/data/default-user/chats/Genshin Impact · Teyvat3/Genshin Impact · Teyvat - 2026-11-11@11h15m40s510ms.jsonl';
@@ -586,27 +591,35 @@ async function runTests() {
             'Restored Teyvat3 multiverse_hypervisor must have exact top-level keys'
         );
 
-        // 4. Test installExtensionReadHooks() blocking cold message vault_ref leak & triggering async hydration
+        // 4. Test TavernHelper.getVariables, _bind._getVariables, _bind._getAllVariables (predefine.js)
+        //    & st-multiverse-hypervisor SlotRegistry.getChatMeta() on CHAT_CHANGED
         const prevWin = globalThis.window;
         const prevLatestKey = singletonRehydrationGuard.latestChatKey;
         const prevVault = singletonRehydrationGuard.vaultClient;
         const coldRefHex = 'cafe1234deadbeef';
+        const coldRefHex2 = 'beef5678cafe0001';
         const mockMsg1Vars = { hp: 99, quest: 'Archon_Chapter' };
+        const mockMsg2Vars = { stamina: 240, region: 'Liyue' };
         const fakeChat = [
             chatInRam[0],
-            { name: 'Lumine', mes: 'msg1', variables: [{ __st_rust_vault_ref: coldRefHex }] },
+            { name: 'Lumine', mes: 'msg1', swipe_id: 0, variables: [{ __st_rust_vault_ref: coldRefHex }] },
+            { name: 'Paimon', mes: 'msg2', swipe_id: 0, variables: { __st_rust_vault_ref: coldRefHex2 } },
         ];
         try {
             singletonRehydrationGuard.setVaultClient(vaultClient);
             singletonRehydrationGuard.latestChatKey = chatKey;
-            // Seed fake cold slot by testing async hydration triggered by getVariables():
             const origHydrateMsg = singletonRehydrationGuard.hydrateColdMessage.bind(singletonRehydrationGuard);
-            let bgCalls = 0;
+            const bgCallIndices = [];
             singletonRehydrationGuard.hydrateColdMessage = async (chatArr, idx, key) => {
-                bgCalls++;
+                bgCallIndices.push(idx);
                 await Promise.resolve();
-                chatArr[idx].variables = mockMsg1Vars;
-                singletonRehydrationGuard.warmReadCache.set(`${key}::${coldRefHex}`, { value: mockMsg1Vars, bytes: 32 });
+                if (idx === 1) {
+                    chatArr[idx].variables = [mockMsg1Vars];
+                    singletonRehydrationGuard.warmReadCache.set(`${key}::${coldRefHex}`, { value: [mockMsg1Vars], bytes: 32 });
+                } else if (idx === 2) {
+                    chatArr[idx].variables = [mockMsg2Vars];
+                    singletonRehydrationGuard.warmReadCache.set(`${key}::${coldRefHex2}`, { value: [mockMsg2Vars], bytes: 32 });
+                }
                 return { hydrated: true, bytes: 32 };
             };
             const stCtx = {
@@ -615,30 +628,135 @@ async function runTests() {
                 characterId: 0,
                 characters: [{ avatar: 'Genshin Impact · Teyvat3.png' }],
             };
+
+            const mockEvents = new Map();
+            const fakeEventSource = {
+                makeFirst(evName, fn) {
+                    const arr = mockEvents.get(evName) || [];
+                    arr.unshift(fn);
+                    mockEvents.set(evName, arr);
+                },
+                on(evName, fn) {
+                    const arr = mockEvents.get(evName) || [];
+                    arr.push(fn);
+                    mockEvents.set(evName, arr);
+                },
+                async emit(evName, payload) {
+                    for (const fn of (mockEvents.get(evName) || [])) {
+                        await fn(payload);
+                    }
+                },
+            };
+
             globalThis.window = {
                 SillyTavern: { getContext: () => stCtx },
-                TavernHelper: {
-                    getVariables(opt = {}) {
+            };
+            // Mount hooks before TavernHelper appears, then emit app_ready after TavernHelper loads
+            installEventSourceHooks(fakeEventSource);
+
+            globalThis.window.TavernHelper = {
+                getVariables(opt = {}) {
+                    if (opt.type === 'message') {
+                        const m = fakeChat[opt.message_id];
+                        return m?.variables?.[m?.swipe_id ?? 0] ?? {};
+                    }
+                    return stCtx.chatMetadata.variables;
+                },
+                _bind: {
+                    _getVariables(opt = {}) {
                         if (opt.type === 'message') {
-                            return fakeChat[opt.message_id]?.variables?.[0];
+                            const m = fakeChat[opt.message_id];
+                            return m?.variables?.[m?.swipe_id ?? 0] ?? {};
                         }
                         return stCtx.chatMetadata.variables;
                     },
+                    _getAllVariables() {
+                        const idStr = this.__TH_IFRAME_ID || this.name || '';
+                        const match = String(idStr).match(/TH-message--(\d+)/);
+                        const upper = match ? Number(match[1]) : 0;
+                        return Object.assign(
+                            {},
+                            stCtx.chatMetadata.variables,
+                            ...fakeChat.slice(0, upper + 1).map((m) => {
+                                const v = m?.variables;
+                                if (Array.isArray(v)) return v[m?.swipe_id ?? 0];
+                                return v;
+                            })
+                        );
+                    },
                 },
             };
-            installExtensionReadHooks();
-            const firstSyncRead = globalThis.window.TavernHelper.getVariables({ type: 'message', message_id: 1 });
-            assert.deepStrictEqual(firstSyncRead, {}, 'Wrapped getVariables must block { __st_rust_vault_ref } sentinel leak');
-            assert.strictEqual(bgCalls, 1, 'Wrapped getVariables must trigger background hydrateColdMessage');
+
+            await fakeEventSource.emit('app_ready');
+            assert.strictEqual(globalThis.window.TavernHelper.getVariables.__stRustReadGuarded, true, 'app_ready must hook TavernHelper.getVariables');
+            assert.strictEqual(globalThis.window.TavernHelper._bind._getVariables.__stRustReadGuarded, true, 'app_ready must hook _bind._getVariables');
+            assert.strictEqual(globalThis.window.TavernHelper._bind._getAllVariables.__stRustReadGuarded, true, 'app_ready must hook _bind._getAllVariables');
+
+            // Simulate predefine.js binding `_getVariables` & `_getAllVariables` to an iframe window
+            const fakeIframeWindow = { __TH_IFRAME_ID: 'TH-message--2--0', name: 'TH-message--2--0' };
+            const iframeGetVariables = globalThis.window.TavernHelper._bind._getVariables.bind(fakeIframeWindow);
+            const iframeGetAllVariables = globalThis.window.TavernHelper._bind._getAllVariables.bind(fakeIframeWindow);
+
+            const firstSyncRead = iframeGetVariables({ type: 'message', message_id: 1 });
+            assert.deepStrictEqual(firstSyncRead, {}, 'Wrapped _bind._getVariables must block { __st_rust_vault_ref } sentinel leak');
+            assert(bgCallIndices.includes(1), 'Wrapped _bind._getVariables must trigger background hydrateColdMessage(1)');
+
+            const firstAllRead = iframeGetAllVariables();
+            assert.strictEqual(firstAllRead.__st_rust_vault_ref, undefined, 'Wrapped _bind._getAllVariables must NEVER expose __st_rust_vault_ref');
+            assert(bgCallIndices.includes(2), '_getAllVariables must also detect array-level stripped chat[2].variables and trigger hydrateColdMessage(2)');
+
             await new Promise((r) => setTimeout(r, 15));
             fakeChat[1].variables = [{ __st_rust_vault_ref: coldRefHex }];
-            const warmCacheHitRead = globalThis.window.TavernHelper.getVariables({ type: 'message', message_id: 1 });
-            assert.deepStrictEqual(warmCacheHitRead, mockMsg1Vars, 'Subsequent getVariables must return warmReadCache hit');
+            fakeChat[2].variables = { __st_rust_vault_ref: coldRefHex2 };
+            const warmCacheHitRead = iframeGetVariables({ type: 'message', message_id: 1 });
+            assert.deepStrictEqual(warmCacheHitRead, mockMsg1Vars, 'Subsequent _bind._getVariables must return warmReadCache swipe slice');
+            const warmAllHitRead = iframeGetAllVariables();
+            assert.strictEqual(warmAllHitRead.hp, 99, '_getAllVariables must overlay warmed msg1 vars');
+            assert.strictEqual(warmAllHitRead.stamina, 240, '_getAllVariables must overlay warmed msg2 vars');
+            assert.strictEqual(warmAllHitRead.__st_rust_vault_ref, undefined);
             singletonRehydrationGuard.hydrateColdMessage = origHydrateMsg;
+
+            // 5. Test st-multiverse-hypervisor SlotRegistry.getChatMeta() with CHAT_CHANGED on real stripped Teyvat3
+            const scrubbedResp2 = await vaultClient.streamResponse(
+                new Response(rawTeyvatJson, { status: 200, headers: { 'Content-Type': 'application/json' } }),
+                { mode: 'CHAT_LOAD', coldThresholdBytes: 4096, keepLastMessages: 15, chatKey }
+            );
+            const mvhChatInRam = await scrubbedResp2.json();
+            assert(extractVaultRefHex(mvhChatInRam[0].chat_metadata.multiverse_hypervisor), 'Fresh Teyvat3 MVH starts cold');
+            stCtx.chat = mvhChatInRam;
+            stCtx.chatMetadata = mvhChatInRam[0].chat_metadata;
+
+            // Without window.MultiverseHypervisor -> MVH stays cold (only variables warms)
+            const noMvhWarm = await warmActiveChatColdReads();
+            assert.strictEqual(noMvhWarm.mvhHydrated, false, 'Without MVH extension, 44 MB MVH stays cold');
+            assert(extractVaultRefHex(stCtx.chatMetadata.multiverse_hypervisor), '44 MB MVH remains stripped without MVH');
+
+            // With window.MultiverseHypervisor loaded -> CHAT_CHANGED makeFirst hydrates MVH before SlotRegistry.getChatMeta()
+            let slotsReadByMvh = null;
+            const SlotRegistryMock = {
+                getChatMeta() {
+                    if (!stCtx.chatMetadata.multiverse_hypervisor) {
+                        stCtx.chatMetadata.multiverse_hypervisor = { slots: {} };
+                    }
+                    return stCtx.chatMetadata.multiverse_hypervisor;
+                },
+                ensurePrimarySlot() {
+                    const meta = this.getChatMeta();
+                    slotsReadByMvh = meta && meta.slots ? Object.keys(meta.slots) : null;
+                },
+            };
+            globalThis.window.MultiverseHypervisor = { SlotRegistry: SlotRegistryMock };
+            fakeEventSource.on('chat_id_changed', () => {
+                SlotRegistryMock.ensurePrimarySlot();
+            });
+            await fakeEventSource.emit('chat_id_changed');
+            assert(!extractVaultRefHex(stCtx.chatMetadata.multiverse_hypervisor), 'Active MVH extension triggers MVH hydration in CHAT_CHANGED');
+            assert(Array.isArray(slotsReadByMvh) && origMvhKeys.includes('slots'), 'SlotRegistry.getChatMeta() must see restored MVH slots rather than overwriting sentinel');
         } finally {
             singletonRehydrationGuard.setVaultClient(prevVault);
             singletonRehydrationGuard.latestChatKey = prevLatestKey;
             singletonRehydrationGuard.warmReadCache.delete(`${chatKey}::${coldRefHex}`);
+            singletonRehydrationGuard.warmReadCache.delete(`${chatKey}::${coldRefHex2}`);
             if (prevWin === undefined) delete globalThis.window;
             else globalThis.window = prevWin;
         }
@@ -646,7 +764,7 @@ async function runTests() {
         await vaultClient.shutdown();
         console.log(
             `[PASS] Test 4: Real Teyvat3 (${(rawTeyvatJson.length / (1024 * 1024)).toFixed(2)} MB) cold-read audit — ` +
-            `variables auto-warmed (${(warmRes.bytes / 1024).toFixed(1)} KB), getVariables hook hardened, & 44 MB MVH restored 1:1`
+            `variables auto-warmed (${(warmRes.bytes / 1024).toFixed(1)} KB), _bind._getVariables/_getAllVariables & MVH CHAT_CHANGED hardened`
         );
     }
 

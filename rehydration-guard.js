@@ -1388,33 +1388,56 @@ class RehydrationGuard {
     /**
      * Selectively pre-warms lightweight `chat_metadata.variables` (`<= maxWarmVariableBytes`, default 2 MiB)
      * so synchronous HUD readers such as `JS-Slash-Runner` `getVariables({ type: 'chat' })`
-     * work seamlessly while multi-megabyte blobs (e.g. `44 MB` `multiverse_hypervisor`) remain cold in OPFS/IDB.
+     * work seamlessly while multi-megabyte blobs (e.g. `44 MB` `multiverse_hypervisor`) remain cold in OPFS/IDB
+     * unless `options.hydrateMultiverseHypervisor` is explicitly enabled (when MVH extension is active).
      *
      * @param {Array} chatArray
      * @param {string} [chatKey]
      * @param {Object} [options={}]
-     * @returns {Promise<{ warmed: boolean, bytes: number, skippedReason?: string }>}
+     * @returns {Promise<{ warmed: boolean, bytes: number, mvhHydrated?: boolean, skippedReason?: string }>}
      */
     async hydrateWarmChatVariables(chatArray, chatKey = this.latestChatKey || '', options = {}) {
         const header = Array.isArray(chatArray) && chatArray[0] ? chatArray[0] : null;
         const meta = header && header.chat_metadata && typeof header.chat_metadata === 'object'
             ? header.chat_metadata
             : null;
-        if (!meta) return { warmed: false, bytes: 0, skippedReason: 'no_chat_metadata' };
+        if (!meta) return { warmed: false, bytes: 0, mvhHydrated: false, skippedReason: 'no_chat_metadata' };
+
+        let warmed = false;
+        let totalBytes = 0;
+        let skippedReason;
+        let mvhHydrated = false;
 
         const refHex = extractVaultRefHex(meta.variables);
-        if (!refHex) return { warmed: false, bytes: 0, skippedReason: 'not_cold_ref' };
-
-        const maxWarmVariableBytes = options.maxWarmVariableBytes ?? 2 * 1024 * 1024;
-        const res = await this.hydrateColdField(meta, 'variables', chatKey, { maxBytes: maxWarmVariableBytes });
-        if (res.hydrated) {
-            this.stats.warmChatVariablesHydrated++;
-            return { warmed: true, bytes: res.bytes };
+        if (refHex) {
+            const maxWarmVariableBytes = options.maxWarmVariableBytes ?? 2 * 1024 * 1024;
+            const res = await this.hydrateColdField(meta, 'variables', chatKey, { maxBytes: maxWarmVariableBytes });
+            if (res.hydrated) {
+                this.stats.warmChatVariablesHydrated++;
+                warmed = true;
+                totalBytes += res.bytes;
+            } else {
+                totalBytes += res.bytes;
+                skippedReason = res.oversized ? 'exceeds_warm_cap' : 'not_found_in_vault';
+            }
+        } else {
+            skippedReason = 'not_cold_ref';
         }
+
+        if (options.hydrateMultiverseHypervisor && extractVaultRefHex(meta.multiverse_hypervisor)) {
+            const mvhRes = await this.hydrateColdField(meta, 'multiverse_hypervisor', chatKey);
+            if (mvhRes.hydrated) {
+                warmed = true;
+                mvhHydrated = true;
+                totalBytes += mvhRes.bytes;
+            }
+        }
+
         return {
-            warmed: false,
-            bytes: res.bytes,
-            skippedReason: res.oversized ? 'exceeds_warm_cap' : 'not_found_in_vault',
+            warmed,
+            bytes: totalBytes,
+            mvhHydrated,
+            ...(warmed ? {} : { skippedReason }),
         };
     }
 

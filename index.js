@@ -982,62 +982,213 @@ async function warmActiveChatColdReads() {
         ? activeChat
         : (ctx && ctx.chatMetadata ? [{ chat_metadata: ctx.chatMetadata }] : null);
 
-    if (!targetChat) return { warmed: false, bytes: 0 };
+    if (!targetChat) return { warmed: false, bytes: 0, mvhHydrated: false };
 
+    const isMvhActive = typeof window !== 'undefined' && Boolean(window.MultiverseHypervisor);
     const res = await rehydrationGuard.hydrateWarmChatVariables(
         targetChat,
-        rehydrationGuard.latestChatKey || ''
+        rehydrationGuard.latestChatKey || '',
+        { hydrateMultiverseHypervisor: isMvhActive }
     );
-    if (res.warmed && ctx && ctx.chatMetadata && targetChat[0] && targetChat[0].chat_metadata) {
+    if (ctx && ctx.chatMetadata && targetChat[0] && targetChat[0].chat_metadata) {
         if (ctx.chatMetadata !== targetChat[0].chat_metadata) {
-            ctx.chatMetadata.variables = targetChat[0].chat_metadata.variables;
+            if (res.warmed && !extractVaultRefHex(targetChat[0].chat_metadata.variables)) {
+                ctx.chatMetadata.variables = targetChat[0].chat_metadata.variables;
+            }
+            if (res.mvhHydrated && !extractVaultRefHex(targetChat[0].chat_metadata.multiverse_hypervisor)) {
+                ctx.chatMetadata.multiverse_hypervisor = targetChat[0].chat_metadata.multiverse_hypervisor;
+            }
         }
     }
     return res;
 }
 
+function resolveMessageIndexForOption(activeChat, rawMsgId) {
+    if (!Array.isArray(activeChat) || activeChat.length === 0) return -1;
+    if (rawMsgId === undefined || rawMsgId === null || rawMsgId === 'latest' || rawMsgId === -1) {
+        return activeChat.length - 1;
+    }
+    let idx = Number(rawMsgId);
+    if (!Number.isInteger(idx)) return -1;
+    if (idx < 0) idx = activeChat.length + idx;
+    return idx >= 0 && idx < activeChat.length ? idx : -1;
+}
+
+function extractMessageVariablesSlice(cachedValue, swipeId) {
+    if (Array.isArray(cachedValue)) {
+        const slot = cachedValue[swipeId];
+        return slot && typeof slot === 'object' ? slot : {};
+    }
+    return cachedValue && typeof cachedValue === 'object' ? cachedValue : {};
+}
+
+function resolveMessageUpperBoundFromContext(iframeCtx, activeChat) {
+    if (!Array.isArray(activeChat) || activeChat.length === 0) return -1;
+    if (iframeCtx && typeof iframeCtx === 'object') {
+        const frameId =
+            iframeCtx.__TH_IFRAME_ID ||
+            (iframeCtx.frameElement && iframeCtx.frameElement.id) ||
+            iframeCtx.name ||
+            '';
+        const match = String(frameId).match(/TH-message--(\d+)/);
+        if (match) {
+            const parsed = Number(match[1]);
+            if (Number.isInteger(parsed) && parsed >= 0) {
+                return Math.min(activeChat.length - 1, parsed);
+            }
+        }
+    }
+    return activeChat.length - 1;
+}
+
+function sanitizeVaultSentinelsShallow(obj) {
+    if (!obj || typeof obj !== 'object') return obj;
+    if (extractVaultRefHex(obj)) {
+        delete obj.__st_rust_vault_ref;
+    }
+    return obj;
+}
+
 function installExtensionReadHooks() {
-    if (typeof window === 'undefined' || !window.TavernHelper) return;
+    if (typeof window === 'undefined') return;
+
     const th = window.TavernHelper;
-    const bindHost = th._bind && typeof th._bind.getVariables === 'function' ? th._bind : null;
-    const targets = [
-        typeof th.getVariables === 'function' ? { obj: th, key: 'getVariables' } : null,
-        bindHost ? { obj: bindHost, key: 'getVariables' } : null,
-    ].filter(Boolean);
+    if (th && typeof th === 'object') {
+        const bindHost = th._bind && typeof th._bind === 'object' ? th._bind : null;
+        const singleVarTargets = [
+            typeof th.getVariables === 'function' ? { obj: th, key: 'getVariables' } : null,
+            bindHost && typeof bindHost._getVariables === 'function' ? { obj: bindHost, key: '_getVariables' } : null,
+            bindHost && typeof bindHost.getVariables === 'function' ? { obj: bindHost, key: 'getVariables' } : null,
+        ].filter(Boolean);
 
-    for (const target of targets) {
-        const orig = target.obj[target.key];
-        if (!orig || orig.__stRustReadGuarded) continue;
+        for (const target of singleVarTargets) {
+            const orig = target.obj[target.key];
+            if (!orig || orig.__stRustReadGuarded) continue;
 
-        const wrapped = function stRustGuardedGetVariables(option = {}) {
-            const res = orig.apply(this, arguments);
-            const refHex = extractVaultRefHex(res);
-            if (!refHex) return res;
+            const wrappedGetVariables = function stRustGuardedGetVariables(option = {}) {
+                const activeChat = getActiveChatArray();
+                const ctx = getActiveStContext();
+                const chatKey = rehydrationGuard.latestChatKey || '';
+                const opt = option && typeof option === 'object' ? option : { type: 'chat' };
+                const type = opt.type || 'chat';
 
-            rehydrationGuard.stats.coldReadVaultRefsDetected++;
-            const activeChat = getActiveChatArray();
-            const ctx = getActiveStContext();
-            const chatKey = rehydrationGuard.latestChatKey || '';
-            const type = option && option.type;
+                const res = orig.apply(this, arguments);
+                let coldRefHex = extractVaultRefHex(res);
 
-            if (type === 'message' && Array.isArray(activeChat)) {
-                const msgId = Number(option.message_id);
-                if (Number.isInteger(msgId) && msgId >= 0) {
-                    rehydrationGuard.hydrateColdMessage(activeChat, msgId, chatKey).catch(() => {});
+                if (type === 'message' && Array.isArray(activeChat)) {
+                    const msgId = resolveMessageIndexForOption(activeChat, opt.message_id);
+                    if (msgId >= 0) {
+                        const msg = activeChat[msgId];
+                        const swipeId = msg && msg.swipe_id !== undefined ? Number(msg.swipe_id) : 0;
+                        const msgVars = msg ? msg.variables : null;
+                        const slotVars = Array.isArray(msgVars) ? msgVars[swipeId] : null;
+                        const detectedMsgRef =
+                            extractVaultRefHex(msgVars) ||
+                            extractVaultRefHex(slotVars) ||
+                            coldRefHex;
+
+                        if (detectedMsgRef) {
+                            coldRefHex = detectedMsgRef;
+                            rehydrationGuard.stats.coldReadVaultRefsDetected++;
+                            rehydrationGuard.hydrateColdMessage(activeChat, msgId, chatKey).catch(() => {});
+                            const cached = rehydrationGuard.warmReadCache.get(`${chatKey}::${detectedMsgRef}`);
+                            if (cached && cached.value && typeof cached.value === 'object') {
+                                rehydrationGuard.stats.warmReadCacheHits++;
+                                return extractMessageVariablesSlice(cached.value, swipeId);
+                            }
+                            return {};
+                        }
+                    }
+                } else if (type === 'chat' && ctx && ctx.chatMetadata) {
+                    const chatRef = extractVaultRefHex(ctx.chatMetadata.variables) || coldRefHex;
+                    if (chatRef) {
+                        coldRefHex = chatRef;
+                        rehydrationGuard.stats.coldReadVaultRefsDetected++;
+                        rehydrationGuard.hydrateColdField(ctx.chatMetadata, 'variables', chatKey).catch(() => {});
+                        const cached = rehydrationGuard.warmReadCache.get(`${chatKey}::${chatRef}`);
+                        if (cached && cached.value && typeof cached.value === 'object') {
+                            rehydrationGuard.stats.warmReadCacheHits++;
+                            return cached.value;
+                        }
+                        return {};
+                    }
                 }
-            } else if (type === 'chat' && ctx && ctx.chatMetadata) {
-                rehydrationGuard.hydrateColdField(ctx.chatMetadata, 'variables', chatKey).catch(() => {});
-            }
 
-            const cached = rehydrationGuard.warmReadCache.get(`${chatKey}::${refHex}`);
-            if (cached && cached.value && typeof cached.value === 'object') {
-                rehydrationGuard.stats.warmReadCacheHits++;
-                return cached.value;
-            }
-            return {};
-        };
-        wrapped.__stRustReadGuarded = true;
-        target.obj[target.key] = wrapped;
+                if (coldRefHex) {
+                    rehydrationGuard.stats.coldReadVaultRefsDetected++;
+                    const cached = rehydrationGuard.warmReadCache.get(`${chatKey}::${coldRefHex}`);
+                    if (cached && cached.value && typeof cached.value === 'object') {
+                        rehydrationGuard.stats.warmReadCacheHits++;
+                        return cached.value;
+                    }
+                    return {};
+                }
+                return res;
+            };
+            wrappedGetVariables.__stRustReadGuarded = true;
+            target.obj[target.key] = wrappedGetVariables;
+        }
+
+        const allVarTargets = [
+            typeof th.getAllVariables === 'function' ? { obj: th, key: 'getAllVariables' } : null,
+            bindHost && typeof bindHost._getAllVariables === 'function' ? { obj: bindHost, key: '_getAllVariables' } : null,
+        ].filter(Boolean);
+
+        for (const target of allVarTargets) {
+            const orig = target.obj[target.key];
+            if (!orig || orig.__stRustReadGuarded) continue;
+
+            const wrappedGetAllVariables = function stRustGuardedGetAllVariables() {
+                const activeChat = getActiveChatArray();
+                const ctx = getActiveStContext();
+                const chatKey = rehydrationGuard.latestChatKey || '';
+                const overlayWarmChunks = [];
+
+                if (ctx && ctx.chatMetadata) {
+                    const chatRef = extractVaultRefHex(ctx.chatMetadata.variables);
+                    if (chatRef) {
+                        rehydrationGuard.stats.coldReadVaultRefsDetected++;
+                        rehydrationGuard.hydrateColdField(ctx.chatMetadata, 'variables', chatKey).catch(() => {});
+                        const cached = rehydrationGuard.warmReadCache.get(`${chatKey}::${chatRef}`);
+                        if (cached && cached.value && typeof cached.value === 'object') {
+                            rehydrationGuard.stats.warmReadCacheHits++;
+                            overlayWarmChunks.push(cached.value);
+                        }
+                    }
+                }
+
+                const upperIdx = resolveMessageUpperBoundFromContext(this, activeChat);
+                if (Array.isArray(activeChat) && upperIdx >= 0) {
+                    for (let i = 0; i <= upperIdx; i++) {
+                        const msg = activeChat[i];
+                        if (!msg) continue;
+                        const swipeId = msg.swipe_id !== undefined ? Number(msg.swipe_id) : 0;
+                        const msgVars = msg.variables;
+                        const slotVars = Array.isArray(msgVars) ? msgVars[swipeId] : null;
+                        const refHex = extractVaultRefHex(msgVars) || extractVaultRefHex(slotVars);
+                        if (refHex) {
+                            rehydrationGuard.stats.coldReadVaultRefsDetected++;
+                            rehydrationGuard.hydrateColdMessage(activeChat, i, chatKey).catch(() => {});
+                            const cached = rehydrationGuard.warmReadCache.get(`${chatKey}::${refHex}`);
+                            if (cached && cached.value && typeof cached.value === 'object') {
+                                rehydrationGuard.stats.warmReadCacheHits++;
+                                overlayWarmChunks.push(extractMessageVariablesSlice(cached.value, swipeId));
+                            }
+                        }
+                    }
+                }
+
+                const res = orig.apply(this, arguments);
+                const out = res && typeof res === 'object' ? sanitizeVaultSentinelsShallow(res) : {};
+                for (let k = 0; k < overlayWarmChunks.length; k++) {
+                    Object.assign(out, overlayWarmChunks[k]);
+                }
+                delete out.__st_rust_vault_ref;
+                return out;
+            };
+            wrappedGetAllVariables.__stRustReadGuarded = true;
+            target.obj[target.key] = wrappedGetAllVariables;
+        }
     }
 }
 
@@ -1110,6 +1261,7 @@ function installEventSourceHooks(explicitEv = null) {
             updateTelemetryUI();
         });
         ev.on('app_ready', () => {
+            installExtensionReadHooks();
             tokenCacheGuard.installJQueryHook();
             pruneCharactersInMemory();
             updateTelemetryUI();
