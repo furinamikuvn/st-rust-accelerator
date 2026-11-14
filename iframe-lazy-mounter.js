@@ -26,7 +26,8 @@ function isProtectedIframe(iframe) {
     const title = (iframe.title || '').toLowerCase();
 
     const protectedKeywords = [
-        'tavern', 'helper', 'slash', 'mvu', 'hud', 
+        'th-message--', 'th-script--',
+        'tavern', 'helper', 'slash', 'mvu', 'hud',
         'game', 'status', 'dashboard', 'card', 'stage'
     ];
 
@@ -176,7 +177,6 @@ class IframeLazyMounter {
             totalIframes: this.managedIframes.size,
             sleepingIframes: sleepingCount,
             activeIframes: activeCount,
-            estimatedRamSavedMb: sleepingCount * 60,
         };
     }
 }

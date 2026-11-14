@@ -1,4 +1,51 @@
-/* ST-Rust-Accelerator Stylesheet */
+/* ST-Rust-Accelerator v3 Stylesheet */
 .st-rust-drawer {
     font-family: inherit;
+}
+
+.st-rust-v3-panel {
+    background: rgba(0, 0, 0, 0.24);
+    padding: 10px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    margin-bottom: 10px;
+}
+
+.st-rust-v3-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.st-rust-v3-toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.st-rust-v3-slots-input {
+    width: 52px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    background: rgba(15, 23, 42, 0.75);
+    color: inherit;
+    text-align: center;
+    font-weight: 600;
+}
+
+.st-rust-v3-telemetry-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 10px;
+    font-size: 0.84em;
+    line-height: 1.4;
+}
+
+.st-rust-v3-telemetry-span2 {
+    grid-column: span 2;
 }

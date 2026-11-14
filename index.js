@@ -718,76 +718,92 @@ function installSettingsDrawer() {
         return;
     }
 
+    const currentPoolMax = iframePoolInstance ? iframePoolInstance.getStats().maxActiveSlots : 2;
     const drawer = document.createElement('div');
     drawer.id = 'st-rust-accelerator-drawer';
-    drawer.className = 'inline-drawer';
+    drawer.className = 'inline-drawer st-rust-drawer';
     drawer.innerHTML = `
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b>🚀 ST Rust Accelerator (Lõi Tối Ưu Rust & Wasm v2.0)</b>
+            <b>🚀 ST Rust Accelerator v3.0 (4-Layer Browser Hypervisor)</b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content" style="padding: 10px; font-size: 0.9em; display: none;">
-            <div style="margin-bottom: 12px; background: rgba(0,0,0,0.25); padding: 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.08);">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                    <span><b>Lõi Backend Native WAL:</b></span>
-                    <span id="st-rust-server-badge" style="padding: 3px 8px; border-radius: 4px; background: #555; color: #fff; font-size: 0.85em; font-weight: bold;">Đang kiểm tra...</span>
+            <div class="st-rust-v3-panel">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 6px;">
+                    <span><b>Runtime Engine:</b></span>
+                    <span id="st-rust-server-badge" style="padding: 3px 8px; border-radius: 4px; background: #15803d; color: #fff; font-size: 0.82em; font-weight: bold;">100% Client-Side Browser Engine Active</span>
                 </div>
-                <div id="st-rust-server-desc" style="font-size: 0.82em; opacity: 0.85; line-height: 1.4;">
-                    Đang thăm dò endpoint /api/plugins/st-rust-accelerator/status...
+                <div id="st-rust-server-desc" style="font-size: 0.82em; opacity: 0.88; line-height: 1.4;">
+                    Chế độ chuẩn v3 chạy hoàn toàn trong trình duyệt (WASM Streaming + Worker OPFS Vault + Iframe Pool). Đang kiểm tra tùy chọn N-API Server Addon...
                 </div>
             </div>
 
-            <div style="margin-bottom: 10px;">
-                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
-                    <input type="checkbox" id="st-rust-toggle-scroller" ${isScrollerEnabled ? 'checked' : ''}>
-                    <span><b>Ảo hóa DOM Khung Chat (60 FPS)</b> <small style="opacity: 0.8;">(Giới hạn 18 tin nhắn, cuộn siêu mượt)</small></span>
-                </label>
-            </div>
-
-            <div style="margin-bottom: 10px;">
-                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+            <div class="st-rust-v3-toggle-row">
+                <label class="st-rust-v3-toggle-label">
                     <input type="checkbox" id="st-rust-toggle-interceptor" ${isInterceptorEnabled ? 'checked' : ''}>
-                    <span><b>Cắt tỉa Card & WASM LZ4 Vault</b> <small style="opacity: 0.8;">(Cắt 46.8MB json_data rác, giảm 73% V8 Heap)</small></span>
+                    <span><b>1. Streaming Scrubber, OPFS Vault &amp; Token Cache</b></span>
                 </label>
             </div>
 
-            <div style="margin-bottom: 10px;">
-                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
-                    <input type="checkbox" id="st-rust-toggle-lazymounter" ${isLazyMounterEnabled ? 'checked' : ''}>
-                    <span><b>Lazy Iframe HUD Mounter</b> <small style="opacity: 0.8;">(Sleep iframe ngầm, tiết kiệm 60MB RAM/tab)</small></span>
+            <div class="st-rust-v3-toggle-row">
+                <label class="st-rust-v3-toggle-label">
+                    <input type="checkbox" id="st-rust-toggle-scroller" ${isScrollerEnabled ? 'checked' : ''}>
+                    <span><b>2. DOM Virtual Scroller</b> <small style="opacity: 0.8;">(Cửa sổ 18 tin)</small></span>
                 </label>
             </div>
 
-            <div style="margin-bottom: 10px;">
-                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+            <div class="st-rust-v3-toggle-row">
+                <label class="st-rust-v3-toggle-label">
+                    <input type="checkbox" id="st-rust-toggle-hoister" ${isAssetHoisterEnabled ? 'checked' : ''}>
+                    <span><b>3. Iframe Asset Hoister</b> <small style="opacity: 0.8;">(Shared CSSStyleSheet &amp; Tailwind)</small></span>
+                </label>
+            </div>
+
+            <div class="st-rust-v3-toggle-row">
+                <label class="st-rust-v3-toggle-label">
+                    <input type="checkbox" id="st-rust-toggle-pool" ${isIframePoolEnabled ? 'checked' : ''}>
+                    <span><b>4. Active Iframe Pool &amp; Shadow Snapshot</b></span>
+                </label>
+                <label style="display: flex; align-items: center; gap: 4px; font-size: 0.85em;" title="Số iframe sống tối đa (1..6)">
+                    <span>Slots:</span>
+                    <input type="number" id="st-rust-pool-max-slots" class="st-rust-v3-slots-input" min="1" max="6" value="${currentPoolMax}">
+                </label>
+            </div>
+
+            <div class="st-rust-v3-toggle-row">
+                <label class="st-rust-v3-toggle-label">
                     <input type="checkbox" id="st-rust-toggle-compositor" ${isCompositorGuardEnabled ? 'checked' : ''}>
-                    <span><b>CSS Compositor Guard (P6)</b> <small style="opacity: 0.8;">(Khóa 73 Animation & Kính Mờ khi cuộn)</small></span>
+                    <span><b>5. Deep CSS Compositor Guard</b></span>
                 </label>
             </div>
 
-            <div style="margin-bottom: 12px;">
-                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+            <div class="st-rust-v3-toggle-row" style="margin-bottom: 12px;">
+                <label class="st-rust-v3-toggle-label">
                     <input type="checkbox" id="st-rust-toggle-canvas" ${isCanvasThrottlerEnabled ? 'checked' : ''}>
-                    <span><b>Canvas Smart Throttler (P7)</b> <small style="opacity: 0.8;">(Điều tốc 0/30/60 FPS cho thẻ có Canvas thật)</small></span>
+                    <span><b>6. Deep Canvas Smart Throttler</b></span>
                 </label>
             </div>
 
-            <div style="background: rgba(0,0,0,0.2); padding: 10px; border-radius: 6px; margin-bottom: 12px; border: 1px solid rgba(255,255,255,0.05);">
-                <div style="font-weight: bold; margin-bottom: 6px; color: #38bdf8;">📊 Telemetry Đo Lường Thực Tế:</div>
-                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 0.85em;">
-                    <div>• RAM cắt tỉa: <b id="st-rust-stat-stripped" style="color: #4ade80;">0.00 MB</b></div>
-                    <div>• Thẻ đã bóc tách: <b id="st-rust-stat-cards">0</b></div>
-                    <div>• DOM nodes hiện tại: <b id="st-rust-stat-dom">0</b></div>
-                    <div>• Wasm Engine: <b id="st-rust-stat-wasm" style="color: #4ade80;">Sẵn sàng</b></div>
-                    <div>• HUD bảo vệ (P6): <b id="st-rust-stat-hud" style="color: #4ade80;">0</b></div>
-                    <div>• Canvas Mode (P7): <b id="st-rust-stat-canvas-mode" style="color: #38bdf8;">NONE</b></div>
-                    <div style="grid-column: span 2;">• Frame Canvas đã tiết kiệm: <b id="st-rust-stat-frames-saved" style="color: #4ade80;">0 frames</b></div>
+            <div class="st-rust-v3-panel" style="margin-bottom: 12px;">
+                <div style="font-weight: bold; margin-bottom: 6px; color: #38bdf8;">📊 Telemetry Đo Lường Thực Tế (100% Runtime):</div>
+                <div class="st-rust-v3-telemetry-grid">
+                    <div>• Dữ liệu cắt tỉa: <b id="st-rust-stat-stripped" style="color: #4ade80;">0.00 MB</b></div>
+                    <div>• Card / Chat bóc tách: <b id="st-rust-stat-cards">0 / 0</b></div>
+                    <div class="st-rust-v3-telemetry-span2">• Cold Vault: <b id="st-rust-stat-vault" style="color: #4ade80;">Chờ khởi tạo</b></div>
+                    <div class="st-rust-v3-telemetry-span2">• Re-hydration Guard: <b id="st-rust-stat-rehydration" style="color: #38bdf8;">0</b></div>
+                    <div class="st-rust-v3-telemetry-span2">• Worldbook &amp; Token Cache: <b id="st-rust-stat-worldbook" style="color: #a78bfa;">0</b></div>
+                    <div class="st-rust-v3-telemetry-span2">• Asset Hoister &amp; Iframe Pool: <b id="st-rust-stat-hoister-pool" style="color: #fbbf24;">0</b></div>
+                    <div>• DOM #chat: <b id="st-rust-stat-dom">0</b></div>
+                    <div>• WASM Core: <b id="st-rust-stat-wasm" style="color: #4ade80;">Đang nạp</b></div>
+                    <div>• Compositor Guard: <b id="st-rust-stat-hud" style="color: #4ade80;">0</b></div>
+                    <div>• Canvas Mode: <b id="st-rust-stat-canvas-mode" style="color: #38bdf8;">NONE</b></div>
+                    <div class="st-rust-v3-telemetry-span2">• Frame Canvas tiết kiệm: <b id="st-rust-stat-frames-saved" style="color: #4ade80;">0 frames</b></div>
                 </div>
             </div>
 
             <div style="display: flex; gap: 8px;">
                 <button id="st-rust-btn-refresh" class="menu_button" style="flex: 1; padding: 6px 10px; cursor: pointer;">🔄 Làm Mới Số Liệu</button>
-                <button id="st-rust-btn-check-server" class="menu_button" style="flex: 1; padding: 6px 10px; cursor: pointer;">⚡ Kiểm Tra Server</button>
+                <button id="st-rust-btn-check-server" class="menu_button" style="flex: 1; padding: 6px 10px; cursor: pointer;">⚡ Kiểm Tra Runtime</button>
             </div>
         </div>
     `;
@@ -809,7 +825,7 @@ function installSettingsDrawer() {
             }
         }
         setTimeout(() => {
-            updateTelemetryUI();
+            vaultClient.refreshStats().catch(() => {}).finally(() => updateTelemetryUI());
             checkServerStatus();
         }, 60);
     });
@@ -825,15 +841,32 @@ function installSettingsDrawer() {
     const chkInterceptor = drawer.querySelector('#st-rust-toggle-interceptor');
     chkInterceptor.addEventListener('change', (e) => {
         isInterceptorEnabled = e.target.checked;
-        debugLog(`Network Interceptor toggled: ${isInterceptorEnabled}`);
+        tokenCacheGuard.setEnabled(isInterceptorEnabled);
+        debugLog(`Network Interceptor & Token Cache toggled: ${isInterceptorEnabled}`);
         updateTelemetryUI();
     });
 
-    const chkLazyMounter = drawer.querySelector('#st-rust-toggle-lazymounter');
-    chkLazyMounter.addEventListener('change', (e) => {
-        isLazyMounterEnabled = e.target.checked;
-        if (lazyMounterInstance) lazyMounterInstance.setEnabled(isLazyMounterEnabled);
-        debugLog(`Lazy Mounter toggled: ${isLazyMounterEnabled}`);
+    const chkHoister = drawer.querySelector('#st-rust-toggle-hoister');
+    chkHoister.addEventListener('change', (e) => {
+        isAssetHoisterEnabled = e.target.checked;
+        if (assetHoisterInstance) assetHoisterInstance.setEnabled(isAssetHoisterEnabled);
+        debugLog(`Iframe Asset Hoister toggled: ${isAssetHoisterEnabled}`);
+        updateTelemetryUI();
+    });
+
+    const chkPool = drawer.querySelector('#st-rust-toggle-pool');
+    chkPool.addEventListener('change', (e) => {
+        isIframePoolEnabled = e.target.checked;
+        if (iframePoolInstance) iframePoolInstance.setEnabled(isIframePoolEnabled);
+        debugLog(`Iframe Pool toggled: ${isIframePoolEnabled}`);
+        updateTelemetryUI();
+    });
+
+    const inputPoolSlots = drawer.querySelector('#st-rust-pool-max-slots');
+    inputPoolSlots.addEventListener('change', (e) => {
+        const clamped = iframePoolInstance ? iframePoolInstance.setMaxActiveSlots(e.target.value) : clampPoolSlots(e.target.value);
+        e.target.value = String(clamped);
+        debugLog(`Iframe Pool maxActiveSlots updated: ${clamped}`);
         updateTelemetryUI();
     });
 
@@ -854,34 +887,95 @@ function installSettingsDrawer() {
     });
 
     drawer.querySelector('#st-rust-btn-refresh').addEventListener('click', () => {
-        pruneCharactersInMemory();
-        updateTelemetryUI();
+        vaultClient.refreshStats().catch(() => {}).finally(() => {
+            pruneCharactersInMemory();
+            updateTelemetryUI();
+        });
     });
 
     drawer.querySelector('#st-rust-btn-check-server').addEventListener('click', () => {
-        checkServerStatus();
+        vaultClient.refreshStats().catch(() => {}).finally(() => {
+            checkServerStatus();
+            updateTelemetryUI();
+        });
     });
 
     checkServerStatus();
-    debugLog('Settings drawer installed.');
+    debugLog('Settings drawer v3.0 installed.');
 }
 
 /**
- * Updates telemetry data displayed within the Settings Drawer UI.
+ * Updates telemetry data displayed within the Settings Drawer UI using 100% real runtime metrics.
  */
 function updateTelemetryUI() {
     if (typeof document === 'undefined' || typeof document.getElementById !== 'function') return;
     const elStripped = document.getElementById('st-rust-stat-stripped');
     const elCards = document.getElementById('st-rust-stat-cards');
+    const elVault = document.getElementById('st-rust-stat-vault');
+    const elRehydration = document.getElementById('st-rust-stat-rehydration');
+    const elWorldbook = document.getElementById('st-rust-stat-worldbook');
+    const elHoisterPool = document.getElementById('st-rust-stat-hoister-pool');
     const elDom = document.getElementById('st-rust-stat-dom');
     const elWasm = document.getElementById('st-rust-stat-wasm');
     const elHud = document.getElementById('st-rust-stat-hud');
     const elCanvasMode = document.getElementById('st-rust-stat-canvas-mode');
     const elFramesSaved = document.getElementById('st-rust-stat-frames-saved');
+    const inputPoolSlots = document.getElementById('st-rust-pool-max-slots');
+
+    const vStats = vaultClient.getStats();
+    const rStats = rehydrationGuard.getStats();
+    const wbStats = worldbookFastScanner.getStats();
+    const tcStats = tokenCacheGuard.getStats();
+    const hoistStats = assetHoisterInstance ? assetHoisterInstance.getStats() : null;
+    const poolStats = iframePoolInstance ? iframePoolInstance.getStats() : null;
 
     if (elStripped) elStripped.textContent = `${(totalStrippedBytes / (1024 * 1024)).toFixed(2)} MB`;
-    if (elCards) elCards.textContent = totalInterceptedCards;
-    if (elWasm) elWasm.textContent = isWasmReady() ? 'Sẵn sàng (v1.0.0)' : 'Chưa tải';
+    if (elCards) elCards.textContent = `${totalInterceptedCards} cards / ${totalInterceptedChats} chats`;
+    if (elWasm) {
+        const linearMiB = ((vStats.linearMemoryBytes || 0) / (1024 * 1024)).toFixed(2);
+        elWasm.textContent = isWasmReady() || vStats.ready
+            ? `Sẵn sàng (v3.0, ${linearMiB} MiB)`
+            : 'Đang nạp';
+    }
+
+    if (elVault) {
+        const backendName = vStats.storageBackend || (vStats.degraded ? 'degraded' : 'initializing');
+        const rawMb = ((vStats.totalRawBytes || 0) / (1024 * 1024)).toFixed(2);
+        const compMb = ((vStats.totalCompressedBytes || 0) / (1024 * 1024)).toFixed(2);
+        const blobs = vStats.blobsStored || 0;
+        const dedup = vStats.dedupHits || 0;
+        elVault.textContent = `${backendName} | ${rawMb} MB -> ${compMb} MB | ${blobs} blobs (${dedup} dedup)`;
+    }
+
+    if (elRehydration) {
+        const blocks = (rStats.failClosedEditBlocks || 0) + (rStats.failClosedChatSaveBlocks || 0);
+        elRehydration.textContent =
+            `Chars ${rStats.charactersRehydrated || 0} (+${rStats.activeCardSubtreeRehydrations || 0} subtree) | ` +
+            `Chats ${rStats.chatsRehydrated || 0} (+${rStats.warmReadHydrations || 0} warm) | Blocks ${blocks}`;
+    }
+
+    if (elWorldbook) {
+        const scanMs = Number(wbStats.lastScanMs || 0).toFixed(2);
+        elWorldbook.textContent =
+            `Scans ${wbStats.totalScans || 0} (${scanMs} ms, ${wbStats.cachedWorldbooks || 0} worlds) | ` +
+            `Tokens ${tcStats.cacheHits || 0} hits / ${tcStats.singleflightCoalesced || 0} coalesced`;
+    }
+
+    if (elHoisterPool) {
+        const hDedup = hoistStats ? hoistStats.dedupedStyleSheets : 0;
+        const hUnique = hoistStats ? hoistStats.cachedUniqueSheets : 0;
+        const hTw = hoistStats ? hoistStats.hoistedTailwindFrames : 0;
+        const pLive = poolStats ? poolStats.activeLiveIframes : 0;
+        const pMax = poolStats ? poolStats.maxActiveSlots : 2;
+        const pSnap = poolStats ? poolStats.hibernatedSnapshots : 0;
+        const pMs = poolStats ? Number(poolStats.lastRehydrateMs || 0).toFixed(1) : '0.0';
+        elHoisterPool.textContent =
+            `CSS ${hDedup} (${hUnique} uniq) | TW ${hTw} | Pool ${pLive}/${pMax} live (${pSnap} shadow, ${pMs} ms)`;
+    }
+
+    if (inputPoolSlots && poolStats && document.activeElement !== inputPoolSlots) {
+        inputPoolSlots.value = String(poolStats.maxActiveSlots);
+    }
 
     if (elDom) {
         if (scrollerInstance && isScrollerEnabled) {
@@ -895,7 +989,9 @@ function updateTelemetryUI() {
 
     if (elHud && compositorGuardInstance) {
         const compStats = compositorGuardInstance.getStats();
-        elHud.textContent = `${compStats.observedContainersCount} (Đóng băng: ${compStats.pausedContainersCount})`;
+        elHud.textContent =
+            `${compStats.observedContainersCount} DOM (${compStats.pausedContainersCount} paused) | ` +
+            `${compStats.guardedIframesCount} HUD (${compStats.pausedInIframesCount} paused)`;
     }
 
     if (canvasThrottlerInstance) {
@@ -906,7 +1002,7 @@ function updateTelemetryUI() {
 }
 
 /**
- * Probes the backend server plugin status and updates status badge.
+ * Reports pure client-side engine readiness and optionally probes optional N-API server plugin.
  */
 async function checkServerStatus() {
     if (typeof document === 'undefined' || typeof document.getElementById !== 'function') return;
@@ -914,31 +1010,31 @@ async function checkServerStatus() {
     const desc = document.getElementById('st-rust-server-desc');
     if (!badge || !desc) return;
 
+    badge.style.background = '#15803d';
+    badge.textContent = '🟢 100% Client-Side Browser Engine Active';
+
+    const vStats = vaultClient.getStats();
+    const backendLabel = vStats.storageBackend || (vaultClient.isSupported() ? 'worker-pending' : 'memory');
     const probeFetch = originalFetch || (typeof window !== 'undefined' ? window.fetch : null);
-    if (typeof probeFetch !== 'function') return;
 
-    try {
-        badge.style.background = '#eab308';
-        badge.textContent = 'Đang dò...';
-
-        let res = await probeFetch('/api/plugins/st-rust-accelerator/status').catch(() => null);
-        if (!res || !res.ok) {
-            res = await probeFetch('/api/plugins/st-rust-accelerator/api/plugins/st-rust-accelerator/status').catch(() => null);
-        }
-        if (res && res.ok) {
-            const data = await res.json();
-            if (data.rust_ready) {
-                badge.style.background = '#16a34a';
-                badge.textContent = `🟢 Online (v${data.version}, 0.05ms)`;
-                desc.innerHTML = `Lõi Rust Addon Native đang chạy tốc độ tối đa! Uptime: <b>${Math.round(data.uptime)}s</b>.`;
-                return;
+    if (typeof probeFetch === 'function') {
+        try {
+            let res = await probeFetch('/api/plugins/st-rust-accelerator/status').catch(() => null);
+            if (!res || !res.ok) {
+                res = await probeFetch('/api/plugins/st-rust-accelerator/api/plugins/st-rust-accelerator/status').catch(() => null);
             }
-        }
-    } catch (_) {}
+            if (res && res.ok) {
+                const data = await res.json();
+                if (data.rust_ready) {
+                    badge.textContent = `🟢 Client v3.0 + Server WAL v${data.version}`;
+                    desc.textContent = `Trình duyệt: WASM + Worker Vault (${backendLabel}). Tùy chọn N-API Server Addon đang Online (uptime ${Math.round(data.uptime)}s).`;
+                    return;
+                }
+            }
+        } catch (_) {}
+    }
 
-    badge.style.background = '#dc2626';
-    badge.textContent = '🔴 Offline (Chưa nạp)';
-    desc.innerHTML = 'Server SillyTavern chưa nạp Plugin. Khởi động lại ST với cờ <code>SILLYTAVERN_ENABLESERVERPLUGINS=true</code> để kích hoạt lõi ghi đĩa 0.05ms.';
+    desc.textContent = `Đang chạy chuẩn v3 hoàn toàn phía trình duyệt (Vault: ${backendLabel}, không cần N-API server plugin).`;
 }
 
 function installPointerPrehydrate() {

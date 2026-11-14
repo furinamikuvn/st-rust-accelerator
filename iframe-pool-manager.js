@@ -519,6 +519,40 @@ class IframePoolManager {
         }
     }
 
+    _cleanupReplacedSnapshotHost(iframeId, parentNode) {
+        const staleHosts = new Set();
+        const existingEntry = iframeId ? this.snapshots.get(iframeId) : null;
+        if (existingEntry && existingEntry.host) {
+            staleHosts.add(existingEntry.host);
+        }
+        if (parentNode && typeof parentNode.querySelectorAll === 'function') {
+            const siblings = parentNode.querySelectorAll('.st-shadow-snapshot-host');
+            for (const h of siblings) {
+                staleHosts.add(h);
+            }
+        }
+        if (staleHosts.size === 0 && !existingEntry) return;
+
+        for (const host of staleHosts) {
+            const hostId = (host && host.getAttribute && host.getAttribute('data-st-iframe-id')) || iframeId;
+            const entry = hostId ? this.snapshots.get(hostId) : null;
+            if (entry && entry.onClick && typeof host.removeEventListener === 'function') {
+                host.removeEventListener('click', entry.onClick);
+            }
+            if (host && typeof host.remove === 'function') {
+                host.remove();
+            } else if (host && host.parentNode && typeof host.parentNode.removeChild === 'function') {
+                host.parentNode.removeChild(host);
+            }
+            if (hostId) {
+                this.snapshots.delete(hostId);
+            }
+        }
+        if (iframeId && this.snapshots.has(iframeId)) {
+            this.snapshots.delete(iframeId);
+        }
+    }
+
     scanExistingIframes() {
         const root = this.container || (typeof document !== 'undefined' ? document.body : null);
         if (!root || typeof root.querySelectorAll !== 'function') return;
@@ -555,6 +589,10 @@ class IframePoolManager {
         const iframeId = resolveIframeId(iframe, seq);
         const mesId = resolveMesId(iframe);
         const ts = nowMs();
+
+        // JS-Slash-Runner Iframe.vue swipe / edit / reloadAll removes old <iframe> but does not remove
+        // our hibernated `.st-shadow-snapshot-host` inside the same `.TH-render` container.
+        this._cleanupReplacedSnapshotHost(iframeId, iframe.parentNode);
 
         const slot = {
             iframeId,

@@ -22,6 +22,7 @@ import {
     captureCanvasSnapshots,
     extractStaticSnapshotBody,
 } from './iframe-pool-manager.js';
+import { IframeLazyMounter, isProtectedIframe } from './iframe-lazy-mounter.js';
 import {
     initExtension,
     IframePoolManager as IndexExportedPoolManager,
@@ -912,7 +913,72 @@ async function runTests() {
         console.log('Test 4 PASS');
     }
 
-    console.log(`\nALL P14 UNIT/INTEGRATION TESTS PASSED (${passed}/4)`);
+    // ─── Test 5: Swipe / Re-render Stale Shadow Host Cleanup + IframeLazyMounter Guard ───
+    console.log('--- Test 5: JS-Slash-Runner Swipe/Re-render Cleanup & LazyMounter Protection ---');
+    {
+        const env = createFakeDomEnv();
+        installGlobals(env);
+
+        const pool = new IframePoolManager({
+            chatSelector: '#chat',
+            maxActiveSlots: 2,
+            pinnedCooldownMs: 0,
+        });
+        pool.init();
+
+        // Mount 3 messages inside .TH-render wrapper like JS-Slash-Runner Vue Teleport
+        const wrappers = [];
+        for (let i = 0; i < 3; i++) {
+            const item = createHudMessage(env.parentDoc, i, { top: i === 0 ? -600 : 120, intersecting: i > 0 });
+            const renderWrap = env.parentDoc.createElement('div');
+            renderWrap.className = 'TH-render';
+            // move iframe inside div.TH-render
+            item.mes.removeChild(item.iframe);
+            renderWrap.appendChild(item.iframe);
+            item.mes.appendChild(renderWrap);
+            env.chatEl.appendChild(item.mes);
+            wrappers.push({ mes: item.mes, renderWrap });
+        }
+        pool.reconcilePool();
+        assert.strictEqual(pool.getStats().hibernatedSnapshots, 1);
+        const staleHost = wrappers[0].renderWrap.querySelector('.st-shadow-snapshot-host[data-st-iframe-id="TH-message--0-0"]');
+        assert.ok(staleHost, 'mes 0 inside div.TH-render must be hibernated');
+        assert.strictEqual(staleHost.listeners.get('click').size, 1, 'Host should have click listener');
+
+        // Simulate JS-Slash-Runner MESSAGE_SWIPED / Edit: mounts fresh <iframe id="TH-message--0-0"> into same div.TH-render without removing staleHost
+        const swipedIframe = env.parentDoc.createElement('iframe');
+        swipedIframe.id = 'TH-message--0-0';
+        swipedIframe.className = 'TH-message--raw TH-message--hud';
+        swipedIframe.setAttribute('src', 'blob:http://127.0.0.1/mock-swiped');
+        swipedIframe.srcdoc = '<!doctype html><html><body><div>Swiped HUD v2</div></body></html>';
+        wrappers[0].renderWrap.appendChild(swipedIframe);
+
+        assert.strictEqual(staleHost.parentNode, null, 'Stale .st-shadow-snapshot-host MUST be removed from .TH-render upon swipe/re-render');
+        assert.strictEqual(staleHost.listeners.get('click').size, 0, 'Stale host click listener MUST be detached');
+        assert.strictEqual(pool.getSnapshotRecord('TH-message--0-0'), null, 'Snapshot entry for swiped iframe MUST be deleted');
+
+        // Verify IframeLazyMounter skips TH-message--* (blob: URL mode) & TH-script--*, and omits estimatedRamSavedMb
+        const thMsgBlob = env.parentDoc.createElement('iframe');
+        thMsgBlob.id = 'TH-message--5-0';
+        thMsgBlob.setAttribute('src', 'blob:http://127.0.0.1/abc');
+        assert.strictEqual(isProtectedIframe(thMsgBlob), true, 'TH-message--* must be protected by IframeLazyMounter');
+
+        const thScript = env.parentDoc.createElement('iframe');
+        thScript.id = 'TH-script--12';
+        thScript.setAttribute('src', 'blob:http://127.0.0.1/def');
+        assert.strictEqual(isProtectedIframe(thScript), true, 'TH-script--* must be protected by IframeLazyMounter');
+
+        const mounter = new IframeLazyMounter();
+        const mStats = mounter.getStats();
+        assert.strictEqual('estimatedRamSavedMb' in mStats, false, 'estimatedRamSavedMb placeholder must be removed');
+
+        pool.destroy();
+        env.cleanupGlobals();
+        passed++;
+        console.log('Test 5 PASS');
+    }
+
+    console.log(`\nALL P14 UNIT/INTEGRATION TESTS PASSED (${passed}/5)`);
 }
 
 runTests().catch((err) => {

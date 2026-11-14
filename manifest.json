@@ -1,12 +1,12 @@
 {
-    "display_name": "ST Rust Accelerator (Memory, I/O & Compositor Optimizer)",
+    "display_name": "ST Rust Accelerator v3 (4-Layer Browser Hypervisor)",
     "loading_order": 1,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
     "author": "Nukumizu & Tawa",
-    "version": "2.0.2",
+    "version": "3.0.0",
     "homePage": "https://github.com/furinamikuvn/st-rust-accelerator",
-    "description": "Comprehensive SillyTavern performance & memory optimization suite (6-Layer Shield): Rust WASM LZ4 Vault, Network Interceptor, DOM Virtual Scroller, Iframe Lazy Mounter, CSS Compositor Guard & Canvas Motion Throttler. Eliminates 4.2GB RAM leaks, maintains 60 FPS for 100% of complex character cards."
+    "description": "4-Layer Client-Side Hypervisor for SillyTavern: Streaming Rust WASM (<=8 MiB) + Web Worker OPFS Zstd Cold Vault, Unicode Aho-Corasick Worldbook + Singleflight Tokenizer Cache, Asset Hoister (Shared CSSStyleSheet & Tailwind v4 Dedup), Active Iframe Pool + Shadow DOM Cold Snapshot, Deep CSS Compositor Guard & Canvas Throttler."
 }
