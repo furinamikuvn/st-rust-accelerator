@@ -978,7 +978,63 @@ async function runTests() {
         console.log('Test 5 PASS');
     }
 
-    console.log(`\nALL P14 UNIT/INTEGRATION TESTS PASSED (${passed}/5)`);
+    // ─── Test 6: MVH .mv-hud-viewport Multi-Tab Hidden Sibling Protection ───
+    console.log('--- Test 6: st-multiverse-hypervisor .mv-hud-viewport Sibling Tab Protection ---');
+    {
+        const env = createFakeDomEnv();
+        installGlobals(env);
+        globalThis.window.getComputedStyle = (el) => ({ display: el?.style?.display || 'block' });
+
+        const pool = new IframePoolManager({
+            chatSelector: '#chat',
+            maxActiveSlots: 1,
+            pinnedCooldownMs: 0,
+        });
+        pool.init();
+
+        // Older offscreen HUD message (mes 0) -> SHOULD still be hibernated when viewport fills
+        const oldMes = createHudMessage(env.parentDoc, 0, { top: -800, intersecting: false });
+        env.chatEl.appendChild(oldMes.mes);
+
+        // Active MVH viewport in latest message (mes 1) with 1 visible + 2 hidden sibling tabs (display: none)
+        const latestMes = env.parentDoc.createElement('div');
+        latestMes.className = 'mes';
+        latestMes.setAttribute('mesid', '1');
+        latestMes._rectTop = 100;
+        const viewport = env.parentDoc.createElement('div');
+        viewport.className = 'mv-hud-viewport';
+        viewport._rectTop = 100;
+        const mvhTabs = [];
+        for (let s = 0; s < 3; s++) {
+            const tabFrame = env.parentDoc.createElement('iframe');
+            tabFrame.id = `TH-message--1-${s}`;
+            tabFrame.className = 'TH-message--raw TH-message--hud';
+            tabFrame.setAttribute('data-mv-slot-id', `slot_${s}`);
+            tabFrame.style.display = s === 0 ? 'block' : 'none';
+            tabFrame._rectTop = s === 0 ? 100 : -9999;
+            tabFrame.srcdoc = `<!doctype html><html><body><div>MVH Slot ${s}</div></body></html>`;
+            viewport.appendChild(tabFrame);
+            mvhTabs.push(tabFrame);
+        }
+        latestMes.appendChild(viewport);
+        env.chatEl.appendChild(latestMes);
+
+        pool.reconcilePool();
+
+        // Hidden sibling MVH tabs MUST remain attached inside .mv-hud-viewport without Shadow replacement
+        for (let s = 0; s < 3; s++) {
+            assert.strictEqual(mvhTabs[s].parentNode, viewport, `MVH sibling tab slot_${s} must stay intact inside active .mv-hud-viewport`);
+        }
+        const staleOldHost = oldMes.mes.querySelector('.st-shadow-snapshot-host');
+        assert.ok(staleOldHost, 'Old offscreen mes 0 outside active .mv-hud-viewport MUST still hibernate into Shadow DOM');
+
+        pool.destroy();
+        env.cleanupGlobals();
+        passed++;
+        console.log('Test 6 PASS');
+    }
+
+    console.log(`\nALL P14 UNIT/INTEGRATION TESTS PASSED (${passed}/6)`);
 }
 
 runTests().catch((err) => {

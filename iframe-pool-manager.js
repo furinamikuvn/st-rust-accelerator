@@ -528,7 +528,10 @@ class IframePoolManager {
         if (parentNode && typeof parentNode.querySelectorAll === 'function') {
             const siblings = parentNode.querySelectorAll('.st-shadow-snapshot-host');
             for (const h of siblings) {
-                staleHosts.add(h);
+                const hId = h && h.getAttribute ? h.getAttribute('data-st-iframe-id') : null;
+                if (!iframeId || !hId || hId === iframeId) {
+                    staleHosts.add(h);
+                }
             }
         }
         if (staleHosts.size === 0 && !existingEntry) return;
@@ -711,8 +714,48 @@ class IframePoolManager {
         });
     }
 
+    _getMvhViewport(iframe) {
+        if (!iframe) return null;
+        let cur = iframe.parentNode || null;
+        while (cur) {
+            if (cur.classList && cur.classList.contains('mv-hud-viewport')) {
+                return cur;
+            }
+            cur = cur.parentNode || null;
+        }
+        if (iframe.hasAttribute && iframe.hasAttribute('data-mv-slot-id')) {
+            return iframe.parentNode || null;
+        }
+        return null;
+    }
+
+    _isHiddenMvhTab(iframe) {
+        const vp = this._getMvhViewport(iframe);
+        if (!vp) return false;
+        const hasSlotAttr = Boolean(iframe.hasAttribute && iframe.hasAttribute('data-mv-slot-id'));
+        const isHidden = Boolean(iframe.style && iframe.style.display === 'none');
+        return isHidden && (hasSlotAttr || (vp.classList && vp.classList.contains('mv-hud-viewport')));
+    }
+
+    _collectActiveMvhViewports(opts = {}) {
+        const activeViewports = new Set();
+        const now = nowMs();
+        for (const [iframe, slot] of this.liveSlots.entries()) {
+            const vp = this._getMvhViewport(iframe);
+            if (!vp) continue;
+            const isHidden = this._isHiddenMvhTab(iframe);
+            const isPinned = iframe === opts.pinnedIframe || slot.pinnedUntil > now;
+            if (isPinned || (!isHidden && (slot.isIntersecting || this._estimateIntersecting(vp)))) {
+                activeViewports.add(vp);
+            }
+        }
+        return activeViewports;
+    }
+
     /**
-     * Enforces `liveSlots.size <= maxActiveSlots` using `distance-lru` priority.
+     * Enforces `liveSlots.size <= maxActiveSlots` using `distance-lru` priority,
+     * while protecting hidden sibling MVH tabs (`data-mv-slot-id` in active `.mv-hud-viewport`)
+     * from premature `.replaceChild` detachment during tab switches.
      *
      * @param {{ pinnedIframe?: HTMLIFrameElement }} [opts={}]
      * @returns {number} Number of iframes dehydrated in this pass
@@ -730,15 +773,22 @@ class IframePoolManager {
         if (totalLive <= this.options.maxActiveSlots) return 0;
 
         const now = nowMs();
+        const activeMvhViewports = this._collectActiveMvhViewports(opts);
         const ranked = [];
         for (const [iframe, slot] of this.liveSlots.entries()) {
-            const isPinned = iframe === opts.pinnedIframe || slot.pinnedUntil > now;
-            const distance = this._computeViewportDistance(iframe);
+            const vp = this._getMvhViewport(iframe);
+            const isMvhProtected = Boolean(
+                vp && this._isHiddenMvhTab(iframe) && (activeMvhViewports.has(vp) || this._estimateIntersecting(vp))
+            );
+            const isPinned = iframe === opts.pinnedIframe || slot.pinnedUntil > now || isMvhProtected;
+            const distance = this._computeViewportDistance(vp || iframe);
             ranked.push({
                 iframe,
                 slot,
+                vp,
+                isMvhProtected,
                 isPinned,
-                isIntersecting: slot.isIntersecting,
+                isIntersecting: slot.isIntersecting || Boolean(vp && this._estimateIntersecting(vp)),
                 distance,
                 mesId: slot.mesId,
                 seq: slot.seq,
@@ -756,10 +806,29 @@ class IframePoolManager {
             return b.seq - a.seq;
         });
 
-        const toEvict = ranked.slice(this.options.maxActiveSlots);
+        // Also treat MVH hidden siblings of any viewport whose primary tab survived in top maxActiveSlots as protected
+        let primaryCount = 0;
+        const survivingViewports = new Set(activeMvhViewports);
+        const toEvict = [];
+        for (let i = 0; i < ranked.length; i++) {
+            const item = ranked[i];
+            if (item.isMvhProtected) continue;
+            if (primaryCount < this.options.maxActiveSlots) {
+                primaryCount++;
+                if (item.vp) survivingViewports.add(item.vp);
+            } else if (item.vp && this._isHiddenMvhTab(item.iframe) && survivingViewports.has(item.vp)) {
+                continue;
+            } else {
+                toEvict.push(item);
+            }
+        }
+
         let evicted = 0;
 
         for (const item of toEvict) {
+            if (this._isHiddenMvhTab(item.iframe) && item.vp && survivingViewports.has(item.vp)) {
+                continue;
+            }
             if (!this._isFrameReadyForSnapshot(item.iframe)) {
                 if (!item.slot.pendingTimer && typeof setTimeout === 'function') {
                     item.slot.pendingTimer = setTimeout(() => {
@@ -1106,13 +1175,18 @@ class IframePoolManager {
 
     _selectSingleEvictionVictim() {
         const now = nowMs();
+        const activeMvhViewports = this._collectActiveMvhViewports();
         let bestIframe = null;
         let bestScore = Infinity;
 
         for (const [iframe, slot] of this.liveSlots.entries()) {
+            const vp = this._getMvhViewport(iframe);
+            if (vp && this._isHiddenMvhTab(iframe) && (activeMvhViewports.has(vp) || this._estimateIntersecting(vp))) {
+                continue;
+            }
             const isPinned = slot.pinnedUntil > now ? 1 : 0;
             const visible = slot.isIntersecting ? 1 : 0;
-            const dist = this._computeViewportDistance(iframe);
+            const dist = this._computeViewportDistance(vp || iframe);
             // Higher score stays; lowest score is evicted
             const score =
                 isPinned * 1e9 +

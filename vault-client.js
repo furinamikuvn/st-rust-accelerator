@@ -38,12 +38,18 @@ class VaultClient {
      * @param {number} [options.initTimeoutMs=4000] - Max startup wait for Worker + WASM/OPFS boot
      * @param {number} [options.rpcTimeoutMs=15000] - Per-RPC timeout before fail-safe abort
      * @param {string} [options.storagePreference='auto'] - 'auto' | 'opfs' | 'idb' | 'memory'
+     * @param {string} [options.codecPreference='zstd'] - 'zstd' | 'lz4'
+     * @param {number} [options.opfsMaxCompressedBytes] - OPFS Auto-LRU cap (default 180 MiB)
      */
     constructor(options = {}) {
         this.workerFactory = options.workerFactory || null;
         this.initTimeoutMs = options.initTimeoutMs ?? 4000;
         this.rpcTimeoutMs = options.rpcTimeoutMs ?? 15000;
         this.storagePreference = options.storagePreference || 'auto';
+        this.codecPreference = options.codecPreference === 'lz4' ? 'lz4' : 'zstd';
+        this.opfsMaxCompressedBytes = Number(options.opfsMaxCompressedBytes) > 0
+            ? Number(options.opfsMaxCompressedBytes)
+            : 180 * 1024 * 1024;
 
         this.worker = null;
         this.ready = false;
@@ -61,6 +67,7 @@ class VaultClient {
             opfsSupported: false,
             hasSharedArrayBuffer: false,
             linearMemoryBytes: 0,
+            codecPreference: this.codecPreference,
             blobsStored: 0,
             charEntries: 0,
             chatEntries: 0,
@@ -70,6 +77,10 @@ class VaultClient {
             totalRawBytes: 0,
             totalCompressedBytes: 0,
             compressionRatio: 1,
+            lruEvictions: 0,
+            packCompactions: 0,
+            manifestSkippedSaves: 0,
+            opfsMaxCompressedBytes: this.opfsMaxCompressedBytes,
         };
     }
 
@@ -104,6 +115,8 @@ class VaultClient {
                     {
                         wasmUrl,
                         storagePreference: this.storagePreference,
+                        codecPreference: this.codecPreference,
+                        opfsMaxCompressedBytes: this.opfsMaxCompressedBytes,
                     },
                     [],
                     this.initTimeoutMs
@@ -112,10 +125,12 @@ class VaultClient {
                 this.ready = true;
                 this.degraded = false;
                 this.initMeta = res;
+                this.codecPreference = res.codecPreference || this.codecPreference;
                 this.lastStats = {
                     ...this.lastStats,
                     initialized: true,
                     storageBackend: res.storageBackend,
+                    codecPreference: this.codecPreference,
                     opfsSupported: Boolean(res.opfsSupported),
                     hasSharedArrayBuffer: Boolean(res.hasSharedArrayBuffer),
                     linearMemoryBytes: Number(res.linearMemoryBytes || 0),
@@ -415,6 +430,8 @@ class VaultClient {
             hydratedCount: res.hydratedCount || 0,
             missingRefs: Array.isArray(res.missingRefs) ? res.missingRefs : [],
             cacheHits: res.cacheHits || 0,
+            rawSpliced: Boolean(res.rawSpliced),
+            hasUnresolvedSentinel: Boolean(res.hasUnresolvedSentinel),
         };
     }
 
@@ -444,6 +461,34 @@ class VaultClient {
     async invalidateCharacters(options = {}) {
         if (!this.isReady()) return { invalidated: 0 };
         const res = await this._sendRpc('INVALIDATE_CHARACTER', options, [], this.rpcTimeoutMs);
+        this.refreshStats().catch(() => {});
+        return res;
+    }
+
+    /**
+     * Switches active `.stv3` compression codec inside the Dedicated Worker (`'zstd'` | `'lz4'`).
+     * Both formats stay mutually readable per 32-byte `.stv3` header without migration.
+     *
+     * @param {'zstd'|'lz4'} codecPreference
+     */
+    async setCodecPreference(codecPreference) {
+        const normalized = codecPreference === 'lz4' ? 'lz4' : 'zstd';
+        this.codecPreference = normalized;
+        this.lastStats.codecPreference = normalized;
+        if (!this.isReady()) {
+            return { codecPreference: normalized, pending: true };
+        }
+        const res = await this._sendRpc('SET_CODEC', { codecPreference: normalized }, [], this.rpcTimeoutMs);
+        if (res && res.codecPreference) {
+            this.codecPreference = res.codecPreference;
+            this.lastStats.codecPreference = res.codecPreference;
+        }
+        return res;
+    }
+
+    async compactPack(force = false) {
+        if (!this.isReady()) return { compactedFiles: 0, reclaimedBytes: 0 };
+        const res = await this._sendRpc('COMPACT_PACK', { force: Boolean(force) }, [], Math.max(this.rpcTimeoutMs, 30000));
         this.refreshStats().catch(() => {});
         return res;
     }

@@ -85,12 +85,27 @@ class VirtualScroller {
     }
 
     /**
+     * Executes DOM mutations from VirtualScroller while discarding synchronous
+     * MutationObserver records so Blink does not re-trigger `onDomMutated` on microtasks.
+     */
+    _runInternalMutation(fn) {
+        this.isInternalMutation = true;
+        try {
+            return fn();
+        } finally {
+            if (this.observer && typeof this.observer.takeRecords === 'function') {
+                this.observer.takeRecords();
+            }
+            this.isInternalMutation = false;
+        }
+    }
+
+    /**
      * Ensures top/bottom virtual spacers are attached inside the container.
      */
     _ensureSpacers() {
         if (!this.container || typeof document === 'undefined') return;
-        this.isInternalMutation = true;
-        try {
+        this._runInternalMutation(() => {
             if (!this.spacerTop) {
                 this.spacerTop = document.createElement('div');
                 this.spacerTop.className = 'st-virtual-spacer-top';
@@ -108,9 +123,7 @@ class VirtualScroller {
             if (!this._isSpacerAttached(this.spacerBottom)) {
                 this.container.appendChild(this.spacerBottom);
             }
-        } finally {
-            this.isInternalMutation = false;
-        }
+        });
     }
 
     /**
@@ -198,6 +211,33 @@ class VirtualScroller {
                 }
             }
         }
+
+        // Only run layout measurement/reconciliation when actual `.mes` nodes changed or spacers detached.
+        let relevantChange = !Array.isArray(mutations) || mutations.length === 0 || (this.spacerTop && !this._isSpacerAttached(this.spacerTop));
+        if (!relevantChange && Array.isArray(mutations)) {
+            const isRelevantNode = (n) => Boolean(
+                n && n.nodeType === 1 && (
+                    (n.classList && n.classList.contains('mes')) ||
+                    (typeof n.getAttribute === 'function' && n.getAttribute('mesid') !== null)
+                )
+            );
+            for (const m of mutations) {
+                if (m.addedNodes) {
+                    for (const n of m.addedNodes) {
+                        if (isRelevantNode(n)) { relevantChange = true; break; }
+                    }
+                }
+                if (relevantChange) break;
+                if (m.removedNodes) {
+                    for (const n of m.removedNodes) {
+                        if (!this.detachedNodes.has(n) && isRelevantNode(n)) { relevantChange = true; break; }
+                    }
+                }
+                if (relevantChange) break;
+            }
+        }
+
+        if (!relevantChange) return;
 
         this.measureElements();
         if (this.isEnabled) {
@@ -331,10 +371,28 @@ class VirtualScroller {
 
         let topSpacerHeight = 0;
         let bottomSpacerHeight = 0;
+        for (let i = 0; i < totalCount; i++) {
+            const node = this.messageNodes.get(sortedMesIds[i]);
+            if (!node) continue;
+            const isVisible = (i >= startIndex && i <= endIndex);
+            if (!isVisible && !this.containsActiveIframe(node)) {
+                if (i < startIndex) topSpacerHeight += heights[i] || this.estimatedItemHeight;
+                else if (i > endIndex) bottomSpacerHeight += heights[i] || this.estimatedItemHeight;
+            }
+        }
+
+        const nextTopCss = `${topSpacerHeight}px`;
+        const nextBottomCss = `${bottomSpacerHeight}px`;
+        if (this.spacerTop && this.spacerTop.style.height !== nextTopCss) {
+            this.spacerTop.style.height = nextTopCss;
+        }
+        if (this.spacerBottom && this.spacerBottom.style.height !== nextBottomCss) {
+            this.spacerBottom.style.height = nextBottomCss;
+        }
+
         let protectedIframes = 0;
 
-        this.isInternalMutation = true;
-        try {
+        this._runInternalMutation(() => {
             // Walk in reverse so visible nodes inserted dynamically maintain strict ascending mesid order.
             let nextMountedRef = this.spacerBottom;
             for (let i = totalCount - 1; i >= 0; i--) {
@@ -363,22 +421,12 @@ class VirtualScroller {
                             node.setAttribute('data-st-virtual-detached', '1');
                         }
                         node.remove();
-                        if (i < startIndex) topSpacerHeight += heights[i] || this.estimatedItemHeight;
-                        else if (i > endIndex) bottomSpacerHeight += heights[i] || this.estimatedItemHeight;
                     }
                 } else if (isInDom) {
                     nextMountedRef = node;
-                } else {
-                    if (i < startIndex) topSpacerHeight += heights[i] || this.estimatedItemHeight;
-                    else if (i > endIndex) bottomSpacerHeight += heights[i] || this.estimatedItemHeight;
                 }
             }
-        } finally {
-            this.isInternalMutation = false;
-        }
-
-        if (this.spacerTop) this.spacerTop.style.height = `${topSpacerHeight}px`;
-        if (this.spacerBottom) this.spacerBottom.style.height = `${bottomSpacerHeight}px`;
+        });
 
         this.protectedIframeCount = protectedIframes;
         this.visibleRange = {
@@ -397,8 +445,7 @@ class VirtualScroller {
         if (!enabled) {
             if (this.container) {
                 const sortedMesIds = Array.from(this.messageNodes.keys()).sort((a, b) => a - b);
-                this.isInternalMutation = true;
-                try {
+                this._runInternalMutation(() => {
                     let nextMountedRef = this.spacerBottom;
                     for (let i = sortedMesIds.length - 1; i >= 0; i--) {
                         const node = this.messageNodes.get(sortedMesIds[i]);
@@ -412,9 +459,7 @@ class VirtualScroller {
                         }
                         nextMountedRef = node;
                     }
-                } finally {
-                    this.isInternalMutation = false;
-                }
+                });
             }
             if (this.spacerTop) this.spacerTop.style.height = '0px';
             if (this.spacerBottom) this.spacerBottom.style.height = '0px';

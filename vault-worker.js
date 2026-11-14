@@ -87,14 +87,41 @@ function createEmptyManifest() {
         blobs: Object.create(null),
         chars: Object.create(null),
         chats: Object.create(null),
+        lru: {
+            chars: Object.create(null),
+            chats: Object.create(null),
+        },
         metrics: {
             uniqueVarBlobs: 0,
             dedupHits: 0,
             dedupSavedBytes: 0,
             totalRawBytes: 0,
             totalCompressedBytes: 0,
+            lruEvictions: 0,
+            packCompactions: 0,
+            manifestSkippedSaves: 0,
         },
     };
+}
+
+function normalizeManifestShape(m) {
+    if (!m || typeof m !== 'object') return createEmptyManifest();
+    if (!m.blobs || typeof m.blobs !== 'object') m.blobs = Object.create(null);
+    if (!m.chars || typeof m.chars !== 'object') m.chars = Object.create(null);
+    if (!m.chats || typeof m.chats !== 'object') m.chats = Object.create(null);
+    if (!m.lru || typeof m.lru !== 'object') m.lru = { chars: Object.create(null), chats: Object.create(null) };
+    if (!m.lru.chars || typeof m.lru.chars !== 'object') m.lru.chars = Object.create(null);
+    if (!m.lru.chats || typeof m.lru.chats !== 'object') m.lru.chats = Object.create(null);
+    if (!m.metrics || typeof m.metrics !== 'object') m.metrics = {};
+    m.metrics.uniqueVarBlobs = Number(m.metrics.uniqueVarBlobs || 0);
+    m.metrics.dedupHits = Number(m.metrics.dedupHits || 0);
+    m.metrics.dedupSavedBytes = Number(m.metrics.dedupSavedBytes || 0);
+    m.metrics.totalRawBytes = Number(m.metrics.totalRawBytes || 0);
+    m.metrics.totalCompressedBytes = Number(m.metrics.totalCompressedBytes || 0);
+    m.metrics.lruEvictions = Number(m.metrics.lruEvictions || 0);
+    m.metrics.packCompactions = Number(m.metrics.packCompactions || 0);
+    m.metrics.manifestSkippedSaves = Number(m.metrics.manifestSkippedSaves || 0);
+    return m;
 }
 
 /**
@@ -380,6 +407,107 @@ class OpfsSyncBackend {
         }
     }
 
+    /**
+     * Reclaims dead regions inside `packs/hot_pack_*.stv3` files when deleted/dead bytes
+     * exceed `thresholdRatio` (default 30% + >= 32 KiB, or when `force === true`).
+     */
+    async compactPack(manifest, { force = false, thresholdRatio = 0.30, minDeadBytes = 32 * 1024 } = {}) {
+        if (!manifest || !manifest.blobs || !this.packsDir) {
+            return { compactedFiles: 0, reclaimedBytes: 0 };
+        }
+        await this.endBatch();
+
+        const liveByFile = new Map();
+        for (const [hash64, entry] of Object.entries(manifest.blobs)) {
+            if (!entry || entry.storage !== 'pack' || !entry.file) continue;
+            let info = liveByFile.get(entry.file);
+            if (!info) {
+                info = { liveBytes: 0, entries: [] };
+                liveByFile.set(entry.file, info);
+            }
+            info.liveBytes += Number(entry.length || 0);
+            info.entries.push({ hash64, entry });
+        }
+
+        let compactedFiles = 0;
+        let reclaimedBytes = 0;
+
+        for (const [packFile, info] of liveByFile.entries()) {
+            let fh = null;
+            let srcSync = null;
+            let fileSize = 0;
+            try {
+                fh = await this.packsDir.getFileHandle(packFile, { create: false });
+                srcSync = await fh.createSyncAccessHandle();
+                fileSize = srcSync.getSize();
+            } catch (_) {
+                if (srcSync) try { srcSync.close(); } catch (_) {}
+                continue;
+            }
+
+            const deadBytes = Math.max(0, fileSize - info.liveBytes);
+            const ratio = fileSize > 0 ? deadBytes / fileSize : 0;
+            const shouldCompact = deadBytes > 0 && (force || (deadBytes >= minDeadBytes && ratio > thresholdRatio));
+            if (!shouldCompact) {
+                srcSync.close();
+                continue;
+            }
+
+            info.entries.sort((a, b) => (a.entry.offset || 0) - (b.entry.offset || 0));
+            this.compactSeq = (this.compactSeq || 0) + 1;
+            const newPackName = `hot_pack_${this.sessionTag}_c${Date.now().toString(36)}_${this.compactSeq}.stv3`;
+            const dstFh = await this.packsDir.getFileHandle(newPackName, { create: true });
+            const dstSync = await dstFh.createSyncAccessHandle();
+            let newOffset = 0;
+            try {
+                dstSync.truncate(0);
+                for (let i = 0; i < info.entries.length; i++) {
+                    const { entry } = info.entries[i];
+                    const buf = new Uint8Array(entry.length);
+                    srcSync.read(buf, { at: entry.offset });
+                    const written = dstSync.write(buf, { at: newOffset });
+                    entry.file = newPackName;
+                    entry.offset = newOffset;
+                    entry.length = written;
+                    newOffset += written;
+                }
+                dstSync.flush();
+            } finally {
+                dstSync.close();
+                srcSync.close();
+            }
+
+            try {
+                await this.packsDir.removeEntry(packFile);
+            } catch (_) {}
+
+            if (this.packFileName === packFile) {
+                this.packFileName = newPackName;
+                this.packOffset = newOffset;
+            }
+            compactedFiles++;
+            reclaimedBytes += deadBytes;
+        }
+
+        // Remove active empty pack file if zero live blobs remain in it
+        if (this.packFileName && !liveByFile.has(this.packFileName)) {
+            try {
+                const emptyFh = await this.packsDir.getFileHandle(this.packFileName, { create: false });
+                const sync = await emptyFh.createSyncAccessHandle();
+                const sz = sync.getSize();
+                sync.close();
+                if (sz > 0 && (force || sz >= minDeadBytes)) {
+                    await this.packsDir.removeEntry(this.packFileName);
+                    this.packOffset = 0;
+                    compactedFiles++;
+                    reclaimedBytes += sz;
+                }
+            } catch (_) {}
+        }
+
+        return { compactedFiles, reclaimedBytes };
+    }
+
     async close() {
         await this.endBatch();
     }
@@ -496,6 +624,10 @@ class IndexedDbBackend {
         });
     }
 
+    async compactPack() {
+        return { compactedFiles: 0, reclaimedBytes: 0 };
+    }
+
     async close() {
         await this.flushPendingWrites();
         if (this.db) {
@@ -531,6 +663,9 @@ class MemoryStv3Backend {
     async deleteBlob(entry) {
         if (entry) this.blobs.delete(entry.file);
     }
+    async compactPack() {
+        return { compactedFiles: 0, reclaimedBytes: 0 };
+    }
     async close() {
         this.blobs.clear();
         this.manifest = null;
@@ -543,8 +678,12 @@ class MemoryStv3Backend {
  * scrubbed objects (~1-3 KB each) until STREAM_END, where tail hot fields are hydrated before emission.
  */
 class RootArrayTailBuffer {
-    constructor(keepLastMessages) {
+    constructor(keepLastMessages, holdLine0 = false) {
         this.keepLastMessages = keepLastMessages;
+        this.holdLine0 = Boolean(holdLine0);
+        this.pendingLine0 = null;
+        this.line0Flushed = !this.holdLine0;
+        this.deferredAfterLine0 = [];
         this.seenArrayOpen = false;
         this.arrayClosed = false;
         this.depth = 0;
@@ -567,6 +706,14 @@ class RootArrayTailBuffer {
             passthroughStart = -1;
         };
 
+        const pushPostLine0 = (chunk) => {
+            if (this.holdLine0 && !this.line0Flushed) {
+                this.deferredAfterLine0.push(chunk);
+            } else {
+                emitParts.push(chunk);
+            }
+        };
+
         for (let i = 0; i < u8.byteLength; i++) {
             const b = u8[i];
 
@@ -581,7 +728,9 @@ class RootArrayTailBuffer {
             }
 
             if (this.arrayClosed) {
-                if (passthroughStart === -1) passthroughStart = i;
+                if (!this.holdLine0 || this.line0Flushed) {
+                    if (passthroughStart === -1) passthroughStart = i;
+                }
                 continue;
             }
 
@@ -597,7 +746,7 @@ class RootArrayTailBuffer {
                     this.depth = 2;
                     this.inString = false;
                     this.escapeNext = false;
-                    if (this.elemIndex === 0) {
+                    if (this.elemIndex === 0 && !this.holdLine0) {
                         passthroughStart = i;
                     } else {
                         this.currentBytes = [b];
@@ -607,7 +756,7 @@ class RootArrayTailBuffer {
             }
 
             // Inside element at depth >= 2
-            if (this.elemIndex === 0) {
+            if (this.elemIndex === 0 && !this.holdLine0) {
                 if (passthroughStart === -1) passthroughStart = i;
             } else {
                 this.currentBytes.push(b);
@@ -635,26 +784,31 @@ class RootArrayTailBuffer {
                 if (this.depth === 1) {
                     this.inElement = false;
                     if (this.elemIndex === 0) {
-                        flushPassthrough(i + 1);
+                        if (this.holdLine0) {
+                            this.pendingLine0 = Uint8Array.from(this.currentBytes);
+                            this.currentBytes = [];
+                        } else {
+                            flushPassthrough(i + 1);
+                        }
                     } else {
                         const msgBytes = Uint8Array.from(this.currentBytes);
                         this.currentBytes = [];
                         this.tailQueue.push({ elemIndex: this.elemIndex, bytes: msgBytes });
                         while (this.tailQueue.length > this.keepLastMessages) {
                             const released = this.tailQueue.shift();
-                            emitParts.push(Uint8Array.from([0x2C])); // ','
-                            emitParts.push(released.bytes);
+                            pushPostLine0(Uint8Array.from([0x2C])); // ','
+                            pushPostLine0(released.bytes);
                         }
                     }
                 }
             }
         }
 
-        if (this.inElement && this.elemIndex === 0 && passthroughStart !== -1) {
+        if (this.inElement && this.elemIndex === 0 && !this.holdLine0 && passthroughStart !== -1) {
             flushPassthrough(u8.byteLength);
         } else if (!this.seenArrayOpen && passthroughStart !== -1) {
             flushPassthrough(u8.byteLength);
-        } else if (this.arrayClosed && passthroughStart !== -1) {
+        } else if (this.arrayClosed && (!this.holdLine0 || this.line0Flushed) && passthroughStart !== -1) {
             flushPassthrough(u8.byteLength);
         }
 
@@ -686,7 +840,7 @@ class CharAvatarElementTracker {
         this.avatarsByElem = new Map();
     }
 
-    feedOutBytes(u8, onElementAvatar) {
+    feedOutBytes(u8, onElementAvatar, onElementEnd) {
         for (let i = 0; i < u8.byteLength; i++) {
             const b = u8[i];
 
@@ -788,7 +942,12 @@ class CharAvatarElementTracker {
                 this.expectValueForAvatar = false;
                 this.depth--;
                 if (this.depth < elemTargetDepth) {
+                    const endedIdx = this.elemIndex;
+                    const endedAvatar = this.avatarsByElem.get(endedIdx) || '';
                     this.inElement = false;
+                    if (onElementEnd && endedIdx >= 0) {
+                        onElementEnd(endedIdx, endedAvatar);
+                    }
                 }
             } else if (b > 0x20 && this.depth === elemTargetDepth) {
                 if (b === 0x2C) {
@@ -819,7 +978,23 @@ async function resolveVaultRefsInTree(node, fetchValueFn, options = {}) {
             if (!onlyKeys || onlyKeys.has(key)) {
                 const resolved = await fetchValueFn(val.__st_rust_vault_ref);
                 if (resolved !== undefined) {
-                    parent[key] = resolved;
+                    const siblingKeys = Object.keys(val).filter(
+                        (k) => k !== '__st_rust_vault_ref' && k !== '__st_rust_stripped' && !k.startsWith('__st_rust_')
+                    );
+                    if (
+                        siblingKeys.length > 0 &&
+                        resolved &&
+                        typeof resolved === 'object' &&
+                        !Array.isArray(resolved)
+                    ) {
+                        const merged = { ...resolved };
+                        for (let s = 0; s < siblingKeys.length; s++) {
+                            merged[siblingKeys[s]] = val[siblingKeys[s]];
+                        }
+                        parent[key] = merged;
+                    } else {
+                        parent[key] = resolved;
+                    }
                     count++;
                 } else {
                     missing.push(val.__st_rust_vault_ref);
@@ -879,6 +1054,387 @@ async function resolveVaultRefsInTree(node, fetchValueFn, options = {}) {
 }
 
 /**
+ * Linear string-aware JSON scanner that splices raw UTF-8 OPFS/IDB bytes for `{ "__st_rust_vault_ref": "<hash>" }`
+ * directly into a `POST /api/chats/save` payload without whole-document `JSON.parse` + `JSON.stringify`.
+ * Falls back cleanly to local object merge/parse only for rare sibling-mutated placeholder objects.
+ */
+async function rawSpliceVaultRefsInJsonBytes(u8, fetchRawEntryFn, fetchJsValueFn, options = {}) {
+    const onlyHashes = options && options.onlyHashes instanceof Set ? options.onlyHashes : null;
+    const n = u8.byteLength;
+    const ops = [];
+    const stack = [];
+    let hasUnresolvedSentinel = false;
+    let i = 0;
+
+    const skipWs = () => {
+        while (i < n) {
+            const c = u8[i];
+            if (c === 0x20 || c === 0x09 || c === 0x0A || c === 0x0D) i++;
+            else break;
+        }
+    };
+
+    const readJsonStringSpan = () => {
+        const start = i;
+        i++; // skip opening '"'
+        while (i < n) {
+            const b = u8[i++];
+            if (b === 0x5C) { // '\\'
+                if (i < n) i++;
+            } else if (b === 0x22) { // '"'
+                return { start, end: i };
+            }
+        }
+        return { start, end: n };
+    };
+
+    const popFrame = (endPos) => {
+        const frame = stack.pop();
+        if (!frame || frame.kind !== '{') return;
+
+        if (frame.vaultRefHex) {
+            if (onlyHashes && !onlyHashes.has(frame.vaultRefHex)) {
+                return;
+            }
+            while (ops.length > 0 && ops[ops.length - 1].start >= frame.startByte) {
+                ops.pop();
+            }
+            ops.push({
+                kind: frame.otherPropsCount === 0 ? 'vault' : 'merge',
+                start: frame.startByte,
+                end: endPos,
+                hex: frame.vaultRefHex,
+            });
+            return;
+        }
+        if (onlyHashes) return;
+
+        if (frame.stripProps.length === 1) {
+            const sp = frame.stripProps[0];
+            if (sp.commaBefore !== -1) {
+                ops.push({ kind: 'delete', start: sp.commaBefore, end: sp.valEnd });
+            } else if (sp.commaAfter !== -1) {
+                ops.push({ kind: 'delete', start: sp.keyStart, end: sp.commaAfter + 1 });
+            } else {
+                ops.push({ kind: 'delete', start: sp.keyStart, end: sp.valEnd });
+            }
+        } else if (frame.stripProps.length > 1) {
+            // Multiple __st_rust_* keys inside one object: strip via small object-local parse unless nested vault ops inside
+            const hasInner = ops.some((op) => op.start >= frame.startByte);
+            if (!hasInner) {
+                ops.push({ kind: 'clean_obj', start: frame.startByte, end: endPos });
+            } else {
+                // Fall back to safe JSON.parse in caller when nested vault ops coexist with multiple strip props
+                return 'abort';
+            }
+        }
+    };
+
+    while (i < n) {
+        skipWs();
+        if (i >= n) break;
+        const top = stack.length > 0 ? stack[stack.length - 1] : null;
+
+        if (top && top.kind === '{') {
+            if (top.state === 'keyOrEnd') {
+                const c = u8[i];
+                if (c === 0x7D) { // '}'
+                    i++;
+                    if (popFrame(i) === 'abort') return null;
+                    const p = stack.length > 0 ? stack[stack.length - 1] : null;
+                    if (p && p.kind === '{' && p.pendingProp) {
+                        p.pendingProp.valEnd = i;
+                        p.lastFinishedProp = p.pendingProp;
+                        p.pendingProp = null;
+                        p.state = 'afterVal';
+                    }
+                    continue;
+                }
+                if (c !== 0x22) return null; // Unexpected token -> abort raw scanner to safe JSON.parse fallback
+                const kSpan = readJsonStringSpan();
+                let keyStr = '';
+                if (kSpan.end - kSpan.start <= 64) {
+                    try {
+                        keyStr = JSON.parse(decoder.decode(u8.subarray(kSpan.start, kSpan.end)));
+                    } catch (_) {
+                        keyStr = '';
+                    }
+                }
+                skipWs();
+                if (u8[i] !== 0x3A) return null; // ':'
+                i++;
+                skipWs();
+                top.pendingProp = {
+                    keyStr,
+                    keyStart: kSpan.start,
+                    valStart: i,
+                    valEnd: i,
+                    commaBefore: top.prevCommaPos,
+                    commaAfter: -1,
+                };
+                top.state = 'readVal';
+                continue;
+            }
+
+            if (top.state === 'afterVal') {
+                const c = u8[i];
+                if (c === 0x2C) { // ','
+                    if (top.lastFinishedProp && top.lastFinishedProp.isStripProp && top.lastFinishedProp.commaBefore === -1) {
+                        top.lastFinishedProp.commaAfter = i;
+                    }
+                    top.prevCommaPos = i;
+                    top.state = 'keyOrEnd';
+                    i++;
+                    continue;
+                }
+                if (c === 0x7D) { // '}'
+                    i++;
+                    if (popFrame(i) === 'abort') return null;
+                    const p = stack.length > 0 ? stack[stack.length - 1] : null;
+                    if (p && p.kind === '{' && p.pendingProp) {
+                        p.pendingProp.valEnd = i;
+                        p.lastFinishedProp = p.pendingProp;
+                        p.pendingProp = null;
+                        p.state = 'afterVal';
+                    }
+                    continue;
+                }
+                return null;
+            }
+        } else if (top && top.kind === '[') {
+            const c = u8[i];
+            if (c === 0x5D) { // ']'
+                i++;
+                stack.pop();
+                const p = stack.length > 0 ? stack[stack.length - 1] : null;
+                if (p && p.kind === '{' && p.pendingProp) {
+                    p.pendingProp.valEnd = i;
+                    p.lastFinishedProp = p.pendingProp;
+                    p.pendingProp = null;
+                    p.state = 'afterVal';
+                }
+                continue;
+            }
+            if (c === 0x2C) {
+                i++;
+                continue;
+            }
+        }
+
+        // Parse next JSON value (either root, array item, or object prop value)
+        const c = u8[i];
+        if (c === 0x7B) { // '{'
+            stack.push({
+                kind: '{',
+                startByte: i,
+                state: 'keyOrEnd',
+                prevCommaPos: -1,
+                pendingProp: null,
+                lastFinishedProp: null,
+                vaultRefHex: null,
+                otherPropsCount: 0,
+                stripProps: [],
+            });
+            i++;
+        } else if (c === 0x5B) { // '['
+            stack.push({ kind: '[', startByte: i });
+            i++;
+        } else if (c === 0x22) { // '"'
+            const vSpan = readJsonStringSpan();
+            if (top && top.kind === '{' && top.pendingProp) {
+                const prop = top.pendingProp;
+                prop.valEnd = vSpan.end;
+                if (prop.keyStr === DEFAULT_CONSTANTS.vaultRefKey || prop.keyStr === '__st_rust_vault_ref') {
+                    try {
+                        const hexVal = JSON.parse(decoder.decode(u8.subarray(vSpan.start, vSpan.end)));
+                        if (typeof hexVal === 'string') {
+                            top.vaultRefHex = hexVal;
+                        } else {
+                            top.otherPropsCount++;
+                        }
+                    } catch (_) {
+                        top.otherPropsCount++;
+                    }
+                } else if (prop.keyStr === '__st_rust_stripped' || prop.keyStr.startsWith('__st_rust_')) {
+                    prop.isStripProp = true;
+                    top.stripProps.push(prop);
+                } else {
+                    if (
+                        prop.keyStr !== 'mes' &&
+                        vSpan.end - vSpan.start === 22 &&
+                        decoder.decode(u8.subarray(vSpan.start, vSpan.end)) === '"__ST_RUST_STRIPPED__"'
+                    ) {
+                        hasUnresolvedSentinel = true;
+                    }
+                    top.otherPropsCount++;
+                }
+                top.lastFinishedProp = prop;
+                top.pendingProp = null;
+                top.state = 'afterVal';
+            }
+        } else {
+            // Primitive (true, false, null, number)
+            const vStart = i;
+            while (i < n) {
+                const ch = u8[i];
+                if (ch === 0x2C || ch === 0x7D || ch === 0x5D || ch === 0x20 || ch === 0x09 || ch === 0x0A || ch === 0x0D) {
+                    break;
+                }
+                i++;
+            }
+            if (top && top.kind === '{' && top.pendingProp) {
+                const prop = top.pendingProp;
+                prop.valEnd = i;
+                if (prop.keyStr === '__st_rust_stripped' || prop.keyStr.startsWith('__st_rust_')) {
+                    prop.isStripProp = true;
+                    top.stripProps.push(prop);
+                } else {
+                    top.otherPropsCount++;
+                }
+                top.lastFinishedProp = prop;
+                top.pendingProp = null;
+                top.state = 'afterVal';
+            } else if (i === vStart) {
+                return null;
+            }
+        }
+    }
+
+    if (stack.length !== 0) return null;
+
+    if (ops.length === 0) {
+        return {
+            bytes: u8,
+            hydratedCount: 0,
+            missingRefs: [],
+            cacheHits: 0,
+            hasUnresolvedSentinel,
+        };
+    }
+
+    ops.sort((a, b) => a.start - b.start);
+
+    let hydratedCount = 0;
+    const missingRefs = [];
+    const entryCache = new Map();
+    const resolveUniqueHex = async (hex) => {
+        if (entryCache.has(hex)) return entryCache.get(hex);
+        const res = await fetchRawEntryFn(hex);
+        entryCache.set(hex, res || null);
+        return res || null;
+    };
+
+    const uniqueHexes = new Set();
+    for (let k = 0; k < ops.length; k++) {
+        if (ops[k].hex) uniqueHexes.add(ops[k].hex);
+    }
+    for (const h of uniqueHexes) {
+        await resolveUniqueHex(h);
+    }
+
+    const parts = [];
+    let cursor = 0;
+    let totalBytes = 0;
+
+    for (let k = 0; k < ops.length; k++) {
+        const op = ops[k];
+        if (op.start < cursor) continue;
+        if (op.start > cursor) {
+            const slice = u8.subarray(cursor, op.start);
+            parts.push(slice);
+            totalBytes += slice.byteLength;
+        }
+
+        if (op.kind === 'vault') {
+            const item = entryCache.get(op.hex);
+            if (!item || !item.rawBytes) {
+                missingRefs.push(op.hex);
+                const untouched = u8.subarray(op.start, op.end);
+                parts.push(untouched);
+                totalBytes += untouched.byteLength;
+            } else {
+                let repBytes = item.rawBytes;
+                if (item.valueKind === 'string') {
+                    repBytes = encoder.encode(JSON.stringify(decoder.decode(item.rawBytes)));
+                }
+                parts.push(repBytes);
+                totalBytes += repBytes.byteLength;
+                hydratedCount++;
+            }
+        } else if (op.kind === 'merge') {
+            const baseVal = await fetchJsValueFn(op.hex);
+            if (baseVal === undefined) {
+                missingRefs.push(op.hex);
+                const untouched = u8.subarray(op.start, op.end);
+                parts.push(untouched);
+                totalBytes += untouched.byteLength;
+            } else {
+                try {
+                    const siblingObj = JSON.parse(decoder.decode(u8.subarray(op.start, op.end)));
+                    let merged = baseVal;
+                    if (
+                        baseVal &&
+                        typeof baseVal === 'object' &&
+                        !Array.isArray(baseVal) &&
+                        siblingObj &&
+                        typeof siblingObj === 'object' &&
+                        !Array.isArray(siblingObj)
+                    ) {
+                        merged = { ...baseVal };
+                        for (const sk of Object.keys(siblingObj)) {
+                            if (sk !== '__st_rust_vault_ref' && sk !== '__st_rust_stripped' && !sk.startsWith('__st_rust_')) {
+                                merged[sk] = siblingObj[sk];
+                            }
+                        }
+                    }
+                    const repBytes = encoder.encode(JSON.stringify(merged));
+                    parts.push(repBytes);
+                    totalBytes += repBytes.byteLength;
+                    hydratedCount++;
+                } catch (_) {
+                    const repBytes = encoder.encode(JSON.stringify(baseVal));
+                    parts.push(repBytes);
+                    totalBytes += repBytes.byteLength;
+                    hydratedCount++;
+                }
+            }
+        } else if (op.kind === 'clean_obj') {
+            try {
+                const obj = JSON.parse(decoder.decode(u8.subarray(op.start, op.end)));
+                if (obj && typeof obj === 'object') {
+                    for (const sk of Object.keys(obj)) {
+                        if (sk.startsWith('__st_rust_')) delete obj[sk];
+                    }
+                }
+                const repBytes = encoder.encode(JSON.stringify(obj));
+                parts.push(repBytes);
+                totalBytes += repBytes.byteLength;
+            } catch (_) {
+                const untouched = u8.subarray(op.start, op.end);
+                parts.push(untouched);
+                totalBytes += untouched.byteLength;
+            }
+        }
+        // op.kind === 'delete' emits zero replacement bytes
+        cursor = op.end;
+    }
+
+    if (cursor < n) {
+        const tail = u8.subarray(cursor, n);
+        parts.push(tail);
+        totalBytes += tail.byteLength;
+    }
+
+    return {
+        bytes: concatUint8Arrays(parts, totalBytes),
+        hydratedCount,
+        missingRefs,
+        cacheHits: hydratedCount,
+        hasUnresolvedSentinel,
+    };
+}
+
+/**
  * Instantiates a Worker Vault runtime engine (works in Browser Dedicated Worker and Node test harnesses).
  */
 export function createVaultWorkerRuntime(overrides = {}) {
@@ -888,8 +1444,132 @@ export function createVaultWorkerRuntime(overrides = {}) {
     let backend = null;
     let manifest = createEmptyManifest();
     let codecPref = DEFAULT_CONSTANTS.codecZstd;
+    let codecPrefName = 'zstd';
+    let opfsMaxCompressedBytes = Number(overrides.opfsMaxCompressedBytes) > 0
+        ? Number(overrides.opfsMaxCompressedBytes)
+        : 180 * 1024 * 1024;
     const streams = new Map();
     const hotBlobCache = new Map(); // Bounded tiny decoded ref cache cleared post-hydrate if desired
+
+    function setActiveCodec(pref) {
+        if (pref === 'lz4' || pref === constants.codecLz4) {
+            codecPref = constants.codecLz4;
+            codecPrefName = 'lz4';
+        } else {
+            codecPref = constants.codecZstd;
+            codecPrefName = 'zstd';
+        }
+        return codecPrefName;
+    }
+
+    async function readRawBlobEntry(hash64) {
+        const entry = manifest.blobs[hash64];
+        if (!entry) return null;
+        const container = await backend.getBlob(entry);
+        if (!container) return null;
+        return {
+            rawBytes: decodeStv3Container(container, constants),
+            valueKind: entry.valueKind || 'json',
+        };
+    }
+
+    function touchLru(kind, key, now = Date.now()) {
+        if (!key) return false;
+        const bucket = kind === 'chars' ? manifest.lru.chars : manifest.lru.chats;
+        const prev = Number(bucket[key] || 0);
+        if (prev > 0 && now - prev < 300000) {
+            return false;
+        }
+        bucket[key] = now;
+        return true;
+    }
+
+    async function pruneUnreferencedBlobs(candidateHashes) {
+        if (!candidateHashes || candidateHashes.length === 0) return 0;
+        const activeRefs = computeContentRefsMap();
+        let freedBytes = 0;
+        const visited = new Set();
+        for (let i = 0; i < candidateHashes.length; i++) {
+            const h = candidateHashes[i];
+            if (visited.has(h)) continue;
+            visited.add(h);
+            if (!activeRefs.has(h) && manifest.blobs[h]) {
+                freedBytes += manifest.blobs[h].compressedBytes || 0;
+                manifest.metrics.totalRawBytes = Math.max(
+                    0,
+                    manifest.metrics.totalRawBytes - (manifest.blobs[h].rawBytes || 0)
+                );
+                manifest.metrics.totalCompressedBytes = Math.max(
+                    0,
+                    manifest.metrics.totalCompressedBytes - (manifest.blobs[h].compressedBytes || 0)
+                );
+                await backend.deleteBlob(manifest.blobs[h]);
+                delete manifest.blobs[h];
+            }
+        }
+        return freedBytes;
+    }
+
+    async function enforceStorageCap(protectedChatKey = '', protectedCharSet = null) {
+        if (!opfsMaxCompressedBytes || manifest.metrics.totalCompressedBytes <= opfsMaxCompressedBytes) {
+            return { evictedCount: 0, freedBytes: 0, compactedFiles: 0 };
+        }
+        const candidates = [];
+        for (const ck of Object.keys(manifest.chats)) {
+            if (ck === protectedChatKey) continue;
+            candidates.push({
+                kind: 'chat',
+                key: ck,
+                lastUsed: Number(manifest.lru.chats[ck] || 0),
+            });
+        }
+        for (const av of Object.keys(manifest.chars)) {
+            if (protectedCharSet && protectedCharSet.has(av)) continue;
+            candidates.push({
+                kind: 'char',
+                key: av,
+                lastUsed: Number(manifest.lru.chars[av] || 0),
+            });
+        }
+        // Evict oldest chats first, then oldest chars
+        candidates.sort((a, b) => {
+            if (a.kind !== b.kind) return a.kind === 'chat' ? -1 : 1;
+            return a.lastUsed - b.lastUsed;
+        });
+
+        let evictedCount = 0;
+        let freedBytes = 0;
+        for (let i = 0; i < candidates.length && manifest.metrics.totalCompressedBytes > opfsMaxCompressedBytes; i++) {
+            const c = candidates[i];
+            if (c.kind === 'chat' && manifest.chats[c.key]) {
+                const hashes = manifest.chats[c.key].hashes || [];
+                delete manifest.chats[c.key];
+                delete manifest.lru.chats[c.key];
+                evictedCount++;
+                const f = await pruneUnreferencedBlobs(hashes);
+                freedBytes += f;
+            } else if (c.kind === 'char' && manifest.chars[c.key]) {
+                const fields = manifest.chars[c.key];
+                const hashes = Object.keys(fields).map((k) => fields[k]);
+                delete manifest.chars[c.key];
+                delete manifest.lru.chars[c.key];
+                evictedCount++;
+                const f = await pruneUnreferencedBlobs(hashes);
+                freedBytes += f;
+            }
+        }
+
+        let compactedFiles = 0;
+        if (evictedCount > 0) {
+            manifest.metrics.lruEvictions += evictedCount;
+            const compRes = await backend.compactPack(manifest, { force: false });
+            compactedFiles = compRes.compactedFiles || 0;
+            if (compactedFiles > 0) {
+                manifest.metrics.packCompactions += compactedFiles;
+            }
+        }
+        return { evictedCount, freedBytes, compactedFiles };
+    }
 
     async function selectStorageBackend(preference = 'auto') {
         const pref = preference || 'auto';
@@ -1048,6 +1728,7 @@ export function createVaultWorkerRuntime(overrides = {}) {
                 manifest.metrics.uniqueVarBlobs++;
             }
             stream.storedNewBlobs++;
+            stream.manifestDirty = true;
         }
 
         stream.touchedHashes.add(hash64);
@@ -1056,8 +1737,17 @@ export function createVaultWorkerRuntime(overrides = {}) {
         if (stream.mode === constants.scrubModeCharList) {
             const avatar = meta.avatarHint || stream.explicitAvatar || stream.charTracker?.avatarsByElem.get(meta.elementIndex) || '';
             if (avatar) {
-                if (!manifest.chars[avatar]) manifest.chars[avatar] = Object.create(null);
-                manifest.chars[avatar][meta.fieldPath] = hash64;
+                if (!manifest.chars[avatar]) {
+                    manifest.chars[avatar] = Object.create(null);
+                    stream.manifestDirty = true;
+                }
+                if (manifest.chars[avatar][meta.fieldPath] !== hash64) {
+                    manifest.chars[avatar][meta.fieldPath] = hash64;
+                    stream.manifestDirty = true;
+                }
+                if (touchLru('chars', avatar)) {
+                    stream.manifestDirty = true;
+                }
                 stream.strippedAvatars.add(avatar);
             } else {
                 let pending = stream.pendingCharFields.get(meta.elementIndex);
@@ -1068,11 +1758,45 @@ export function createVaultWorkerRuntime(overrides = {}) {
                 pending.push({ fieldPath: meta.fieldPath, hash64 });
             }
         } else {
-            if (meta.elementIndex === 0 && meta.fieldPath.startsWith('chat_metadata.')) {
+            if (meta.elementIndex === 0) {
                 stream.line0Hashes.push(hash64);
+                if (stream.hydrateLine0KeySet && rawBytesLen <= stream.hydrateLine0MaxBytes) {
+                    const subKey = meta.fieldPath.startsWith('chat_metadata.')
+                        ? meta.fieldPath.slice('chat_metadata.'.length)
+                        : meta.fieldPath;
+                    const leafKey = subKey.includes('.') ? subKey.slice(subKey.lastIndexOf('.') + 1) : subKey;
+                    if (stream.hydrateLine0KeySet.has(subKey) || stream.hydrateLine0KeySet.has(leafKey)) {
+                        stream.line0AutoHydrateHashes.add(hash64);
+                    }
+                }
             } else {
                 stream.msgRefHashes[`msg_${meta.elementIndex}:${meta.fieldPath}`] = hash64;
             }
+        }
+    }
+
+    async function flushPendingLine0(stream) {
+        const tb = stream && stream.tailBuffer;
+        if (!tb || !tb.holdLine0 || !tb.pendingLine0 || tb.line0Flushed) return;
+        let line0Bytes = tb.pendingLine0;
+        tb.pendingLine0 = null;
+        tb.line0Flushed = true;
+        if (stream.line0AutoHydrateHashes && stream.line0AutoHydrateHashes.size > 0) {
+            try {
+                const res = await rawSpliceVaultRefsInJsonBytes(line0Bytes, readRawBlobEntry, readBlobJsValue, {
+                    onlyHashes: stream.line0AutoHydrateHashes,
+                });
+                if (res && res.bytes) {
+                    line0Bytes = res.bytes;
+                }
+            } catch (_) {}
+        }
+        stream.outChunks.push(line0Bytes);
+        if (tb.deferredAfterLine0.length > 0) {
+            for (let k = 0; k < tb.deferredAfterLine0.length; k++) {
+                stream.outChunks.push(tb.deferredAfterLine0[k]);
+            }
+            tb.deferredAfterLine0 = [];
         }
     }
 
@@ -1119,6 +1843,12 @@ export function createVaultWorkerRuntime(overrides = {}) {
         try {
             switch (type) {
                 case 'INIT_WASM': {
+                    if (payload && payload.codecPreference !== undefined) {
+                        setActiveCodec(payload.codecPreference);
+                    }
+                    if (payload && Number(payload.opfsMaxCompressedBytes) > 0) {
+                        opfsMaxCompressedBytes = Number(payload.opfsMaxCompressedBytes);
+                    }
                     if (!initialized) {
                         const wasmOk = overrides.wasmInitOverride
                             ? await overrides.wasmInitOverride(payload)
@@ -1130,22 +1860,41 @@ export function createVaultWorkerRuntime(overrides = {}) {
                         if (g0 && typeof g0 === 'object') {
                             constants = { ...DEFAULT_CONSTANTS, ...g0 };
                         }
+                        if (payload && payload.codecPreference !== undefined) {
+                            setActiveCodec(payload.codecPreference);
+                        }
                         backend = await selectStorageBackend(payload.storagePreference || 'auto');
                         const persisted = await backend.loadManifest();
-                        if (persisted && persisted.blobs) {
-                            manifest = persisted;
-                        } else {
-                            manifest = createEmptyManifest();
-                        }
+                        manifest = normalizeManifestShape(persisted);
                         initialized = true;
                     }
                     return wrapOk({
                         coreVersion: getWasmCoreVersion(),
                         storageBackend: backend.name,
+                        codecPreference: codecPrefName,
+                        opfsMaxCompressedBytes,
                         linearMemoryBytes: getLinearMemoryBytes(),
                         hasSharedArrayBuffer: false,
                         opfsSupported: backend.name === 'opfs-sync',
                     });
+                }
+
+                case 'SET_CODEC': {
+                    const activeName = setActiveCodec(payload.codecPreference);
+                    return wrapOk({
+                        codecPreference: activeName,
+                        codecId: codecPref,
+                    });
+                }
+
+                case 'COMPACT_PACK': {
+                    if (!initialized) throw makeRpcError('ERR_NOT_INITIALIZED', 'Worker not initialized');
+                    const compRes = await backend.compactPack(manifest, { force: Boolean(payload.force) });
+                    if (compRes.compactedFiles > 0) {
+                        manifest.metrics.packCompactions += compRes.compactedFiles;
+                        await backend.saveManifest(manifest);
+                    }
+                    return wrapOk(compRes);
                 }
 
                 case 'STREAM_BEGIN': {
@@ -1169,11 +1918,23 @@ export function createVaultWorkerRuntime(overrides = {}) {
                             : (modeNum === constants.scrubModeCharList ? 512 : 4096);
                     const keepLastMessages = payload.keepLastMessages !== undefined ? payload.keepLastMessages : 15;
                     const expectedTotalMessages = payload.expectedTotalMessages !== undefined ? payload.expectedTotalMessages : 0;
+                    const dedupCharSubtrees =
+                        modeNum === constants.scrubModeCharList &&
+                        payload.dedupCharSubtrees !== false &&
+                        (scrubFlags & (constants.scrubFlagCharJsonData | constants.scrubFlagCharColdSubtrees)) ===
+                            (constants.scrubFlagCharJsonData | constants.scrubFlagCharColdSubtrees);
 
                     await backend.beginBatch();
 
                     const activeRawSlices = new Map();
                     const outChunks = [];
+                    const hydrateLine0Keys = Array.isArray(payload.hydrateLine0Keys) && payload.hydrateLine0Keys.length > 0
+                        ? payload.hydrateLine0Keys.map((k) => String(k))
+                        : null;
+                    const hydrateLine0MaxBytes =
+                        Number(payload.hydrateLine0MaxBytes) > 0
+                            ? Number(payload.hydrateLine0MaxBytes)
+                            : 32 * 1024 * 1024;
                     const stream = {
                         streamId: payload.streamId,
                         mode: modeNum,
@@ -1182,6 +1943,14 @@ export function createVaultWorkerRuntime(overrides = {}) {
                         explicitAvatar: payload.avatar || '',
                         chatKey: payload.chatKey || 'active_chat',
                         hydrateTailAllRefs: Boolean(payload.hydrateTailAllRefs),
+                        hydrateLine0KeySet: hydrateLine0Keys ? new Set(hydrateLine0Keys) : null,
+                        hydrateLine0MaxBytes,
+                        line0AutoHydrateHashes: new Set(),
+                        dedupCharSubtrees,
+                        elemHasJsonData: new Set(),
+                        deferredCharSubtrees: new Map(),
+                        deferredCharBytes: 0,
+                        manifestDirty: false,
                         deltaStrippedBytes: 0,
                         blobCount: 0,
                         storedNewBlobs: 0,
@@ -1194,8 +1963,8 @@ export function createVaultWorkerRuntime(overrides = {}) {
                         readyToStoreQueue: [],
                         activeRawSlices,
                         tailBuffer:
-                            modeNum === constants.scrubModeChatLoad && expectedTotalMessages === 0 && keepLastMessages > 0
-                                ? new RootArrayTailBuffer(keepLastMessages)
+                            modeNum === constants.scrubModeChatLoad && expectedTotalMessages === 0 && (keepLastMessages > 0 || Boolean(hydrateLine0Keys))
+                                ? new RootArrayTailBuffer(keepLastMessages, Boolean(hydrateLine0Keys))
                                 : null,
                         charTracker:
                             modeNum === constants.scrubModeCharList
@@ -1215,19 +1984,40 @@ export function createVaultWorkerRuntime(overrides = {}) {
                         collectBlobs: false,
                         onOutChunk: (outSlice) => {
                             if (stream.charTracker) {
-                                stream.charTracker.feedOutBytes(outSlice, (elemIdx, avatar) => {
-                                    const pending = stream.pendingCharFields.get(elemIdx);
-                                    if (pending) {
-                                        if (!manifest.chars[avatar]) manifest.chars[avatar] = Object.create(null);
-                                        for (let i = 0; i < pending.length; i++) {
-                                            manifest.chars[avatar][pending[i].fieldPath] = pending[i].hash64;
+                                stream.charTracker.feedOutBytes(
+                                    outSlice,
+                                    (elemIdx, avatar) => {
+                                        const pending = stream.pendingCharFields.get(elemIdx);
+                                        if (pending) {
+                                            if (!manifest.chars[avatar]) {
+                                                manifest.chars[avatar] = Object.create(null);
+                                                stream.manifestDirty = true;
+                                            }
+                                            for (let i = 0; i < pending.length; i++) {
+                                                if (manifest.chars[avatar][pending[i].fieldPath] !== pending[i].hash64) {
+                                                    manifest.chars[avatar][pending[i].fieldPath] = pending[i].hash64;
+                                                    stream.manifestDirty = true;
+                                                }
+                                            }
+                                            if (touchLru('chars', avatar)) {
+                                                stream.manifestDirty = true;
+                                            }
+                                            stream.pendingCharFields.delete(elemIdx);
                                         }
-                                        stream.pendingCharFields.delete(elemIdx);
+                                        if (pending || (manifest.chars[avatar] && Object.keys(manifest.chars[avatar]).length > 0)) {
+                                            stream.strippedAvatars.add(avatar);
+                                        }
+                                    },
+                                    (endedIdx) => {
+                                        if (stream.elemHasJsonData.has(endedIdx)) {
+                                            const bucket = stream.deferredCharSubtrees.get(endedIdx);
+                                            if (bucket) {
+                                                stream.deferredCharBytes = Math.max(0, stream.deferredCharBytes - bucket.bytes);
+                                                stream.deferredCharSubtrees.delete(endedIdx);
+                                            }
+                                        }
                                     }
-                                    if (pending || (manifest.chars[avatar] && Object.keys(manifest.chars[avatar]).length > 0)) {
-                                        stream.strippedAvatars.add(avatar);
-                                    }
-                                });
+                                );
                             }
                             if (stream.tailBuffer) {
                                 const emitted = stream.tailBuffer.feedOutBytes(outSlice);
@@ -1255,6 +2045,46 @@ export function createVaultWorkerRuntime(overrides = {}) {
                             if (meta.isComplete) {
                                 activeRawSlices.delete(meta.blobId);
                                 stream.blobCount++;
+                                const rawBytesLen = Number(meta.rawBytes || 0);
+                                if (stream.dedupCharSubtrees) {
+                                    if (meta.fieldPath === 'json_data') {
+                                        stream.elemHasJsonData.add(meta.elementIndex);
+                                        const dropped = stream.deferredCharSubtrees.get(meta.elementIndex);
+                                        if (dropped) {
+                                            stream.deferredCharBytes = Math.max(0, stream.deferredCharBytes - dropped.bytes);
+                                            stream.deferredCharSubtrees.delete(meta.elementIndex);
+                                            manifest.metrics.dedupHits += dropped.items.length;
+                                            manifest.metrics.dedupSavedBytes += dropped.rawBytes;
+                                            stream.dedupHits += dropped.items.length;
+                                            stream.deltaStrippedBytes += dropped.rawBytes;
+                                        }
+                                    } else if (
+                                        meta.fieldPath === 'data.character_book' ||
+                                        meta.fieldPath === 'data.extensions.tavern_helper' ||
+                                        meta.fieldPath === 'data.extensions.regex_scripts'
+                                    ) {
+                                        if (stream.elemHasJsonData.has(meta.elementIndex)) {
+                                            manifest.metrics.dedupHits++;
+                                            manifest.metrics.dedupSavedBytes += rawBytesLen;
+                                            stream.dedupHits++;
+                                            stream.deltaStrippedBytes += rawBytesLen;
+                                            return;
+                                        }
+                                        const itemSize = blobState.pendingBytes + blobState.encodedBytes;
+                                        if (stream.deferredCharBytes + itemSize <= 4 * 1024 * 1024) {
+                                            let bucket = stream.deferredCharSubtrees.get(meta.elementIndex);
+                                            if (!bucket) {
+                                                bucket = { bytes: 0, rawBytes: 0, items: [] };
+                                                stream.deferredCharSubtrees.set(meta.elementIndex, bucket);
+                                            }
+                                            bucket.bytes += itemSize;
+                                            bucket.rawBytes += rawBytesLen;
+                                            bucket.items.push({ blobState, meta });
+                                            stream.deferredCharBytes += itemSize;
+                                            return;
+                                        }
+                                    }
+                                }
                                 stream.readyToStoreQueue.push({ blobState, meta });
                             }
                         },
@@ -1276,9 +2106,15 @@ export function createVaultWorkerRuntime(overrides = {}) {
                         const sub = chunkU8.subarray(off, Math.min(off + stepCap, chunkU8.byteLength));
                         stream.scrubber.feed(sub);
                         await flushPendingBlobPromises(stream);
+                        if (stream.tailBuffer && stream.tailBuffer.pendingLine0 && !stream.tailBuffer.line0Flushed) {
+                            await flushPendingLine0(stream);
+                        }
                     }
                     if (chunkU8.byteLength === 0) {
                         await flushPendingBlobPromises(stream);
+                        if (stream.tailBuffer && stream.tailBuffer.pendingLine0 && !stream.tailBuffer.line0Flushed) {
+                            await flushPendingLine0(stream);
+                        }
                     }
 
                     const scrubbed = concatUint8Arrays(stream.outChunks.splice(0, stream.outChunks.length));
@@ -1302,6 +2138,27 @@ export function createVaultWorkerRuntime(overrides = {}) {
 
                     const finishRes = stream.scrubber.finish();
                     await flushPendingBlobPromises(stream);
+                    if (stream.tailBuffer && stream.tailBuffer.pendingLine0 && !stream.tailBuffer.line0Flushed) {
+                        await flushPendingLine0(stream);
+                    }
+
+                    // Flush deferred `data.*` subtrees ONLY for character elements that had NO `json_data` field
+                    if (stream.deferredCharSubtrees && stream.deferredCharSubtrees.size > 0) {
+                        for (const [elemIdx, bucket] of stream.deferredCharSubtrees.entries()) {
+                            if (stream.elemHasJsonData.has(elemIdx)) {
+                                manifest.metrics.dedupHits += bucket.items.length;
+                                manifest.metrics.dedupSavedBytes += bucket.rawBytes;
+                                stream.dedupHits += bucket.items.length;
+                                stream.deltaStrippedBytes += bucket.rawBytes;
+                            } else {
+                                for (let i = 0; i < bucket.items.length; i++) {
+                                    await storeCompletedBlobFromState(bucket.items[i].blobState, bucket.items[i].meta, stream);
+                                }
+                            }
+                        }
+                        stream.deferredCharSubtrees.clear();
+                        stream.deferredCharBytes = 0;
+                    }
 
                     const tailParts = stream.outChunks.splice(0, stream.outChunks.length);
 
@@ -1313,9 +2170,18 @@ export function createVaultWorkerRuntime(overrides = {}) {
                                 stream.charTracker?.avatarsByElem.get(elemIdx) ||
                                 '';
                             if (avatar) {
-                                if (!manifest.chars[avatar]) manifest.chars[avatar] = Object.create(null);
+                                if (!manifest.chars[avatar]) {
+                                    manifest.chars[avatar] = Object.create(null);
+                                    stream.manifestDirty = true;
+                                }
                                 for (let i = 0; i < pending.length; i++) {
-                                    manifest.chars[avatar][pending[i].fieldPath] = pending[i].hash64;
+                                    if (manifest.chars[avatar][pending[i].fieldPath] !== pending[i].hash64) {
+                                        manifest.chars[avatar][pending[i].fieldPath] = pending[i].hash64;
+                                        stream.manifestDirty = true;
+                                    }
+                                }
+                                if (touchLru('chars', avatar)) {
+                                    stream.manifestDirty = true;
                                 }
                                 stream.strippedAvatars.add(avatar);
                             }
@@ -1325,7 +2191,9 @@ export function createVaultWorkerRuntime(overrides = {}) {
 
                     // Rehydrate hot last-K tail messages for MODE_CHAT_LOAD unknown-length stream
                     if (stream.tailBuffer) {
-                        const hotOnlyKeys = stream.hydrateTailAllRefs ? null : new Set(['variables', 'swipes', 'reasoning']);
+                        const hotOnlyKeys = stream.hydrateTailAllRefs
+                            ? null
+                            : new Set(['variables', 'swipes', 'reasoning', 'world_backstage', 'world_backstage_v1']);
                         for (let i = 0; i < stream.tailBuffer.tailQueue.length; i++) {
                             const item = stream.tailBuffer.tailQueue[i];
                             let emittedBytes = item.bytes;
@@ -1348,15 +2216,46 @@ export function createVaultWorkerRuntime(overrides = {}) {
                     }
 
                     if (stream.mode === constants.scrubModeChatLoad && stream.chatKey) {
-                        manifest.chats[stream.chatKey] = {
-                            hashes: Array.from(stream.touchedHashes),
-                            line0Hashes: stream.line0Hashes,
-                            msgRefHashes: stream.msgRefHashes,
-                        };
+                        const nextHashes = Array.from(stream.touchedHashes);
+                        const prevChat = manifest.chats[stream.chatKey];
+                        const sameChatMapping =
+                            prevChat &&
+                            Array.isArray(prevChat.hashes) &&
+                            prevChat.hashes.length === nextHashes.length &&
+                            prevChat.hashes.every((h, idx) => h === nextHashes[idx]) &&
+                            Array.isArray(prevChat.line0Hashes) &&
+                            prevChat.line0Hashes.length === stream.line0Hashes.length &&
+                            prevChat.line0Hashes.every((h, idx) => h === stream.line0Hashes[idx]);
+                        if (!sameChatMapping) {
+                            manifest.chats[stream.chatKey] = {
+                                hashes: nextHashes,
+                                line0Hashes: stream.line0Hashes,
+                                msgRefHashes: stream.msgRefHashes,
+                            };
+                            stream.manifestDirty = true;
+                        }
+                        if (touchLru('chats', stream.chatKey)) {
+                            stream.manifestDirty = true;
+                        }
                     }
 
                     await backend.endBatch();
-                    await backend.saveManifest(manifest);
+
+                    if (manifest.metrics.totalCompressedBytes > opfsMaxCompressedBytes) {
+                        const capRes = await enforceStorageCap(
+                            stream.mode === constants.scrubModeChatLoad ? stream.chatKey : '',
+                            stream.strippedAvatars
+                        );
+                        if (capRes.evictedCount > 0) {
+                            stream.manifestDirty = true;
+                        }
+                    }
+
+                    if (stream.manifestDirty) {
+                        await backend.saveManifest(manifest);
+                    } else {
+                        manifest.metrics.manifestSkippedSaves++;
+                    }
 
                     const scrubberStats = finishRes ? finishRes.stats : null;
                     streams.delete(payload.streamId);
@@ -1458,6 +2357,30 @@ export function createVaultWorkerRuntime(overrides = {}) {
                 case 'HYDRATE_CHAT_FOR_SAVE': {
                     if (!initialized) throw makeRpcError('ERR_NOT_INITIALIZED', 'Worker not initialized');
                     const rawInput = payload.chatPayload;
+
+                    // Fast path: UTF-8 Raw Byte Splice avoids parsing/re-stringifying 45 MB JSON trees in Worker RAM
+                    if (typeof rawInput === 'string' || rawInput instanceof ArrayBuffer || ArrayBuffer.isView(rawInput)) {
+                        const inputU8 = typeof rawInput === 'string' ? encoder.encode(rawInput) : toUint8Array(rawInput);
+                        const spliceRes = await rawSpliceVaultRefsInJsonBytes(inputU8, readRawBlobEntry, readBlobJsValue);
+                        if (spliceRes && spliceRes.bytes) {
+                            const outU8 = spliceRes.bytes;
+                            const ab = outU8.byteOffset === 0 && outU8.byteLength === outU8.buffer.byteLength
+                                ? (outU8 === inputU8 && typeof rawInput !== 'string' ? outU8.slice().buffer : outU8.buffer)
+                                : outU8.slice().buffer;
+                            return wrapOk(
+                                {
+                                    chatPayload: ab,
+                                    hydratedCount: spliceRes.hydratedCount,
+                                    missingRefs: spliceRes.missingRefs,
+                                    cacheHits: spliceRes.cacheHits,
+                                    hasUnresolvedSentinel: Boolean(spliceRes.hasUnresolvedSentinel),
+                                    rawSpliced: true,
+                                },
+                                [ab]
+                            );
+                        }
+                    }
+
                     let parsed;
                     if (typeof rawInput === 'string') {
                         parsed = JSON.parse(rawInput);
@@ -1485,6 +2408,7 @@ export function createVaultWorkerRuntime(overrides = {}) {
                             hydratedCount: res.count,
                             missingRefs: res.missing,
                             cacheHits: res.count,
+                            rawSpliced: false,
                         },
                         [ab]
                     );
@@ -1570,31 +2494,21 @@ export function createVaultWorkerRuntime(overrides = {}) {
                     const chatKey = String(payload.chatKey || '');
                     const existed = Boolean(manifest.chats[chatKey]);
                     if (!existed) {
-                        return wrapOk({ evicted: false, freedBytes: 0 });
+                        return wrapOk({ evicted: false, freedBytes: 0, compactedFiles: 0 });
                     }
                     const oldHashes = manifest.chats[chatKey].hashes || [];
                     delete manifest.chats[chatKey];
+                    if (manifest.lru && manifest.lru.chats) {
+                        delete manifest.lru.chats[chatKey];
+                    }
 
-                    const activeRefs = computeContentRefsMap();
-                    let freedBytes = 0;
-                    for (let i = 0; i < oldHashes.length; i++) {
-                        const h = oldHashes[i];
-                        if (!activeRefs.has(h) && manifest.blobs[h]) {
-                            freedBytes += manifest.blobs[h].compressedBytes || 0;
-                            manifest.metrics.totalRawBytes = Math.max(
-                                0,
-                                manifest.metrics.totalRawBytes - (manifest.blobs[h].rawBytes || 0)
-                            );
-                            manifest.metrics.totalCompressedBytes = Math.max(
-                                0,
-                                manifest.metrics.totalCompressedBytes - (manifest.blobs[h].compressedBytes || 0)
-                            );
-                            await backend.deleteBlob(manifest.blobs[h]);
-                            delete manifest.blobs[h];
-                        }
+                    const freedBytes = await pruneUnreferencedBlobs(oldHashes);
+                    const compRes = await backend.compactPack(manifest, { force: false });
+                    if (compRes.compactedFiles > 0) {
+                        manifest.metrics.packCompactions += compRes.compactedFiles;
                     }
                     await backend.saveManifest(manifest);
-                    return wrapOk({ evicted: true, freedBytes });
+                    return wrapOk({ evicted: true, freedBytes, compactedFiles: compRes.compactedFiles || 0 });
                 }
 
                 case 'INVALIDATE_CHARACTER': {
@@ -1612,25 +2526,17 @@ export function createVaultWorkerRuntime(overrides = {}) {
                                 candidateHashes.push(rec[fp]);
                             }
                             delete manifest.chars[av];
+                            if (manifest.lru && manifest.lru.chars) {
+                                delete manifest.lru.chars[av];
+                            }
                             removed++;
                         }
                     }
                     if (removed > 0) {
-                        const activeRefs = computeContentRefsMap();
-                        for (let i = 0; i < candidateHashes.length; i++) {
-                            const h = candidateHashes[i];
-                            if (!activeRefs.has(h) && manifest.blobs[h]) {
-                                manifest.metrics.totalRawBytes = Math.max(
-                                    0,
-                                    manifest.metrics.totalRawBytes - (manifest.blobs[h].rawBytes || 0)
-                                );
-                                manifest.metrics.totalCompressedBytes = Math.max(
-                                    0,
-                                    manifest.metrics.totalCompressedBytes - (manifest.blobs[h].compressedBytes || 0)
-                                );
-                                await backend.deleteBlob(manifest.blobs[h]);
-                                delete manifest.blobs[h];
-                            }
+                        await pruneUnreferencedBlobs(candidateHashes);
+                        const compRes = await backend.compactPack(manifest, { force: false });
+                        if (compRes.compactedFiles > 0) {
+                            manifest.metrics.packCompactions += compRes.compactedFiles;
                         }
                         await backend.saveManifest(manifest);
                     }
@@ -1645,6 +2551,8 @@ export function createVaultWorkerRuntime(overrides = {}) {
                     return wrapOk({
                         initialized,
                         storageBackend: backend ? backend.name : 'none',
+                        codecPreference: codecPrefName,
+                        opfsMaxCompressedBytes,
                         opfsSupported: backend ? backend.name === 'opfs-sync' : false,
                         hasSharedArrayBuffer: false,
                         linearMemoryBytes: initialized ? getLinearMemoryBytes() : 0,
@@ -1657,6 +2565,9 @@ export function createVaultWorkerRuntime(overrides = {}) {
                         totalRawBytes: manifest.metrics.totalRawBytes,
                         totalCompressedBytes: manifest.metrics.totalCompressedBytes,
                         compressionRatio: ratio,
+                        lruEvictions: manifest.metrics.lruEvictions,
+                        packCompactions: manifest.metrics.packCompactions,
+                        manifestSkippedSaves: manifest.metrics.manifestSkippedSaves,
                     });
                 }
 

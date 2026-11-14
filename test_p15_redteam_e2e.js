@@ -64,14 +64,18 @@ function sha256(bufOrStr) {
     return crypto.createHash('sha256').update(bufOrStr).digest('hex');
 }
 
-function extractPngCardJson(filePath) {
+function parsePngCardChunks(filePath) {
     const buf = fs.readFileSync(filePath);
+    const pngSig = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+    const hasValidSignature = buf.length >= 8 && buf.subarray(0, 8).equals(pngSig);
     let pos = 8;
     let charaJson = null;
     let ccv3Json = null;
+    const chunkTypes = [];
     while (pos + 8 <= buf.length) {
         const len = buf.readUInt32BE(pos);
         const type = buf.subarray(pos + 4, pos + 8).toString('ascii');
+        chunkTypes.push(type);
         if (type === 'tEXt' && pos + 8 + len <= buf.length) {
             const data = buf.subarray(pos + 8, pos + 8 + len);
             const nullIdx = data.indexOf(0);
@@ -86,7 +90,17 @@ function extractPngCardJson(filePath) {
         }
         pos += 12 + len;
     }
-    return ccv3Json || charaJson;
+    return {
+        hasValidSignature,
+        chunkTypes,
+        charaJson,
+        ccv3Json,
+        primaryJson: ccv3Json || charaJson,
+    };
+}
+
+function extractPngCardJson(filePath) {
+    return parsePngCardChunks(filePath).primaryJson;
 }
 
 function createWorkerBridge(runtime) {
@@ -439,8 +453,28 @@ async function runRedTeamE2E() {
     {
         const { cards, expectedRawByAvatar, fileCount } = loadRealCharacterCards();
         assert(fileCount >= 73, `Expected >= 73 PNG cards in characters dir, found ${fileCount}`);
-        const teyvat3Stat = fs.statSync(path.join(CHAR_DIR, 'Genshin Impact · Teyvat3.png'));
-        assert.strictEqual(teyvat3Stat.size, 50175781, 'Genshin Impact · Teyvat3.png must be restored (50,175,781 bytes)');
+        const teyvat3Path = path.join(CHAR_DIR, 'Genshin Impact · Teyvat3.png');
+        const teyvat3Stat = fs.statSync(teyvat3Path);
+        assert.strictEqual(teyvat3Stat.size, 50175781, `Genshin Impact · Teyvat3.png must stay intact (50,175,781 bytes, got ${teyvat3Stat.size})`);
+        const teyvat3Chunks = parsePngCardChunks(teyvat3Path);
+        assert.strictEqual(teyvat3Chunks.hasValidSignature, true, 'Teyvat3 PNG must have valid PNG header signature');
+        assert(teyvat3Chunks.chunkTypes.includes('IHDR') && teyvat3Chunks.chunkTypes.includes('IEND'), 'Teyvat3 PNG must have IHDR/IEND chunks');
+        assert(teyvat3Chunks.charaJson && teyvat3Chunks.ccv3Json, 'Teyvat3 PNG must contain both chara and ccv3 tEXt chunks');
+        const teyvat3Parsed = JSON.parse(teyvat3Chunks.ccv3Json);
+        assert(
+            Array.isArray(teyvat3Parsed?.data?.character_book?.entries) && teyvat3Parsed.data.character_book.entries.length > 0,
+            'Teyvat3 PNG must preserve data.character_book.entries'
+        );
+        assert(
+            Array.isArray(teyvat3Parsed?.data?.extensions?.tavern_helper?.scripts) &&
+                teyvat3Parsed.data.extensions.tavern_helper.scripts.length > 0,
+            'Teyvat3 PNG must preserve data.extensions.tavern_helper.scripts'
+        );
+        assert(
+            Array.isArray(teyvat3Parsed?.data?.extensions?.regex_scripts) &&
+                teyvat3Parsed.data.extensions.regex_scripts.length > 0,
+            'Teyvat3 PNG must preserve data.extensions.regex_scripts'
+        );
 
         const runtime = createVaultWorkerRuntime({
             opfsRootOverride: createMockOpfsRoot(),
@@ -505,6 +539,24 @@ async function runRedTeamE2E() {
                 expectedRawByAvatar.get(avatar).sha,
                 `SHA-256 mismatch on ${avatar} json_data`
             );
+            if (avatar === 'Genshin Impact · Teyvat3.png') {
+                const roundTripObj = JSON.parse(hydrated.jsonData);
+                assert.strictEqual(
+                    roundTripObj.data.character_book.entries.length,
+                    teyvat3Parsed.data.character_book.entries.length,
+                    'Teyvat3 round-trip character_book.entries count mismatch'
+                );
+                assert.strictEqual(
+                    roundTripObj.data.extensions.tavern_helper.scripts.length,
+                    teyvat3Parsed.data.extensions.tavern_helper.scripts.length,
+                    'Teyvat3 round-trip tavern_helper.scripts count mismatch'
+                );
+                assert.strictEqual(
+                    roundTripObj.data.extensions.regex_scripts.length,
+                    teyvat3Parsed.data.extensions.regex_scripts.length,
+                    'Teyvat3 round-trip regex_scripts count mismatch'
+                );
+            }
         }
 
         // Stream & SHA-256 verify all 4 heavy real chats (Teyvat3, Mushoku, Trình Mô Phỏng, Thế Chiến)

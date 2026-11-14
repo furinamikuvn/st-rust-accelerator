@@ -66,12 +66,34 @@ let totalInterceptedCards = 0;
 const STORAGE_STRIPPED_BYTES = 'st_rust_total_stripped_bytes';
 const STORAGE_INTERCEPTED_CARDS = 'st_rust_total_cards';
 const STORAGE_INTERCEPTED_CHATS = 'st_rust_total_chats';
+const STORAGE_VAULT_CODEC = 'st_rust_vault_codec';
+
+function loadSavedCodecPreference() {
+    try {
+        if (typeof localStorage !== 'undefined') {
+            const v = localStorage.getItem(STORAGE_VAULT_CODEC);
+            if (v === 'lz4' || v === 'zstd') return v;
+        }
+    } catch (_) {}
+    return 'zstd';
+}
+
+function saveCodecPreference(pref) {
+    try {
+        if (typeof localStorage !== 'undefined') {
+            localStorage.setItem(STORAGE_VAULT_CODEC, pref === 'lz4' ? 'lz4' : 'zstd');
+        }
+    } catch (_) {}
+}
 
 /**
  * Restores telemetry values from sessionStorage to persist across page reloads.
  */
 function loadTelemetryStorage() {
     try {
+        const savedCodec = loadSavedCodecPreference();
+        vaultClient.codecPreference = savedCodec;
+        vaultClient.lastStats.codecPreference = savedCodec;
         if (typeof sessionStorage !== 'undefined') {
             const b = sessionStorage.getItem(STORAGE_STRIPPED_BYTES);
             const c = sessionStorage.getItem(STORAGE_INTERCEPTED_CARDS);
@@ -415,6 +437,7 @@ async function handleCharacterReadResponse(fetchCtx, args, init) {
                         mode: 'CHAR_LIST',
                         scrubFlags,
                         coldThresholdBytes: 512,
+                        dedupCharSubtrees: !isSingleChar,
                         avatar: reqAvatar,
                     },
                     (stats) => {
@@ -496,6 +519,8 @@ async function processLoadedChatResponse(response, chatKey, { allowPrune = true 
                         keepLastMessages: 15,
                         expectedTotalMessages: 0,
                         chatKey,
+                        hydrateLine0Keys: ['variables', 'world_backstage_v1', 'world_backstage', 'sheets'],
+                        hydrateLine0MaxBytes: 32 * 1024 * 1024,
                     },
                     (stats) => {
                         totalInterceptedChats++;
@@ -628,6 +653,14 @@ function initNetworkInterceptor() {
 
     originalFetch = window.fetch;
 
+    const saveQueueByUrl = new Map();
+    const enqueueChatSave = (queueKey, fn) => {
+        const prev = saveQueueByUrl.get(queueKey) || Promise.resolve();
+        const run = prev.then(fn, fn);
+        saveQueueByUrl.set(queueKey, run.catch(() => {}));
+        return run;
+    };
+
     const wrappedFetch = async function (resource, init) {
         const fetchCtx = (this && this !== wrappedFetch) ? this : (typeof window !== 'undefined' ? window : globalThis);
         const url = resolveFetchUrl(resource);
@@ -659,10 +692,16 @@ function initNetworkInterceptor() {
         }
 
         if (url.includes('/api/chats/save') || url.includes('/api/chats/group/save')) {
-            if (isInterceptorEnabled || rehydrationGuard.hasTrackedStrippedChats()) {
-                await rehydrationGuard.guardChatSaveInit(init);
-            }
-            return originalFetch.call(fetchCtx, resource, init);
+            const reqMeta = tryParseJsonBody(init && init.body);
+            const saveKey = (reqMeta && (reqMeta.file_name || reqMeta.id || reqMeta.avatar_url))
+                ? `${url}::${reqMeta.avatar_url || ''}::${reqMeta.file_name || reqMeta.id || ''}`
+                : url;
+            return enqueueChatSave(saveKey, async () => {
+                if (isInterceptorEnabled || rehydrationGuard.hasTrackedStrippedChats()) {
+                    await rehydrationGuard.guardChatSaveInit(init);
+                }
+                return originalFetch.call(fetchCtx, resource, init);
+            });
         }
 
         if (url.includes('/api/tokenizers/') && isInterceptorEnabled) {
@@ -743,6 +782,13 @@ function installSettingsDrawer() {
                     <input type="checkbox" id="st-rust-toggle-interceptor" ${isInterceptorEnabled ? 'checked' : ''}>
                     <span><b>1. Streaming Scrubber, OPFS Vault &amp; Token Cache</b></span>
                 </label>
+                <label style="display: flex; align-items: center; gap: 4px; font-size: 0.85em;" title="Chuẩn nén OPFS Vault (.stv3): Zstd (nhỏ nhất) hoặc LZ4 (nén/giải nén nhanh nhất)">
+                    <span>Codec:</span>
+                    <select id="st-rust-codec-select" style="padding: 2px 6px; border-radius: 4px; background: rgba(15,23,42,0.85); color: inherit; border: 1px solid rgba(148,163,184,0.35);">
+                        <option value="zstd" ${vaultClient.codecPreference === 'zstd' ? 'selected' : ''}>Zstd</option>
+                        <option value="lz4" ${vaultClient.codecPreference === 'lz4' ? 'selected' : ''}>LZ4</option>
+                    </select>
+                </label>
             </div>
 
             <div class="st-rust-v3-toggle-row">
@@ -791,7 +837,7 @@ function installSettingsDrawer() {
                     <div>• Card / Chat bóc tách: <b id="st-rust-stat-cards">0 / 0</b></div>
                     <div class="st-rust-v3-telemetry-span2">• Cold Vault: <b id="st-rust-stat-vault" style="color: #4ade80;">Chờ khởi tạo</b></div>
                     <div class="st-rust-v3-telemetry-span2">• Re-hydration Guard: <b id="st-rust-stat-rehydration" style="color: #38bdf8;">0</b></div>
-                    <div class="st-rust-v3-telemetry-span2">• Worldbook &amp; Token Cache: <b id="st-rust-stat-worldbook" style="color: #a78bfa;">0</b></div>
+                    <div class="st-rust-v3-telemetry-span2">• Aho-Corasick API Cache &amp; Token Cache: <b id="st-rust-stat-worldbook" style="color: #a78bfa;">0</b></div>
                     <div class="st-rust-v3-telemetry-span2">• Asset Hoister &amp; Iframe Pool: <b id="st-rust-stat-hoister-pool" style="color: #fbbf24;">0</b></div>
                     <div>• DOM #chat: <b id="st-rust-stat-dom">0</b></div>
                     <div>• WASM Core: <b id="st-rust-stat-wasm" style="color: #4ade80;">Đang nạp</b></div>
@@ -845,6 +891,16 @@ function installSettingsDrawer() {
         debugLog(`Network Interceptor & Token Cache toggled: ${isInterceptorEnabled}`);
         updateTelemetryUI();
     });
+
+    const selectCodec = drawer.querySelector('#st-rust-codec-select');
+    if (selectCodec) {
+        selectCodec.addEventListener('change', (e) => {
+            const nextCodec = e.target.value === 'lz4' ? 'lz4' : 'zstd';
+            saveCodecPreference(nextCodec);
+            vaultClient.setCodecPreference(nextCodec).catch(() => {}).finally(() => updateTelemetryUI());
+            debugLog(`OPFS Vault codec changed: ${nextCodec}`);
+        });
+    }
 
     const chkHoister = drawer.querySelector('#st-rust-toggle-hoister');
     chkHoister.addEventListener('change', (e) => {
@@ -940,11 +996,12 @@ function updateTelemetryUI() {
 
     if (elVault) {
         const backendName = vStats.storageBackend || (vStats.degraded ? 'degraded' : 'initializing');
+        const codecLabel = String(vStats.codecPreference || vaultClient.codecPreference || 'zstd').toUpperCase();
         const rawMb = ((vStats.totalRawBytes || 0) / (1024 * 1024)).toFixed(2);
         const compMb = ((vStats.totalCompressedBytes || 0) / (1024 * 1024)).toFixed(2);
         const blobs = vStats.blobsStored || 0;
         const dedup = vStats.dedupHits || 0;
-        elVault.textContent = `${backendName} | ${rawMb} MB -> ${compMb} MB | ${blobs} blobs (${dedup} dedup)`;
+        elVault.textContent = `${backendName}/${codecLabel} | ${rawMb} MB -> ${compMb} MB | ${blobs} blobs (${dedup} dedup)`;
     }
 
     if (elRehydration) {
@@ -957,7 +1014,7 @@ function updateTelemetryUI() {
     if (elWorldbook) {
         const scanMs = Number(wbStats.lastScanMs || 0).toFixed(2);
         elWorldbook.textContent =
-            `Scans ${wbStats.totalScans || 0} (${scanMs} ms, ${wbStats.cachedWorldbooks || 0} worlds) | ` +
+            `Pre-warm API ${wbStats.cachedWorldbooks || 0} worlds (${wbStats.totalScans || 0} scans, ${scanMs} ms; core checkWorldInfo giữ nguyên) | ` +
             `Tokens ${tcStats.cacheHits || 0} hits / ${tcStats.singleflightCoalesced || 0} coalesced`;
     }
 
@@ -1037,29 +1094,75 @@ async function checkServerStatus() {
     desc.textContent = `Đang chạy chuẩn v3 hoàn toàn phía trình duyệt (Vault: ${backendLabel}, không cần N-API server plugin).`;
 }
 
+function hasColdMessageRefs(msg) {
+    if (!msg || typeof msg !== 'object') return false;
+    if (extractVaultRefHex(msg.variables) || extractVaultRefHex(msg.swipes)) return true;
+    if (msg.extra && typeof msg.extra === 'object') {
+        if (
+            extractVaultRefHex(msg.extra.world_backstage) ||
+            extractVaultRefHex(msg.extra.world_backstage_v1) ||
+            extractVaultRefHex(msg.extra.reasoning)
+        ) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function prehydrateMessageByIndex(mesIdx) {
+    if (!Number.isInteger(mesIdx) || mesIdx < 0) return;
+    const activeChat = getActiveChatArray();
+    if (!Array.isArray(activeChat) || !activeChat[mesIdx]) return;
+    if (hasColdMessageRefs(activeChat[mesIdx])) {
+        rehydrationGuard
+            .hydrateColdMessage(activeChat, mesIdx, rehydrationGuard.latestChatKey || '')
+            .catch(() => {});
+    }
+}
+
 function installPointerPrehydrate() {
     if (pointerPrehydrateInstalled || typeof document === 'undefined' || typeof document.addEventListener !== 'function') {
         return;
     }
     pointerPrehydrateInstalled = true;
-    document.addEventListener(
-        'pointerdown',
-        (event) => {
-            const target = event && event.target && typeof event.target.closest === 'function'
-                ? event.target.closest('.character_select[chid], [data-chid]')
-                : null;
-            if (!target || typeof target.getAttribute !== 'function') return;
-            const rawChid = target.getAttribute('chid') ?? target.getAttribute('data-chid');
-            if (rawChid === null || rawChid === '') return;
-            const chars = getActiveCharactersArray();
-            const charObj = Array.isArray(chars) ? chars[Number(rawChid)] : null;
-            if (charObj) {
-                const av = rehydrationGuard.getCharacterKey(charObj);
-                if (av) ensureActiveCharacterHydrated(av).catch(() => {});
+
+    const handleInteraction = (event) => {
+        const target = event && event.target && typeof event.target.closest === 'function' ? event.target : null;
+        if (!target) return;
+
+        // 1. Pre-hydrate character cold fields when user presses a character card in the selector list
+        const charEl = target.closest('.character_select[chid], [data-chid]');
+        if (charEl && typeof charEl.getAttribute === 'function') {
+            const rawChid = charEl.getAttribute('chid') ?? charEl.getAttribute('data-chid');
+            if (rawChid !== null && rawChid !== '') {
+                const chars = getActiveCharactersArray();
+                const charObj = Array.isArray(chars) ? chars[Number(rawChid)] : null;
+                if (charObj) {
+                    const av = rehydrationGuard.getCharacterKey(charObj);
+                    if (av) ensureActiveCharacterHydrated(av).catch(() => {});
+                }
             }
-        },
-        true
-    );
+        }
+
+        // 2. Pre-hydrate old message (< last 15) cold fields when user interacts with .mes or Edit/Swipe buttons
+        const actionOrMesEl = target.closest(
+            '.mes_edit, .swipe_left, .swipe_right, .mes_edit_done, .mes_edit_copy, .mes_edit_delete, .mes_edit_up, .mes_edit_down, .mes_buttons, .extraMesButtons, #chat .mes[mesid], #chat .mes[data-mesid]'
+        );
+        if (actionOrMesEl) {
+            const mesContainer = actionOrMesEl.closest('.mes[mesid], .mes[data-mesid], [mesid], [data-st-mesid]');
+            if (mesContainer && typeof mesContainer.getAttribute === 'function') {
+                const rawMes =
+                    mesContainer.getAttribute('mesid') ??
+                    mesContainer.getAttribute('data-mesid') ??
+                    mesContainer.getAttribute('data-st-mesid');
+                if (rawMes !== null && rawMes !== '') {
+                    prehydrateMessageByIndex(parseInt(rawMes, 10));
+                }
+            }
+        }
+    };
+
+    document.addEventListener('pointerdown', handleInteraction, true);
 }
 
 function protectActiveChatTail() {
@@ -1081,22 +1184,39 @@ async function warmActiveChatColdReads() {
         ? activeChat
         : (ctx && ctx.chatMetadata ? [{ chat_metadata: ctx.chatMetadata }] : null);
 
-    if (!targetChat) return { warmed: false, bytes: 0, mvhHydrated: false };
+    if (!targetChat) return { warmed: false, bytes: 0, mvhHydrated: false, worldBackstageHydrated: false };
 
+    const chatKey = rehydrationGuard.latestChatKey || '';
     const isMvhActive = typeof window !== 'undefined' && Boolean(window.MultiverseHypervisor);
-    const res = await rehydrationGuard.hydrateWarmChatVariables(
-        targetChat,
-        rehydrationGuard.latestChatKey || '',
-        { hydrateMultiverseHypervisor: isMvhActive }
-    );
-    if (ctx && ctx.chatMetadata && targetChat[0] && targetChat[0].chat_metadata) {
-        if (ctx.chatMetadata !== targetChat[0].chat_metadata) {
-            if (res.warmed && !extractVaultRefHex(targetChat[0].chat_metadata.variables)) {
-                ctx.chatMetadata.variables = targetChat[0].chat_metadata.variables;
+    const res = await rehydrationGuard.hydrateWarmChatVariables(targetChat, chatKey, {
+        chatMetadata: ctx && ctx.chatMetadata ? ctx.chatMetadata : undefined,
+        hydrateMultiverseHypervisor: isMvhActive,
+        hydrateWorldBackstage: true,
+        hydrateSheets: true,
+        maxWarmVariableBytes: 32 * 1024 * 1024,
+    });
+
+    if (ctx && ctx.chatMetadata) {
+        const line0Meta = targetChat[0] && targetChat[0].chat_metadata;
+        if (line0Meta && ctx.chatMetadata !== line0Meta) {
+            if (!extractVaultRefHex(line0Meta.variables) && line0Meta.variables !== undefined) {
+                ctx.chatMetadata.variables = line0Meta.variables;
             }
-            if (res.mvhHydrated && !extractVaultRefHex(targetChat[0].chat_metadata.multiverse_hypervisor)) {
-                ctx.chatMetadata.multiverse_hypervisor = targetChat[0].chat_metadata.multiverse_hypervisor;
+            if (!extractVaultRefHex(line0Meta.world_backstage_v1) && line0Meta.world_backstage_v1 !== undefined) {
+                ctx.chatMetadata.world_backstage_v1 = line0Meta.world_backstage_v1;
             }
+            if (res.mvhHydrated && !extractVaultRefHex(line0Meta.multiverse_hypervisor)) {
+                ctx.chatMetadata.multiverse_hypervisor = line0Meta.multiverse_hypervisor;
+            }
+        }
+        // Fallback if ctx.chatMetadata still independently holds a cold ref
+        if (extractVaultRefHex(ctx.chatMetadata.world_backstage_v1)) {
+            await rehydrationGuard.hydrateColdField(ctx.chatMetadata, 'world_backstage_v1', chatKey);
+        }
+        if (extractVaultRefHex(ctx.chatMetadata.variables)) {
+            await rehydrationGuard.hydrateColdField(ctx.chatMetadata, 'variables', chatKey, {
+                maxBytes: 32 * 1024 * 1024,
+            });
         }
     }
     return res;

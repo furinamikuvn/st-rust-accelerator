@@ -20,8 +20,8 @@ Installable in **1 click via SillyTavern's built-in GitHub Extension Installer**
 |  - Keyed by real mesid (works cleanly with chat_truncation > 0)                   |
 |  - Detaches inactive nodes without nuking active <iframe> realms                  |
 +-----------------------------------------------------------------------------------+
-| Layer 3: JS Aho-Corasick Unicode Scanner & Singleflight Token Cache               |
-|  - UTF-16 native scanner with full Unicode word boundaries & regex parity         |
+| Layer 3: JS Aho-Corasick Unicode Pre-warm API & Singleflight Token Cache |
+|  - Native UTF-16 Unicode scanner (100% parity; core checkWorldInfo kept untouched) |
 |  - Intercepts jQuery.ajax & fetch /api/tokenizers/* with LRU + Singleflight       |
 +-----------------------------------------------------------------------------------+
 | Layer 4: JS-Slash-Runner Asset Hoister, Deep Freeze & Iframe Pool (<= 2..6 Slots) |
@@ -46,10 +46,11 @@ Measured directly on Google Chrome `157.0.8103.51` (headless CDP) and Node.js `-
 | **25 HUDs Blink `Documents` / `Frames`** | `26` / `26` | **`3` / `3`** (`<= 2` active HUD slots) | **`-88.5%`** |
 | **25 HUDs Tab `JSHeapUsed` / `RecalcStyleCount`** | `20.11 MB` / `1822` | **`1.42 MB`** / **`268`** | **`-92.9%`** / **`-85.3%`** |
 | **25 HUDs OS `TabRenderer PrivateMB`** | `202.02 MB` | **`136.33 MB`** | **`-32.5%` (`-65.69 MB`)** |
-| **Combined 4-Layer E2E (74 PNGs + Teyvat3 + 25 HUDs)** | Out-of-memory risk (`>1 GB` heap) | **`45.37 MB` `JSHeapUsed`**, `Docs=3`, `Frames=3` (`0` errors) | **Gate G3 PASS** |
-| **Worldbook Scan (`Genshin Impact.json`, `961` entries)** | `~182 ms` (ST RegExp) | **`0.766 ms`** (100% parity) | **`237.9x` faster** |
-| **Click-to-Rehydrate Shadow Snapshot -> Live HUD** | N/A | **`7.3 ms`** (`0` leaks across 50 cycles) | Instant |
-| **Character Edit & Chat Save (`POST`)** | Vulnerable to empty overwrite | **100% SHA-256 lossless** + Fail-Closed lock | **Zero Data Loss** |
+| **Combined 4-Layer E2E (75 PNGs + Teyvat3 + 25 HUDs)** | Out-of-memory risk (`>1 GB` heap) | **`46.02 MB` `JSHeapUsed`**, OPFS `307.17 -> 85.01 MB` (`179 dedup`), `totalPrivate 387.46 MB`, `Docs=3`, `Frames=3` (`0` errors) | **Gate G3 PASS** |
+| **Live SillyTavern A/B (Disabled vs v3.0.0 Enabled)** | `2158.05 MB` `PrivateMB` / `1155.65 MB` `JSHeap` / `222,350` DOM nodes | **`1389.14 MB`** `PrivateMB` / **`590.32 MB`** `JSHeap` / **`115,047`** nodes (`Boot PrivateMB -69.8%`) | **`-35.6%` RAM / `-48.9%` Heap** |
+| **Worldbook Pre-warm API (`Genshin Impact.json`, `961` entries)** | `~182 ms` (ST RegExp) | **`0.766 ms`** (`core checkWorldInfo` kept untouched for Zero-Core safety) | **`237.9x` API speedup** |
+| **Click-to-Rehydrate Shadow Snapshot -> Live HUD** | N/A | **`6.2 - 7.3 ms`** (`0` leaks across 50 cycles) | Instant |
+| **Character Edit & Chat Save (`POST` / Raw Byte Splice)** | Vulnerable to empty overwrite | **100% SHA-256 lossless** + Fail-Closed lock + sequential save queue | **Zero Data Loss** |
 
 ---
 
@@ -68,9 +69,9 @@ Measured directly on Google Chrome `157.0.8103.51` (headless CDP) and Node.js `-
 ## Settings Drawer v3.0.0 & Live Telemetry
 
 All 4 layers expose real-time runtime metrics (no fabricated estimates) and independent switches in the SillyTavern Extensions Drawer:
-- **Layer 1** (`#st-rust-toggle-interceptor`): Worker OPFS Cold Vault + Rehydration Guard (`opfs-sync` / `idb`, WASM linear memory in `MiB`, dedup savings, Edit/Chat recovery counts).
-- **Layer 2** (`#st-rust-toggle-scroller`): Safe DOM Virtual Scroller (`mesid`-keyed active DOM count).
-- **Layer 3**: Aho-Corasick Unicode Worldbook hits/cache ratio + Singleflight Tokenizer coalesced upstream savings.
+- **Layer 1** (`#st-rust-toggle-interceptor`, `#st-rust-codec-select`): Worker OPFS Cold Vault + Rehydration Guard (`opfs-sync` / `idb`, live `Zstd` <-> `LZ4` codec switch, Auto-LRU `180 MiB` + `compactPack()`, PNG subtree dedup & Raw Byte Splice, WASM linear memory in `MiB`, Edit/Chat recovery counts).
+- **Layer 2** (`#st-rust-toggle-scroller`): Safe DOM Virtual Scroller (`mesid`-keyed active DOM count + `MutationObserver.takeRecords()` loop guard).
+- **Layer 3**: Aho-Corasick Unicode Pre-warm API (`core checkWorldInfo` untouched for Zero Core Modification) + Singleflight Tokenizer coalesced upstream savings (`fetch`/`jQuery.ajax`).
 - **Layer 4**: Asset Hoister + Active `<iframe>` Pool (`#st-rust-toggle-hoister`, `#st-rust-toggle-pool`, `#st-rust-pool-max-slots` clamped `1..6`), CSS Compositor Guard (`#st-rust-toggle-compositor`), and Canvas `rAF` Throttler (`#st-rust-toggle-canvas`).
 
 ---
@@ -94,6 +95,7 @@ All 4 layers expose real-time runtime metrics (no fabricated estimates) and inde
 node --expose-gc test_p15_redteam_e2e.js
 node --expose-gc benchmarks/stress_bombardment_security.js
 
-# Run full Chrome v157 CDP Gate G3 verification
+# Run full Chrome v157 CDP Gate G3 & Live SillyTavern Server verification
 node benchmarks/p15_chrome_cdp.mjs
+node benchmarks/live_st_cdp.mjs
 ```

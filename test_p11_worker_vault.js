@@ -802,8 +802,181 @@ async function runTests() {
         console.log('[PASS] Test 6: index.js fetch interceptor (Worker streaming, mid-session toggle-off safety & degraded fallback)');
     }
 
+    // -------------------------------------------------------------------------
+    // TEST 7: v3 Optimizations (Subtree Dedup, Raw Byte Splice, Dirty-Check, LRU/GC, Zstd<->LZ4, World-Backstage & >2MiB Vars)
+    // -------------------------------------------------------------------------
+    {
+        // 7A: PNG Subtree Dedup + fallback when json_data absent + Manifest Dirty-Check
+        const opfsRoot = createMockOpfsRoot();
+        const runtime = createVaultWorkerRuntime({ opfsRootOverride: opfsRoot });
+        const client = new VaultClient({ workerFactory: () => createMockWorkerBridge(runtime) });
+        assert.strictEqual(await client.ensureReady(), true);
+
+        const loreA = { name: 'LoreA', entries: Array.from({ length: 12 }, (_, i) => ({ keys: [`k${i}`], content: 'A'.repeat(120) })) };
+        const thA = [{ id: 's1', name: 'HUD', content: 'console.log(1);' + 'X'.repeat(1200) }];
+        const fullJsonA = JSON.stringify({
+            spec: 'chara_card_v2',
+            data: { name: 'DedupCard', character_book: loreA, extensions: { tavern_helper: thA } },
+        });
+        const cardListDedup = [
+            { name: 'DedupCard', avatar: 'DedupCard.png', json_data: fullJsonA, data: { name: 'DedupCard', character_book: loreA, extensions: { tavern_helper: thA } } },
+            { name: 'NoJsonCard', avatar: 'NoJsonCard.png', json_data: '', data: { name: 'NoJsonCard', character_book: loreA } },
+        ];
+        const r1 = await client.streamResponse(
+            createReadableJsonResponse(JSON.stringify(cardListDedup), {}, 512),
+            { mode: 'CHAR_LIST', scrubFlags: 1 | 2 | 256, coldThresholdBytes: 512, dedupCharSubtrees: true }
+        );
+        const out1 = await r1.json();
+        assert.strictEqual(out1[0].json_data, '');
+        assert.strictEqual(out1[0].data.character_book, '__ST_RUST_STRIPPED__');
+        assert.strictEqual(out1[1].data.character_book, '__ST_RUST_STRIPPED__');
+        const st1 = await client.refreshStats();
+        assert(st1.dedupHits >= 2, `Expected subtree dedup hits >= 2, got ${st1.dedupHits}`);
+        const hydFull = await client.hydrateCharacter('DedupCard.png', ['data.character_book', 'data.extensions.tavern_helper', 'json_data']);
+        assert.strictEqual(sha256(hydFull.jsonData), sha256(fullJsonA));
+        assert.strictEqual(sha256(JSON.stringify(hydFull.fields['data.character_book'])), sha256(JSON.stringify(loreA)));
+        const hydFallback = await client.hydrateCharacter('NoJsonCard.png', ['data.character_book']);
+        assert.strictEqual(sha256(JSON.stringify(hydFallback.fields['data.character_book'])), sha256(JSON.stringify(loreA)));
+
+        // Repeat identical CHAR_LIST stream -> manifest dirty-check MUST skip redundant manifest write
+        const r2 = await client.streamResponse(
+            createReadableJsonResponse(JSON.stringify(cardListDedup), {}, 512),
+            { mode: 'CHAR_LIST', scrubFlags: 1 | 2 | 256, coldThresholdBytes: 512, dedupCharSubtrees: true }
+        );
+        await r2.text();
+        const st2 = await client.refreshStats();
+        assert(st2.manifestSkippedSaves >= 1, `Expected manifestSkippedSaves >= 1, got ${st2.manifestSkippedSaves}`);
+
+        // 7B: Raw Byte Splice (first/middle/last __st_rust_stripped + sibling mutation alongside __st_rust_vault_ref) + World-Backstage & >2MiB Vars
+        const largeVars = {};
+        for (let i = 0; i < 65; i++) largeVars[`prompt_tpl_${i}`] = 'P'.repeat(40000); // ~2.6 MB > old 2 MiB cap!
+        const wbV1 = { schemaVersion: 14, recoveryPoints: [{ id: 'rp1', state: { note: 'W'.repeat(6000) } }] };
+        const hybridChat = [
+            { user_name: 'U', chat_metadata: { variables: largeVars, world_backstage_v1: wbV1, multiverse_hypervisor: { state: 'M'.repeat(8192) } } },
+            ...Array.from({ length: 18 }, (_, i) => ({
+                name: 'C',
+                mes: `msg ${i}`,
+                variables: { turn: i, pad: 'V'.repeat(5000) },
+                extra: { world_backstage: { turnNote: `wb_${i}_` + 'B'.repeat(4500) } },
+            })),
+        ];
+        const guard = new RehydrationGuard({ vaultClient: client });
+        const streamedChat = await client.streamResponse(
+            createReadableJsonResponse(JSON.stringify(hybridChat), {}, 1024),
+            { mode: 'CHAT_LOAD', coldThresholdBytes: 4096, keepLastMessages: 15, expectedTotalMessages: 0, chatKey: 'Hybrid::c1' },
+            () => guard.markStrippedChat('Hybrid::c1')
+        );
+        const scrubbedChat = await streamedChat.json();
+        const warmRes = await guard.hydrateWarmChatVariables(scrubbedChat, 'Hybrid::c1', { hydrateWorldBackstage: true });
+        assert.strictEqual(warmRes.worldBackstageHydrated, true, 'world_backstage_v1 MUST warm-hydrate automatically');
+        assert.strictEqual(scrubbedChat[0].chat_metadata.variables.__st_rust_vault_ref, undefined, '>2MiB chat_metadata.variables MUST warm-hydrate under 32MiB cap');
+        assert.strictEqual(Object.keys(scrubbedChat[0].chat_metadata.variables).length, 65);
+        assert.strictEqual(scrubbedChat[0].chat_metadata.world_backstage_v1.__st_rust_vault_ref, undefined);
+        // Simulate third-party mutation next to __st_rust_vault_ref on an older message + __st_rust_stripped markers at first/middle/last key
+        scrubbedChat[1].extra.world_backstage.extraMutated = 'kept_sibling';
+        scrubbedChat[1].__st_rust_stripped = true;
+        const expectedChatAfterMutation = structuredClone(hybridChat);
+        expectedChatAfterMutation[1].extra.world_backstage.extraMutated = 'kept_sibling';
+
+        const spliceSaveInit = {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ch_name: 'Hybrid', file_name: 'c1', chat: scrubbedChat }),
+        };
+        const spliceRes = await guard.guardChatSaveInit(spliceSaveInit);
+        assert.strictEqual(spliceRes.modified, true);
+        const savedAfterSplice = JSON.parse(new TextDecoder().decode(spliceSaveInit.body));
+        assert.strictEqual(savedAfterSplice.chat[1].__st_rust_stripped, undefined, '__st_rust_stripped must be omitted on save');
+        assert.strictEqual(sha256(JSON.stringify(savedAfterSplice.chat)), sha256(JSON.stringify(expectedChatAfterMutation)), 'Raw Byte Splice + sibling merge SHA-256 mismatch');
+
+        // 7C: Codec Zstd <-> LZ4 toggle + cross-read
+        const codecRes = await client.setCodecPreference('lz4');
+        assert.strictEqual(codecRes.codecPreference, 'lz4');
+        const lz4Card = [{ name: 'Lz4Card', avatar: 'Lz4Card.png', json_data: JSON.stringify({ data: { name: 'Lz4Card', desc: 'L'.repeat(4000) } }), data: { name: 'Lz4Card' } }];
+        const lz4Resp = await client.streamResponse(createReadableJsonResponse(JSON.stringify(lz4Card), {}, 512), { mode: 'CHAR_LIST', coldThresholdBytes: 512 });
+        await lz4Resp.text();
+        await client.setCodecPreference('zstd');
+        const lz4Hydrated = await client.hydrateCharacter('Lz4Card.png', ['json_data']);
+        assert.strictEqual(sha256(lz4Hydrated.jsonData), sha256(lz4Card[0].json_data), 'LZ4 blob must still read after toggling back to Zstd');
+        await client.shutdown();
+
+        // 7D: Auto-LRU storage cap + OpfsSyncBackend.compactPack() GC (>30% & >= 32KiB dead bytes)
+        const capOpfsRoot = createMockOpfsRoot();
+        const capRuntime = createVaultWorkerRuntime({ opfsRootOverride: capOpfsRoot, opfsMaxCompressedBytes: 90 * 1024 });
+        const capClient = new VaultClient({ workerFactory: () => createMockWorkerBridge(capRuntime), opfsMaxCompressedBytes: 90 * 1024 });
+        assert.strictEqual(await capClient.ensureReady(), true);
+        const makeRandomJson = (seed, size) => {
+            const bytes = crypto.randomBytes(size).toString('base64');
+            return JSON.stringify({ seed, blob: bytes });
+        };
+        for (let c = 0; c < 4; c++) {
+            const chatPay = [{ user_name: 'U', chat_metadata: { heavy_meta: JSON.parse(makeRandomJson(c, 50000)) } }, { name: 'C', mes: 'hi' }];
+            const resp = await capClient.streamResponse(createReadableJsonResponse(JSON.stringify(chatPay), {}, 2048), { mode: 'CHAT_LOAD', coldThresholdBytes: 4096, keepLastMessages: 1, chatKey: `Cap::c${c}` });
+            await resp.text();
+        }
+        const capStats = await capClient.refreshStats();
+        assert(capStats.lruEvictions >= 1, `Expected Auto-LRU evictions >= 1 under 90KiB cap, got ${capStats.lruEvictions}`);
+        assert(capStats.totalCompressedBytes <= 90 * 1024, `Compressed bytes ${capStats.totalCompressedBytes} exceeded 90KiB cap`);
+        const gcRes = await capClient.compactPack();
+        assert(gcRes.compacted === true || capStats.packCompactions >= 1, 'Expected compactPack GC to reclaim dead pack bytes');
+        await capClient.shutdown();
+
+        // 7E: Old message (< last 15) .mes_edit pointerdown pre-hydration via index.js
+        execFileSync(process.execPath, ['--expose-gc', __filename], {
+            env: { ...process.env, P11_SUBTEST: 'index-pointer-prehydrate' },
+            stdio: 'inherit',
+        });
+
+        // 7F: Synchronous line0 selective hydration (`hydrateLine0Keys` for sheets/variables/world_backstage_v1, keeping MVH cold)
+        {
+            const opfsLine0Root = createMockOpfsRoot();
+            const runtimeLine0 = createVaultWorkerRuntime({ opfsRootOverride: opfsLine0Root });
+            const clientLine0 = new VaultClient({ workerFactory: () => createMockWorkerBridge(runtimeLine0) });
+            assert.strictEqual(await clientLine0.ensureReady(), true);
+
+            const line0Chat = [
+                {
+                    user_name: 'U',
+                    chat_metadata: {
+                        variables: { promptKey: 'V'.repeat(5500) },
+                        sheets: [
+                            { uid: 's1', name: 'Inventory', content: [['Sword', 'X'.repeat(5200)]] },
+                            { uid: 's2', name: 'Status', content: [['HP', '100']] },
+                        ],
+                        world_backstage_v1: { schemaVersion: 14, recoveryPoints: [{ id: 'rp_sync', pad: 'W'.repeat(5500) }] },
+                        multiverse_hypervisor: { state: 'M'.repeat(8192) },
+                    },
+                },
+                { name: 'C', mes: 'hello' },
+            ];
+            const wireResp = await clientLine0.streamResponse(
+                createReadableJsonResponse(JSON.stringify(line0Chat), {}, 1024),
+                {
+                    mode: 'CHAT_LOAD',
+                    coldThresholdBytes: 4096,
+                    keepLastMessages: 15,
+                    expectedTotalMessages: 0,
+                    chatKey: 'SyncLine0::c1',
+                    hydrateLine0Keys: ['variables', 'world_backstage_v1', 'world_backstage', 'sheets'],
+                    hydrateLine0MaxBytes: 32 * 1024 * 1024,
+                }
+            );
+            const wireJson = await wireResp.json();
+            const m0 = wireJson[0].chat_metadata;
+            assert.strictEqual(m0.variables.__st_rust_vault_ref, undefined, 'line0 variables must hydrate synchronously on wire');
+            assert.strictEqual(m0.variables.promptKey, line0Chat[0].chat_metadata.variables.promptKey);
+            assert(Array.isArray(m0.sheets) && m0.sheets.length === 2, 'line0 sheets array must hydrate synchronously on wire');
+            assert.strictEqual(m0.world_backstage_v1.__st_rust_vault_ref, undefined, 'line0 world_backstage_v1 must hydrate synchronously on wire');
+            assert.strictEqual(m0.world_backstage_v1.recoveryPoints[0].id, 'rp_sync');
+            assert(m0.multiverse_hypervisor && m0.multiverse_hypervisor.__st_rust_vault_ref, 'line0 multiverse_hypervisor must stay cold ref');
+            await clientLine0.shutdown();
+        }
+
+        console.log('[PASS] Test 7: Subtree dedup, Raw Byte Splice, Dirty-Check, Auto-LRU/GC, Zstd<->LZ4, World-Backstage, sync line0 keys & pointerdown pre-hydration');
+    }
+
     console.log('\n=============================================================');
-    console.log('KẾT QUẢ KIỂM THỬ PHASE P11: 6/6 BÀI TEST PASS 100%!');
+    console.log('KẾT QUẢ KIỂM THỬ PHASE P11: 7/7 BÀI TEST PASS 100%!');
     console.log('=============================================================');
 }
 
@@ -868,8 +1041,9 @@ async function runIndexSubtest(subMode) {
     };
 
     const noopEl = () => ({ style: {}, classList: { add() {}, remove() {}, contains: () => false }, appendChild() {}, prepend() {}, insertBefore() {}, addEventListener() {}, querySelector: () => null, querySelectorAll: () => [], getAttribute: () => null, setAttribute() {}, children: [] });
+    const docListeners = new Map();
     const chatStub = { ...noopEl(), id: 'chat', scrollTop: 0, clientHeight: 800, scrollHeight: 800 };
-    global.MutationObserver = class { observe() {} disconnect() {} };
+    global.MutationObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
     global.IntersectionObserver = class { observe() {} unobserve() {} disconnect() {} };
     global.requestAnimationFrame = () => 0;
     global.cancelAnimationFrame = () => {};
@@ -885,7 +1059,10 @@ async function runIndexSubtest(subMode) {
         readyState: 'complete',
         head: noopEl(),
         body: noopEl(),
-        addEventListener() {},
+        addEventListener(type, fn) {
+            if (!docListeners.has(type)) docListeners.set(type, new Set());
+            docListeners.get(type).add(fn);
+        },
         getElementById: (id) => (id === 'chat' ? chatStub : null),
         querySelector: (sel) => (sel === '#chat' ? chatStub : null),
         querySelectorAll: () => [],
@@ -894,7 +1071,7 @@ async function runIndexSubtest(subMode) {
     };
     global.SillyTavern = { getContext: () => stContext };
 
-    if (subMode === 'index-worker-ok' || subMode === 'index-toggle-off') {
+    if (subMode === 'index-worker-ok' || subMode === 'index-toggle-off' || subMode === 'index-pointer-prehydrate') {
         const opfsRoot = createMockOpfsRoot();
         const runtime = createVaultWorkerRuntime({ opfsRootOverride: opfsRoot });
         global.Worker = class MockOkWorker {
@@ -912,7 +1089,7 @@ async function runIndexSubtest(subMode) {
 
     const idxMod = await import('./index.js');
 
-    if (subMode === 'index-worker-ok' || subMode === 'index-toggle-off') {
+    if (subMode === 'index-worker-ok' || subMode === 'index-toggle-off' || subMode === 'index-pointer-prehydrate') {
         const ready = await idxMod.vaultClient.ensureReady();
         assert.strictEqual(ready, true, 'index.js VaultClient must initialize mock Worker');
 
@@ -932,6 +1109,34 @@ async function runIndexSubtest(subMode) {
         assert(chatOut[0].chat_metadata.multiverse_hypervisor.__st_rust_vault_ref);
         assert(chatOut[1].variables.__st_rust_vault_ref);
         assert.strictEqual(chatOut[18].variables.__st_rust_vault_ref, undefined, 'Last tail msg must stay hydrated');
+
+        if (subMode === 'index-pointer-prehydrate') {
+            await idxMod.initExtension();
+            stContext.chatMetadata = chatOut[0].chat_metadata;
+            stContext.chat = chatOut.slice(1);
+            // chatOut[1] is now index 0 of stContext.chat (older than last 15!)
+            assert(stContext.chat[0].variables.__st_rust_vault_ref, 'Old message 0 variables must begin as cold vault ref');
+            const mesNode = { getAttribute: (k) => (k === 'mesid' ? '0' : null) };
+            const editBtnTarget = {
+                closest: (sel) => {
+                    if (sel.includes('.mes_edit')) return editBtnTarget;
+                    if (sel.includes('.mes[')) return mesNode;
+                    return null;
+                },
+            };
+            const pdHandlers = docListeners.get('pointerdown') || new Set();
+            assert(pdHandlers.size > 0, 'index.js must register document pointerdown pre-hydration handler');
+            for (const fn of pdHandlers) {
+                fn({ target: editBtnTarget });
+            }
+            for (let t = 0; t < 20 && stContext.chat[0].variables.__st_rust_vault_ref; t++) {
+                await new Promise((r) => setTimeout(r, 15));
+            }
+            assert.strictEqual(stContext.chat[0].variables.__st_rust_vault_ref, undefined, 'Old message (< last 15) MUST hydrate on .mes_edit pointerdown');
+            assert.strictEqual(stContext.chat[0].variables.turn, origChat[1].variables.turn);
+            await idxMod.vaultClient.shutdown();
+            return;
+        }
 
         if (subMode === 'index-toggle-off') {
             await idxMod.initExtension();

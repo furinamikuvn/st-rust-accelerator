@@ -1120,6 +1120,26 @@ class RehydrationGuard {
             try {
                 const workerRes = await this.vaultClient.hydrateChatForSave(jsonText, this.latestChatKey || '');
                 if (workerRes && workerRes.bytes && (workerRes.hydratedCount > 0 || !workerRes.missingRefs.length)) {
+                    // Zero-parse fast path: Worker raw byte splice resolved every ref with zero missing markers.
+                    if (
+                        workerRes.hydratedCount > 0 &&
+                        workerRes.rawSpliced &&
+                        workerRes.missingRefs.length === 0 &&
+                        !workerRes.hasUnresolvedSentinel &&
+                        !jsonText.includes('__st_rust_proxied')
+                    ) {
+                        this.stats.workerVaultChatHydrations++;
+                        this.stats.chatsRehydrated++;
+                        if (wasGzipped && typeof CompressionStream !== 'undefined') {
+                            init.body = await this._compressGzipText(workerRes.bytes);
+                        } else {
+                            init.body = workerRes.bytes;
+                            this._removeHeader(init.headers, 'content-encoding');
+                            this._setHeader(init.headers, 'Content-Type', 'application/json');
+                        }
+                        debugLog(`Rehydrated /api/chats/save payload via raw byte splice (${workerRes.bytes.byteLength} bytes).`);
+                        return { modified: true };
+                    }
                     const outTextCheck = new TextDecoder().decode(workerRes.bytes);
                     workerHydrated = workerRes.hydratedCount > 0;
                     workerBytes = workerRes.bytes;
@@ -1302,12 +1322,17 @@ class RehydrationGuard {
         }
 
         let parsed;
+        const text = new TextDecoder('utf-8', { fatal: false }).decode(rawBytes);
         try {
-            const text = new TextDecoder('utf-8', { fatal: false }).decode(rawBytes);
             parsed = JSON.parse(text);
         } catch (err) {
-            debugLog(`Failed parsing cold vault ref ${refHex}:`, err);
-            return { found: false, value: null, bytes: byteLen };
+            const trimmed = text.trimStart();
+            if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+                debugLog(`Failed parsing cold vault ref ${refHex}:`, err);
+                return { found: false, value: null, bytes: byteLen };
+            }
+            // String blobs such as `extra.reasoning` or raw text fields store raw UTF-8 text without JSON quotes.
+            parsed = text;
         }
 
         this.stats.warmReadHydrations++;
@@ -1342,14 +1367,34 @@ class RehydrationGuard {
         if (!container || typeof container !== 'object' || !key) {
             return { hydrated: false, refHex: null, bytes: 0 };
         }
-        const refHex = extractVaultRefHex(container[key]);
+        const prevObj = container[key];
+        const refHex = extractVaultRefHex(prevObj);
         if (!refHex) {
             return { hydrated: false, refHex: null, bytes: 0 };
         }
         this.stats.coldReadVaultRefsDetected++;
         const res = await this.hydrateVaultRef(refHex, chatKey, opts);
         if (res.found) {
-            container[key] = res.value;
+            let finalVal = res.value;
+            if (
+                prevObj &&
+                typeof prevObj === 'object' &&
+                !Array.isArray(prevObj) &&
+                finalVal &&
+                typeof finalVal === 'object' &&
+                !Array.isArray(finalVal)
+            ) {
+                const extraKeys = Object.keys(prevObj).filter(
+                    (k) => k !== '__st_rust_vault_ref' && k !== '__st_rust_stripped' && !k.startsWith('__st_rust_')
+                );
+                if (extraKeys.length > 0) {
+                    finalVal = { ...finalVal };
+                    for (let i = 0; i < extraKeys.length; i++) {
+                        finalVal[extraKeys[i]] = prevObj[extraKeys[i]];
+                    }
+                }
+            }
+            container[key] = finalVal;
             return { hydrated: true, refHex, bytes: res.bytes };
         }
         return { hydrated: false, refHex, bytes: res.bytes, oversized: res.oversized };
@@ -1386,31 +1431,40 @@ class RehydrationGuard {
     }
 
     /**
-     * Selectively pre-warms lightweight `chat_metadata.variables` (`<= maxWarmVariableBytes`, default 2 MiB)
-     * so synchronous HUD readers such as `JS-Slash-Runner` `getVariables({ type: 'chat' })`
-     * work seamlessly while multi-megabyte blobs (e.g. `44 MB` `multiverse_hypervisor`) remain cold in OPFS/IDB
-     * unless `options.hydrateMultiverseHypervisor` is explicitly enabled (when MVH extension is active).
+     * Selectively pre-warms lightweight `chat_metadata.variables` (`<= maxWarmVariableBytes`, default 32 MiB)
+     * plus `world_backstage_v1` / tail `extra.world_backstage` so synchronous readers such as
+     * `JS-Slash-Runner`, `ST-Prompt-template`, and `world-backstage` work seamlessly while massive
+     * non-variable blobs (e.g. `44 MB` `multiverse_hypervisor` when MVH is off) remain cold in OPFS/IDB.
      *
      * @param {Array} chatArray
      * @param {string} [chatKey]
      * @param {Object} [options={}]
-     * @returns {Promise<{ warmed: boolean, bytes: number, mvhHydrated?: boolean, skippedReason?: string }>}
+     * @returns {Promise<{ warmed: boolean, bytes: number, mvhHydrated?: boolean, worldBackstageHydrated?: boolean, skippedReason?: string }>}
      */
     async hydrateWarmChatVariables(chatArray, chatKey = this.latestChatKey || '', options = {}) {
         const header = Array.isArray(chatArray) && chatArray[0] ? chatArray[0] : null;
-        const meta = header && header.chat_metadata && typeof header.chat_metadata === 'object'
+        const meta = (header && header.chat_metadata && typeof header.chat_metadata === 'object'
             ? header.chat_metadata
-            : null;
-        if (!meta) return { warmed: false, bytes: 0, mvhHydrated: false, skippedReason: 'no_chat_metadata' };
+            : null) || (options && options.chatMetadata && typeof options.chatMetadata === 'object' ? options.chatMetadata : null);
+        if (!meta) {
+            return {
+                warmed: false,
+                bytes: 0,
+                mvhHydrated: false,
+                worldBackstageHydrated: false,
+                skippedReason: 'no_chat_metadata',
+            };
+        }
 
         let warmed = false;
         let totalBytes = 0;
         let skippedReason;
         let mvhHydrated = false;
+        let worldBackstageHydrated = false;
 
         const refHex = extractVaultRefHex(meta.variables);
         if (refHex) {
-            const maxWarmVariableBytes = options.maxWarmVariableBytes ?? 2 * 1024 * 1024;
+            const maxWarmVariableBytes = options.maxWarmVariableBytes ?? 32 * 1024 * 1024;
             const res = await this.hydrateColdField(meta, 'variables', chatKey, { maxBytes: maxWarmVariableBytes });
             if (res.hydrated) {
                 this.stats.warmChatVariablesHydrated++;
@@ -1422,6 +1476,42 @@ class RehydrationGuard {
             }
         } else {
             skippedReason = 'not_cold_ref';
+        }
+
+        if (options.hydrateWorldBackstage !== false && extractVaultRefHex(meta.world_backstage_v1)) {
+            const wbRes = await this.hydrateColdField(meta, 'world_backstage_v1', chatKey);
+            if (wbRes.hydrated) {
+                warmed = true;
+                worldBackstageHydrated = true;
+                totalBytes += wbRes.bytes;
+            }
+        }
+
+        if (options.hydrateSheets !== false && extractVaultRefHex(meta.sheets)) {
+            const sheetsRes = await this.hydrateColdField(meta, 'sheets', chatKey);
+            if (sheetsRes.hydrated) {
+                warmed = true;
+                totalBytes += sheetsRes.bytes;
+            }
+        }
+
+        if (options.hydrateWorldBackstage !== false && Array.isArray(chatArray) && chatArray.length > 1) {
+            const tailStart = Math.max(1, chatArray.length - 16);
+            for (let i = tailStart; i < chatArray.length; i++) {
+                const msg = chatArray[i];
+                if (msg && msg.extra && typeof msg.extra === 'object') {
+                    for (const k of ['world_backstage', 'world_backstage_v1']) {
+                        if (extractVaultRefHex(msg.extra[k])) {
+                            const mWbRes = await this.hydrateColdField(msg.extra, k, chatKey);
+                            if (mWbRes.hydrated) {
+                                warmed = true;
+                                worldBackstageHydrated = true;
+                                totalBytes += mWbRes.bytes;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if (options.hydrateMultiverseHypervisor && extractVaultRefHex(meta.multiverse_hypervisor)) {
@@ -1437,6 +1527,7 @@ class RehydrationGuard {
             warmed,
             bytes: totalBytes,
             mvhHydrated,
+            worldBackstageHydrated,
             ...(warmed ? {} : { skippedReason }),
         };
     }
